@@ -129,7 +129,8 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                jobs: int, quiet: bool) -> tuple[int, int, int]:
     batches = [pending[i:i + BATCH] for i in range(0, len(pending), BATCH)]
     total_files = len(pending)
-    n_sym = n_calls = n_parsed = 0
+    n_parsed = sum(1 for _, _, parse in pending if parse)
+    n_sym = n_calls = 0
     done = 0
     started = time.time()
 
@@ -159,8 +160,6 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
             for file_id, lines, syms in result:
                 conn.execute("UPDATE files SET lines=?, n_symbols=? WHERE id=?",
                              (lines, len(syms), file_id))
-                if syms:
-                    n_parsed += 1
                 for (name, kind, start, end, sig, st, inl, exp, calls) in syms:
                     sym_rows.append((next_sym_id, file_id, name, kind, start, end,
                                      sig, st, inl, exp))
@@ -244,7 +243,10 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
     jobs = jobs or min(os.cpu_count() or 4, 16)
     stats = BuildStats()
 
-    conn = db.create(out)
+    # Build into a scratch file and rename only on success, so an interrupted
+    # build can never masquerade as a finished index.
+    scratch = out.with_name(out.name + ".building")
+    conn = db.create(scratch)
     try:
         stats.dirs, stats.files, pending = _scan_tree(tree, conn, quiet)
         stats.parsed, stats.symbols, stats.calls = _parse_all(
@@ -271,6 +273,10 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
             ],
         )
         db.finalize(conn)
-    finally:
+    except BaseException:
         conn.close()
+        scratch.unlink(missing_ok=True)
+        raise
+    conn.close()
+    scratch.replace(out)
     return stats
