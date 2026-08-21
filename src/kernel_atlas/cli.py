@@ -30,6 +30,14 @@ def _split_list(value: str | None) -> list[str]:
     return [p.strip() for p in re.split(r"[,\s]+", value) if p.strip()]
 
 
+def _version_key(path: Path) -> tuple:
+    """Sort '7.2' above '6.18.45'. Non-numeric stems sort last."""
+    try:
+        return (1, tuple(int(p) for p in path.stem.split("-")[0].split(".")))
+    except ValueError:
+        return (0, ())
+
+
 def open_index(args) -> tuple[sqlite3.Connection, dict]:
     if getattr(args, "db", None):
         path = Path(args.db).expanduser()
@@ -38,18 +46,31 @@ def open_index(args) -> tuple[sqlite3.Connection, dict]:
         if wanted:
             path = config.index_path(wanted)
             if not path.is_file():
-                matches = [p for p in config.list_indexes() if p.stem.startswith(wanted)]
+                matches = [p for p in config.list_indexes()
+                           if p.stem.startswith(wanted)]
                 if len(matches) == 1:
                     path = matches[0]
+                elif matches:
+                    _die(f"-K {wanted} is ambiguous: "
+                         + ", ".join(p.stem for p in matches))
         else:
             available = config.list_indexes()
             if not available:
                 _die(f"no index built yet — run '{PROG} build lts' first")
-            path = max(available, key=lambda p: p.stat().st_mtime)
+            # Highest kernel version wins, which is predictable; mtime is not.
+            path = max(available, key=_version_key)
     if not path.is_file():
         _die(f"no index at {path} — run '{PROG} build <version>' first")
-    conn = db.connect(path, readonly=True)
-    return conn, db.get_meta(conn)
+    try:
+        conn = db.connect(path, readonly=True)
+        meta = db.get_meta(conn)
+    except sqlite3.DatabaseError as exc:
+        _die(f"{path} is not a usable index ({exc}) — rebuild it with "
+             f"'{PROG} build <version> --force'")
+    if not meta.get("kernel_version"):
+        _die(f"{path} looks like an interrupted build — rebuild it with "
+             f"'{PROG} build <version> --force'")
+    return conn, meta
 
 
 _SOURCE_SUFFIXES = (".c", ".h", ".S", ".rs", ".dts", ".rst")
@@ -180,6 +201,15 @@ def _static_mode(args) -> str:
     if getattr(args, "no_static", False):
         return "exclude"
     return "any"
+
+
+def _checked_grep(pattern: str | None) -> str | None:
+    if pattern:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            _die(f"--grep {pattern!r} is not a valid regex: {exc}")
+    return pattern
 
 
 # --------------------------------------------------------------------------
@@ -438,10 +468,11 @@ def cmd_siblings(args):
         _die(f"cannot build a '{args.level}' scope for {t.display} ({scope.label})")
 
     kinds = kinds_from_args(args, t)
-    # Collect unlimited so that dropping the target itself does not eat one of
-    # the requested rows, then trim, then look up subsystems for what survives.
+    # Fetch one extra row so that dropping the target itself does not eat one
+    # of the requested rows; subsystems are looked up only for what survives.
     entries = query.collect(
-        conn, scope, kinds, limit=0, grep=args.grep,
+        conn, scope, kinds, limit=args.limit + 1 if args.limit else 0,
+        grep=_checked_grep(args.grep),
         exported_only=args.exported, static=_static_mode(args),
         with_subsystem=False, sort=args.sort)
 
@@ -492,7 +523,8 @@ def cmd_ls(args):
         default = query.SYMBOL_KINDS
 
     kinds = kinds_from_args(args, t) if _split_list(args.kinds) else default
-    entries = query.collect(conn, scope, kinds, limit=args.limit, grep=args.grep,
+    entries = query.collect(conn, scope, kinds, limit=args.limit,
+                            grep=_checked_grep(args.grep),
                             exported_only=args.exported, static=_static_mode(args),
                             with_subsystem=args.with_subsystem, sort=args.sort)
     emit(entries, args, set(kinds), args.with_subsystem, f"{scope.label}\n")
@@ -798,7 +830,9 @@ def cmd_calls(args):
             entries.append(Entry(kind=r.target.symbol_kind or "function", name=n,
                                  path=r.target.path, line=r.target.line))
         else:
-            entries.append(Entry(kind="macro", name=n, path="-"))
+            # A callee with no definition anywhere in the index: usually a
+            # compiler builtin or a macro the parser could not attribute.
+            entries.append(Entry(kind="?", name=n, path="-"))
     query.annotate_subsystems(conn, entries)
     args.columns = args.columns or "kind,name,path,line,subsystem"
     emit(entries, args, {"function"}, True, f"Called by {t.display}\n")
@@ -873,7 +907,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_versions)
 
     sp = add("build", help="download a kernel and build its index")
-    sp.add_argument("version", nargs="?", default="lts",
+    # No hardcoded default: with --src the version comes from the tree's own
+    # Makefile, otherwise the alias 'lts' is applied in cmd_build.
+    sp.add_argument("version", nargs="?", default=None,
                     help="version or alias: lts (default), stable, mainline, 6.12.104")
     sp.add_argument("--src", help="index an existing local kernel tree instead")
     sp.add_argument("--output", "-o", help="write the index here")

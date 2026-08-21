@@ -150,13 +150,17 @@ def _declarator_name(node):
     return None
 
 
-def _has_function_declarator(node) -> bool:
+def _is_function_prototype(node) -> bool:
+    """True for ``int foo(void);`` but not for the function-pointer variable
+    ``int (*fp)(void);`` — in the pointer case the function_declarator wraps a
+    parenthesized declarator around the name instead of the name itself."""
     cur = node
     for _ in range(32):
         if cur is None:
             return False
         if cur.type == "function_declarator":
-            return True
+            inner = cur.child_by_field_name("declarator")
+            return inner is None or inner.type != "parenthesized_declarator"
         cur = cur.child_by_field_name("declarator") or next(
             (c for c in cur.named_children if c.type in _DECLARATOR_FIELDS), None
         )
@@ -216,15 +220,22 @@ def _first_argument(src: bytes, call_node) -> str | None:
     return None
 
 
-def _collect_calls(src: bytes, func_node) -> tuple[str, ...]:
-    body = func_node.child_by_field_name("body")
+def _collect_calls(src: bytes, node) -> tuple[str, ...]:
+    """Callee names inside a function body.
+
+    Accepts either a function_definition or a bare compound_statement — the
+    latter is what SYSCALL_DEFINEn leaves us with, where the body is a sibling
+    of the macro call rather than a child of anything function-shaped.
+    """
+    body = node if node.type == "compound_statement" else \
+        node.child_by_field_name("body")
     if body is None:
         return ()
     cursor = QueryCursor(_CALL_QUERY)
     caps = cursor.captures(body)
     seen: dict[str, None] = {}
-    for node in caps.get("callee", []):
-        seen.setdefault(_text(src, node), None)
+    for n in caps.get("callee", []):
+        seen.setdefault(_text(src, n), None)
     return tuple(seen)
 
 
@@ -389,8 +400,7 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
                     name = _macro_decl_name(src, node) or ""
                 if not name or name in _ATTRIBUTE_MACROS:
                     continue
-                is_proto = _has_function_declarator(decl)
-                kind = PROTOTYPE if is_proto else VARIABLE
+                kind = PROTOTYPE if _is_function_prototype(decl) else VARIABLE
                 if kind not in kinds:
                     continue
                 symbols.append(Symbol(

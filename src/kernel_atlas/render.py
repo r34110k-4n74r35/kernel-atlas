@@ -177,14 +177,26 @@ def render_csv(entries: list[Entry], columns) -> str:
 
 
 def render_tree(entries: list[Entry], color: bool) -> str:
-    """Nested view of the paths present in `entries`."""
+    """Nested view of the paths present in `entries`.
+
+    Symbols hang beneath their file as their own leaves; keying them by name
+    and line means two symbols in one file can never overwrite each other.
+    """
     root: dict = {}
     for e in entries:
         node = root
-        parts = e.path.split("/")
-        for part in parts[:-1]:
-            node = node.setdefault(part, {})
-        node.setdefault(parts[-1], {})["__entry__"] = e
+        parts = [p for p in e.path.split("/") if p]
+        if not parts:
+            continue
+        if e.kind in ("dir", "file"):
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node.setdefault(parts[-1], {})["__entry__"] = e
+        else:
+            for part in parts:
+                node = node.setdefault(part, {})
+            label = f"{e.name}:{e.line}" if e.line else e.name
+            node.setdefault(label, {})["__entry__"] = e
 
     out = io.StringIO()
 

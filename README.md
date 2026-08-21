@@ -23,7 +23,7 @@ fs/ext4/inode.c:ext4_bmap
   defined in   fs/ext4/inode.c:3363-3391 (29 lines)
   signature    static sector_t ext4_bmap(struct address_space *mapping, sector_t block)
   linkage      static (file-local)
-  on disk      /Users/you/kernel-atlas/kernels/linux-6.18.45/fs/ext4/inode.c
+  on disk      ~/kernel-atlas/kernels/linux-6.18.45/fs/ext4/inode.c
 
   Area: Filesystems
     VFS layer plus every individual filesystem (ext4, btrfs, xfs, ...).
@@ -34,9 +34,31 @@ fs/ext4/inode.c:ext4_bmap
        list        linux-ext4@vger.kernel.org
 ```
 
+---
+
+## Contents
+
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Where everything lives](#where-everything-lives)
+- [Building indexes](#building-indexes)
+- [Naming a target](#naming-a-target)
+- [The main idea: "same level"](#the-main-idea-same-level)
+- [A tour across the kernel](#a-tour-across-the-kernel)
+- [Reading the code](#reading-the-code)
+- [Backtraces](#backtraces)
+- [Call graph](#call-graph)
+- [Controlling the output](#controlling-the-output)
+- [Command reference](#command-reference)
+- [How subsystems are determined](#how-subsystems-are-determined)
+- [How parsing works, and its limits](#how-parsing-works-and-its-limits)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+
 ## Install
 
-Requires Python 3.10+.
+Requires Python 3.10+ and roughly 2.5 GB of disk per kernel version
+(1.6 GB source + a 0.7–1 GB index).
 
 ```bash
 git clone <this repo> && cd kernel-atlas
@@ -45,8 +67,8 @@ python3 -m venv .venv
 ```
 
 This creates two equivalent commands, `kernel-atlas` and the shorter `ka`, but
-**only inside the venv** — nothing is added to your system `PATH`. Either
-activate the venv:
+**only inside the venv** — nothing is added to your system `PATH` and no shell
+profile is touched. Either activate the venv:
 
 ```bash
 source .venv/bin/activate
@@ -59,6 +81,21 @@ or call the full path from anywhere (the shebang pins it to the venv's Python):
 ~/kernel-atlas/.venv/bin/ka info fs/ext4
 ```
 
+Deleting `.venv/` removes both commands; deleting `kernels/` and `indexes/`
+reclaims the data.
+
+## Quick start
+
+```bash
+ka build lts                  # one-off: download + index the latest LTS (~2 min)
+
+ka info fs/ext4               # what is this? who maintains it?
+ka siblings fs/ext4           # what sits at the same level?
+ka find tcp_sendmsg           # where is this symbol?
+ka show tcp_sendmsg           # print its source
+dmesg | ka trace              # map a whole backtrace to subsystems
+```
+
 ## Where everything lives
 
 The kernel source and the index are kept **inside the project directory**, not
@@ -67,61 +104,93 @@ in a hidden cache, so the code you are studying sits right next to the tool:
 ```
 kernel-atlas/
 ├── kernels/
-│   └── linux-6.18.45/      <- the real kernel tree: open it, grep it, browse it
+│   ├── linux-6.18.45/      <- real kernel trees: open them, grep them
+│   └── linux-7.2/
 ├── indexes/
-│   └── 6.18.45.db
+│   ├── 6.18.45.db
+│   └── 7.2.db
 └── src/kernel_atlas/
 ```
 
-Both `kernels/` and `indexes/` are gitignored. That means you can point your
-editor, `grep`, `ctags` or anything else straight at
-`kernel-atlas/kernels/linux-6.18.45/` — and `ka path` will hand you absolute
-paths into it (see [Reading the code](#reading-the-code)).
+Both directories are gitignored. Point your editor or `grep` straight at
+`kernels/linux-*/`, or let `ka path` hand you absolute paths into it.
 
-Set `KERNEL_ATLAS_HOME` to put them somewhere else:
+Set `KERNEL_ATLAS_HOME` to keep the data somewhere else (e.g. a bigger disk):
 
 ```bash
 export KERNEL_ATLAS_HOME=/mnt/big-disk/kernel-atlas
 ```
 
-## Build an index
+The only other relevant environment variable is `NO_COLOR`, which disables
+colored output (as does `--color never`).
+
+## Building indexes
 
 ```bash
-ka versions          # what kernel.org currently offers
-ka build lts         # download + index the latest longterm release
+ka versions                   # live list of releases from kernel.org
+ka build lts                  # latest longterm  (best default for learning)
+ka build stable               # latest stable
+ka build mainline             # newest release
+ka build 6.12.104             # any exact version
+ka build lts --force          # rebuild over an existing index
 ```
 
-`build` accepts `lts` (default, recommended for learning), `stable`, `mainline`,
-or an exact version like `6.12.104`. The version list is fetched live from
-kernel.org, so nothing is hardcoded and old releases keep working.
+Version aliases are resolved live against kernel.org, so nothing is hardcoded
+and old releases keep working. Downloads are verified against kernel.org's
+`sha256sums.asc` and resume automatically if the connection drops. Both
+extraction and indexing are atomic: an interrupted build can never leave
+behind something that looks like a finished tree or index.
 
-The tarball is verified against kernel.org's `sha256sums.asc`, and downloads
-resume automatically if the connection drops (a truncated 147 MB transfer is
-otherwise easy to mistake for a complete one).
-
-Indexing Linux 6.18.45 on a laptop:
-
-| | |
+| `build` option | Effect |
 | --- | --- |
-| directories / files | 6,048 / 91,107 |
-| symbols | 4,051,600 from 61,467 C files |
-| subsystems | 3,144 sections from `MAINTAINERS` |
-| time | ~57s (plus a one-off 147 MB download) |
-| index size | 741 MB, or 922 MB with `--with-calls` |
+| `--src PATH` | index a kernel tree you already have (version read from its `Makefile`) |
+| `--kinds LIST` | which symbol kinds to index (default: `function,syscall,struct,union,enum,typedef,macro,variable`; add `prototype` if wanted) |
+| `--with-calls` | also record the call graph (enables `ka calls`) |
+| `--jobs N` | parser processes (default: one per CPU, max 16) |
+| `--output PATH` | write the index somewhere specific |
+| `--keep-tarball` | don't delete the `.tar.xz` after extraction |
+| `--no-verify` | skip the checksum (not recommended) |
+| `--quiet` | no progress output |
 
-Most of that size is the kernel's ~2.9M macros. If you don't need them:
+For scale, Linux 6.18.45 on a laptop: 91,107 files, ~4.05M symbols, 3,144
+subsystems, ~60 s to index. Most of the index's size is the kernel's ~2.9M
+macros — `--kinds function,syscall,struct,enum,typedef` gives a much smaller
+index if you don't need them.
+
+### Multiple versions
+
+Keep as many as you like and choose per command; without `-K`, the **highest
+version** is used:
 
 ```bash
-ka build lts --kinds function,syscall,struct,enum,typedef   # far smaller
+ka indexes                     # what you have, with sizes and build dates
+ka -K 6.18.45 info fs/ext4     # exact
+ka -K 6.18 info fs/ext4        # unique prefix works too
+ka stats                       # totals and biggest top-level areas of an index
 ```
 
-You can hold several versions at once and pick between them with `-K`:
+## Naming a target
+
+Every command that takes a `target` accepts all of these forms:
 
 ```bash
-ka build 6.12.104
-ka indexes
-ka -K 6.12.104 info fs/ext4
+ka info fs/ext4                      # a folder
+ka info fs/ext4/inode.c              # a file
+ka info fs/ext4/inode.c:ext4_bmap    # a symbol in a known file
+ka info ext4_bmap                    # a bare symbol name
+ka info inode.c:ext4_bmap            # basename:symbol — the symbol picks the right inode.c
+ka info fs/ext4/inode.c:2768         # whatever symbol spans that line number
+ka info inode.c                      # a bare filename
+ka info ext4                         # a bare directory name
+ka info .                            # the kernel root
 ```
+
+When a name is ambiguous (`inode.c` exists in 60+ places; some symbols have
+per-architecture definitions), the most likely candidate is chosen — real
+definitions beat prototypes, non-static beats static — and the alternatives are
+listed. Typos get "did you mean" suggestions for both symbols and paths, and
+`file.c:no_such_symbol` tells you plainly that the file exists but the symbol
+does not.
 
 ## The main idea: "same level"
 
@@ -131,14 +200,33 @@ Every target lives in a **container**:
 | --- | --- |
 | a folder | its parent directory |
 | a file | its directory |
-| a function or other symbol | the file it is defined in |
+| a symbol | the file it is defined in |
 
-`siblings` lists the other members of that container, and `--level` widens the
-container outwards: `file` → `dir` → `subtree` → `subsystem` → `tree`.
+`ka siblings` lists the other members of that container. `--level` widens the
+container outwards, and `--kinds` chooses *what* to list from it, independently
+of what you asked about:
 
-You also choose *what* to list with `--kinds`, independently of what you asked
-about. So you can ask for the functions next to a file, or the files next to a
-function.
+| `--level` | Scope becomes |
+| --- | --- |
+| `auto` (default) | the natural container above |
+| `file` | the containing file (symbols only) |
+| `dir` | the containing directory |
+| `subtree` | that directory and everything beneath it |
+| `subsystem` | every file the target's subsystem claims |
+| `tree` | the entire kernel |
+
+```bash
+ka siblings fs/ext4                                   # other filesystems
+ka siblings fs/ext4/inode.c                           # other files in fs/ext4/
+ka siblings ext4_bmap                                 # other functions in inode.c
+ka siblings ext4_bmap --level subsystem               # every ext4 function
+ka siblings fs/ext4/inode.c --kinds function          # functions next to a *file*
+ka siblings ext4_bmap --level dir --kinds file        # files around a *symbol*
+ka siblings fs/ext4 --include-self                    # keep the target, marked >
+```
+
+`ka ls` is the complement — it looks *inside* rather than *beside*: children of
+a folder, or symbols defined in a file.
 
 ## A tour across the kernel
 
@@ -175,12 +263,11 @@ Siblings of net/ipv4/tcp.c
 
 $ ka siblings tcp_sendmsg                       # functions in the same file
 $ ka siblings tcp_sendmsg --level subsystem     # everything in NETWORKING [TCP]
-$ ka siblings tcp_sendmsg --level dir --kinds file    # files around it instead
 ```
 
-### Memory management — searching when you don't know the name
+### Memory management — search when you don't know the name
 
-Names drift between releases. Search rather than guess:
+Names drift between releases; search rather than guess:
 
 ```bash
 $ ka find __alloc_pages --prefix -n 4
@@ -203,9 +290,6 @@ $ ka find schedule --exact
   function  schedule  kernel/sched/core.c                   7027  SCHEDULER
   macro     schedule  tools/testing/shared/linux/kernel.h     21  THE REST
   variable  schedule  .../bpf/progs/test_snprintf.c           35  BPF [GENERAL] ...
-
-$ ka siblings kernel/sched/core.c -n 6
-$ ka ls kernel/sched --kinds file --sort lines
 ```
 
 A common name resolving to three different things in three different areas is
@@ -213,8 +297,8 @@ exactly why `find` reports the subsystem alongside each hit.
 
 ### Block layer — when neighbours belong elsewhere
 
-Add `-S` to show which subsystem each result belongs to. Files sitting in the
-same directory often do not share an owner:
+Add `-S` to any listing for a subsystem column. Files sitting in the same
+directory often do not share an owner:
 
 ```bash
 $ ka siblings block/bio.c --sort lines -n 4 -S
@@ -245,13 +329,13 @@ $ ka info drivers/net/ethernet/intel/igb
   Area: Device drivers
    * INTEL ETHERNET DRIVERS   [Maintained]  427 files
        maintainer  Tony Nguyen <anthony.l.nguyen@intel.com>
-       list        intel-wired-lan@lists.osuosl.org (moderated for non-subscribers)
+       list        intel-wired-lan@lists.osuosl.org
      NETWORKING DRIVERS   [Maintained]  4,864 files
        list        netdev@vger.kernel.org
 ```
 
-Both are correct: the precise subsystem is listed first, the umbrella one after.
-That is the ordering `MAINTAINERS` itself asks for.
+Both are correct: the precise subsystem first, the umbrella one after. That is
+the ordering `MAINTAINERS` itself asks for.
 
 ### Syscalls
 
@@ -277,17 +361,17 @@ $ ka show sys_open          # and its source
 ### BPF, io_uring, crypto, arch
 
 ```bash
-$ ka info kernel/bpf          # -> BPF [GENERAL], 1,963 files
-$ ka info io_uring            # -> IO_URING, 86 files
-$ ka ls crypto --kinds file --sort lines -n 4
-$ ka siblings arch/x86        # every other architecture port
-$ ka tree arch/x86 -d 1
+ka info kernel/bpf          # -> BPF [GENERAL], ~2,000 files
+ka info io_uring            # -> IO_URING
+ka ls crypto --kinds file --sort lines -n 5
+ka siblings arch/x86        # every other architecture port
+ka tree arch/x86 -d 1
 ```
 
 ## Reading the code
 
-Because the kernel tree lives inside the project, `kernel-atlas` can hand you
-straight to it.
+Because the kernel trees live inside the project, `kernel-atlas` can hand you
+straight to them.
 
 ```bash
 $ ka path fs/ext4/inode.c
@@ -305,8 +389,8 @@ code -g $(ka path ext4_bmap --line)
 grep -rn iomap_bmap $(ka path fs/ext4)
 ```
 
-`show` prints the source without leaving the terminal. Given a symbol it prints
-exactly that symbol:
+`show` prints source without leaving the terminal. Given a symbol it prints
+exactly that symbol, with its subsystem in the header:
 
 ```bash
 $ ka show tcp_sendmsg
@@ -314,24 +398,18 @@ net/ipv4/tcp.c:1409  tcp_sendmsg   [NETWORKING [TCP]]
   1409 int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
   1410 {
   1411 	int ret;
-  1412
-  1413 	lock_sock(sk);
-  1414 	ret = tcp_sendmsg_locked(sk, msg, size);
-  1415 	release_sock(sk);
-  1416
-  1417 	return ret;
+  ...
   1418 }
-```
 
-```bash
-ka show ext4_bmap -C 5              # with 5 lines of context either side
+ka show ext4_bmap -C 5              # 5 lines of context either side
 ka show fs/ext4/inode.c -L 100:140  # a line range from a file
-ka show tcp_sendmsg --bare          # no header, no line numbers, pipeable
+ka show fs/ext4/inode.c             # the whole file
+ka show tcp_sendmsg --bare          # no header/numbers — pipe it anywhere
 ```
 
 ## Backtraces
 
-Paste a kernel oops, an ftrace stack or just a list of names, and every frame is
+Paste a kernel oops, an ftrace stack, gdb frames, or just names — every frame is
 mapped to a file, a line and a subsystem. This does **not** need a call graph.
 
 ```bash
@@ -355,81 +433,84 @@ Backtrace across 8 frames (Linux 6.18.45)
     ...
 ```
 
-## Call graph (optional)
+Frames that resolve to several definitions are flagged with `(+N more defs)`,
+and `-f json` gives the same data machine-readably.
+
+## Call graph
+
+Built only when you ask (`--with-calls`), because it costs a few hundred MB:
 
 ```bash
 ka build lts --with-calls --force
-ka calls vfs_write              # what it calls
-ka calls ext4_get_block --callers
+ka calls vfs_write              # what does it call?
+ka calls do_sys_open --callers  # who calls it?  (sys_open and sys_openat do)
 ```
 
-For 6.18.45 this records about 3.0M call edges and grows the index from 741 MB
-to 922 MB. It is off by default; `ka trace` does not need it.
+It matches on **name only**, so it cannot see calls through function pointers —
+which the kernel uses everywhere. `ka calls ext4_bmap --callers` correctly
+returns nothing, because `ext4_bmap` is only reached through the `.bmap` entry
+of an ops struct. Callees with no definition anywhere in the index (compiler
+builtins, unexpanded macros) are listed with kind `?`.
 
-It matches on **name only**, so it cannot see calls made through function
-pointers — which the kernel uses everywhere. `ka calls ext4_bmap --callers`
-correctly returns nothing, because `ext4_bmap` is only ever reached through the
-`.bmap` entry of an ops struct.
+## Controlling the output
 
-## Customising output
+All listing commands (`siblings`, `ls`, `find`, `calls`) accept:
 
-Every listing command takes:
+| Option | Values / meaning |
+| --- | --- |
+| `--format`, `-f` | `table` (default), `plain`, `names`, `json`, `csv`, `tree` |
+| `--columns`, `-c` | comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature` |
+| `--limit`, `-n` | max rows; `0` = all (the target itself never counts against it) |
+| `--sort` | `name`, `path`, `kind`, `line`, `size`, `lines` (size/lines sort descending) |
+| `--grep`, `-g` | keep only names matching a regex (case-insensitive) |
+| `--with-subsystem`, `-S` | add a subsystem column |
+| `--kinds`, `-k` | what to list: `dir,file,function,syscall,struct,union,enum,typedef,macro,variable,prototype` or shortcuts `all`, `symbols`, `paths`, `functions`, `types` |
+| `--exported` | only `EXPORT_SYMBOL`'d symbols |
+| `--static-only` / `--no-static` | keep only / drop `static` symbols |
 
-- `--format` / `-f` — `table` (default), `plain`, `names`, `json`, `csv`, `tree`
-- `--columns` / `-c` — pick and order columns: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature`
-- `--limit` / `-n`, `--sort` (`name`, `path`, `kind`, `line`, `size`, `lines`)
-- `--grep` / `-g` — filter names by regex
-- `--with-subsystem` / `-S` — add a subsystem column
-- `--exported` — only `EXPORT_SYMBOL`'d symbols
-- `--static-only` / `--no-static`
-- `--kinds` / `-k` — `dir`, `file`, `function`, `syscall`, `struct`, `union`,
-  `enum`, `typedef`, `macro`, `variable`, `prototype`, plus the shortcuts `all`,
-  `symbols`, `paths`, `functions`, `types`
+Global options work before **or** after the subcommand:
 
-`names` and `plain` print bare values with no header, so they pipe cleanly:
+| Option | Meaning |
+| --- | --- |
+| `-K`, `--kernel` | which index to use (`6.18.45`, or a unique prefix like `6.18`) |
+| `--db PATH` | use a specific index file |
+| `--color` | `auto` (default), `always`, `never` |
+
+`names` and `plain` print bare values with no header or footer, so they pipe
+cleanly; `json` and `csv` are for scripts and spreadsheets:
 
 ```bash
 ka siblings fs/ext4 -f names | head
 ka ls net/ipv4 --kinds function -f json | jq -r '.[].name'
 ka find ext4_ --prefix -f csv > ext4-symbols.csv
 ka siblings mm/page_alloc.c -c name,lines,size --sort lines
+ka ls fs/ext4/super.c --kinds function --grep '^ext4_(get|put)' -f plain
 ```
 
-Global flags `-K/--kernel`, `--db` and `--color` work before *or* after the
-subcommand.
+`plain` prints `path` for files/dirs and `path:line:name` for symbols — the
+same shape grep prints, so editors and quickfix lists understand it.
 
 ## Command reference
 
-| Command | What it does |
-| --- | --- |
-| `ka versions` | kernel versions available on kernel.org |
-| `ka build <ver>` | download and index a release |
-| `ka indexes` | indexes you have built |
-| `ka stats` | what is in an index |
-| `ka info <target>` | explain a folder, file or symbol |
-| `ka siblings <target>` | what sits at the same level |
-| `ka ls <target>` | contents of a folder, or symbols in a file |
-| `ka tree <target>` | draw the directory tree |
-| `ka find <pattern>` | search symbols (`--exact`, `--glob`, `--prefix`) |
-| `ka path <target>` | absolute on-disk path |
-| `ka show <target>` | print source |
-| `ka trace` | annotate a backtrace |
-| `ka subsystems` | list subsystems from `MAINTAINERS` |
-| `ka subsystem <name>` | detail for one subsystem |
-| `ka calls <target>` | call graph (needs `--with-calls`) |
+| Command | Arguments | Purpose |
+| --- | --- | --- |
+| `ka versions` | `[-f table\|json]` | releases currently on kernel.org |
+| `ka build` | `[version] [--src PATH] [--kinds L] [--with-calls] [--jobs N] [--output P] [--keep-tarball] [--no-verify] [--force] [--quiet]` | download + index a kernel |
+| `ka indexes` | `[-f table\|json]` | list built indexes |
+| `ka stats` | `[-f table\|json]` | index totals, symbols by kind, biggest areas |
+| `ka info` | `TARGET [--max-subsystems N] [--max-candidates N] [-f table\|json]` | explain one folder/file/symbol |
+| `ka siblings` | `TARGET [--level L] [--include-self] [filters] [output]` | what sits at the same level |
+| `ka ls` | `[TARGET] [filters] [output]` | contents of a folder / symbols in a file |
+| `ka tree` | `[TARGET] [-d DEPTH] [--files] [-f tree\|json]` | draw the directory tree |
+| `ka find` | `PATTERN [--exact\|--glob\|--prefix] [filters] [output]` | search symbols by name |
+| `ka path` | `TARGET [--line]` | absolute on-disk path |
+| `ka show` | `TARGET [-C N] [-L A:B] [--bare]` | print source |
+| `ka trace` | `[FRAMES...] [-n N] [-f table\|json]` | annotate a backtrace (or read stdin) |
+| `ka subsystems` | `[-g REGEX] [--sort size\|name] [-n N] [-f table\|json]` | list subsystems |
+| `ka subsystem` | `NAME [--files] [-n N] [-f table\|json]` | one subsystem in detail |
+| `ka calls` | `TARGET [--callers] [output]` | call graph (needs `--with-calls`) |
 
-### Ways to name a target
-
-```bash
-ka info fs/ext4                      # a folder
-ka info fs/ext4/inode.c              # a file
-ka info fs/ext4/inode.c:ext4_bmap    # a symbol in a known file
-ka info ext4_bmap                    # a bare symbol name
-ka info fs/ext4/inode.c:2768         # whatever symbol spans that line
-ka info inode.c                      # a bare filename (reports if ambiguous)
-```
-
-Typos get suggestions rather than a bare failure.
+`siblings` also answers to `ka sib`. `ka <command> --help` shows everything.
 
 ## How subsystems are determined
 
@@ -445,6 +526,7 @@ F: drivers/net/     all files in and below drivers/net
 F: drivers/net/*    all files in drivers/net, but not below
 F: */net/*          all files in "any top level directory"/net
 X: fs/ext4/         excluded, even if an F: line above matched
+N: regex            matched against the whole path
 ```
 
 When several sections match, the most precise one wins, following the advice in
@@ -458,32 +540,58 @@ instead.
 
 C is parsed with [tree-sitter](https://tree-sitter.github.io/), which is fast
 and error-tolerant — but it does **not** run the C preprocessor, and the kernel
-is extremely macro-heavy. Several kernel idioms are therefore handled
-explicitly:
+is extremely macro-heavy. Several kernel idioms are handled explicitly:
 
 - `SYSCALL_DEFINE3(open, ...)` does not parse as a function at all: the macro
   call becomes a statement and the body a *sibling* block. It is reassembled
-  into `sys_open`. `COMPAT_SYSCALL_DEFINE4(openat, ...)` correctly becomes
-  `compat_sys_openat`, a genuinely different symbol from `sys_openat`.
+  into `sys_open`, including its call edges. `COMPAT_SYSCALL_DEFINE4(openat,
+  ...)` correctly becomes `compat_sys_openat`, a different symbol from
+  `sys_openat`.
 - `EXPORT_SYMBOL(foo)` / `EXPORT_SYMBOL_GPL(foo)` marks `foo` as available to
-  modules (36,901 symbols in 6.18.45).
+  modules (~37k symbols per release).
 - `static DECLARE_WORK(free_ipc_work, free_ipc);` declares `free_ipc_work`.
 - Trailing attribute macros such as
   `struct sem { ... } ____cacheline_aligned_in_smp;` are not mistaken for
   variable names.
 - `#ifdef` blocks reach inside function bodies too, so declarations there are
   treated as locals rather than file-scope variables.
+- `int (*fp)(void);` is a function-pointer variable; `int fp(void);` is a
+  prototype. The two are told apart.
 
 Known limits, stated plainly:
 
-- Code inside `#if` branches is indexed regardless of configuration, so a symbol
-  may be listed that your `.config` would not build.
-- A name defined per-architecture (`access_ok`, and much of `arch/`) resolves to
-  one arbitrary definition. `ka find --exact <name>` shows them all.
+- Code inside `#if` branches is indexed regardless of configuration, so a
+  symbol may be listed that your `.config` would not build.
+- A name defined per-architecture (`access_ok`, much of `arch/`) resolves to
+  one likely definition; `ka find --exact <name>` shows all of them.
 - Functions generated entirely by macros other than the ones above are missed.
 - The call graph resolves names, not function pointers.
 - Only C is parsed. Assembly and Rust files are indexed as files, without
   symbols.
+
+## Troubleshooting
+
+**"no index built yet"** — run `ka build lts` once; everything else needs an
+index.
+
+**"this index has no call graph"** — `ka calls` needs an index built with
+`--with-calls`; rebuild with `ka build <version> --with-calls --force`.
+
+**"the source for Linux X is not on disk"** — `ka path` and `ka show` need the
+tree under `kernels/`; queries (`info`, `siblings`, `find`, ...) work without
+it. Rebuild to re-download.
+
+**"looks like an interrupted build"** — a build was killed at the wrong moment
+on an older version of this tool; rebuild with `--force`. (Builds are atomic
+now, so this should no longer occur.)
+
+**A download keeps failing** — transfers resume automatically and the checksum
+rejects truncated files; if kernel.org is unreachable entirely, `ka versions`
+will say so.
+
+**The index disagrees with my tree** — the index is a snapshot; if you edit
+files under `kernels/`, line numbers in `ka show` can drift until you rebuild
+with `--force`.
 
 ## Development
 
@@ -495,15 +603,15 @@ Known limits, stated plainly:
 The tests build a small synthetic kernel tree (`tests/fixture.py`) with its own
 `MAINTAINERS`, so they run in well under a second and need no network.
 
-## Layout
+### Layout
 
 | File | Purpose |
 | --- | --- |
 | `config.py` | where kernels and indexes live |
-| `kernelsrc.py` | kernel.org release list, resumable download, checksum, extract |
+| `kernelsrc.py` | kernel.org release list, resumable download, checksum, atomic extract |
 | `cparse.py` | tree-sitter C symbol extraction and kernel macro idioms |
 | `maintainers.py` | `MAINTAINERS` parsing and fast path → subsystem matching |
-| `indexer.py` | tree walk, parallel parsing, subsystem attachment |
+| `indexer.py` | tree walk, parallel parsing, subsystem attachment, atomic build |
 | `db.py` | SQLite schema |
 | `query.py` | target resolution, container/level model, search |
 | `render.py` | table / plain / json / csv / tree output |

@@ -182,26 +182,41 @@ def _sha256(path: Path) -> str:
 
 
 def extract(tarball: Path, into: Path, quiet: bool = False) -> Path:
-    """Unpack linux-X.Y.tar.xz. Uses system tar when present (far faster)."""
+    """Unpack linux-X.Y.tar.xz. Uses system tar when present (far faster).
+
+    Extraction happens in a scratch directory that is renamed into place only
+    when complete, so an interrupted run can never be mistaken for a full tree.
+    """
     into.mkdir(parents=True, exist_ok=True)
     if not quiet:
         print(f"  extracting {tarball.name} ...", file=sys.stderr, flush=True)
 
-    if shutil.which("tar"):
-        try:
-            subprocess.run(["tar", "-xf", str(tarball), "-C", str(into)],
-                           check=True, capture_output=True)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"tar failed: {exc.stderr.decode('utf-8', 'replace')[:400]}")
-    else:
-        with tarfile.open(tarball, "r:xz") as tf:
-            tf.extractall(into, filter="data")
-
     stem = tarball.name.removesuffix(".tar.xz")
-    out = into / stem
-    if not out.is_dir():
-        raise RuntimeError(f"expected {out} after extracting {tarball}")
-    return out
+    scratch = into / f".extracting-{stem}"
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir()
+    try:
+        if shutil.which("tar"):
+            try:
+                subprocess.run(["tar", "-xf", str(tarball), "-C", str(scratch)],
+                               check=True, capture_output=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"tar failed: {exc.stderr.decode('utf-8', 'replace')[:400]}")
+        else:
+            with tarfile.open(tarball, "r:xz") as tf:
+                tf.extractall(scratch, filter="data")
+
+        extracted = scratch / stem
+        if not extracted.is_dir():
+            raise RuntimeError(f"expected {stem}/ inside {tarball}")
+        final = into / stem
+        if final.exists():
+            shutil.rmtree(final)
+        extracted.rename(final)
+        return final
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def ensure_source(version: str, keep_tarball: bool = False, quiet: bool = False,

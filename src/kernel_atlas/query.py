@@ -139,31 +139,56 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
     if ":" in raw:
         head, _, tail = raw.rpartition(":")
         head_n = _norm(head)
-        frow = conn.execute("SELECT * FROM files WHERE path = ?", (head_n,)).fetchone()
-        if frow is None and head_n:
-            frow = conn.execute("SELECT * FROM files WHERE name = ?",
-                                (head_n.rsplit("/", 1)[-1],)).fetchone()
-        if frow is not None:
-            if tail.isdigit():
-                line = int(tail)
-                row = conn.execute(
-                    _SYM_SELECT + " WHERE s.file_id = ? AND s.start_line <= ?"
-                    " AND s.end_line >= ? ORDER BY (s.end_line - s.start_line) LIMIT 1",
-                    (frow["id"], line, line)).fetchone()
-                if row:
-                    return Resolution(_sym_target(conn, row),
-                                      note=f"line {line} falls inside this symbol")
-                return Resolution(
-                    Target(kind="file", id=frow["id"], path=frow["path"],
-                           name=frow["name"], dir_id=frow["dir_id"],
-                           file_id=frow["id"]),
-                    note=f"no symbol spans line {line}")
-            rows = conn.execute(_SYM_SELECT + " WHERE s.file_id = ? AND s.name = ?",
-                                (frow["id"], tail)).fetchall()
+        frow = conn.execute("SELECT * FROM files WHERE path = ?",
+                            (head_n,)).fetchone() if head_n else None
+        exact_file = frow is not None
+        if exact_file:
+            frows = [frow]
+        elif head_n:
+            # 'inode.c:ext4_bmap' — consider every file with that basename and
+            # let the symbol pick out the right one.
+            frows = conn.execute(
+                "SELECT * FROM files WHERE name = ? ORDER BY LENGTH(path), path"
+                " LIMIT 200", (head_n.rsplit("/", 1)[-1],)).fetchall()
+        else:
+            frows = []
+
+        if frows and tail.isdigit():
+            line = int(tail)
+            frow = frows[0]
+            row = conn.execute(
+                _SYM_SELECT + " WHERE s.file_id = ? AND s.start_line <= ?"
+                " AND s.end_line >= ? ORDER BY (s.end_line - s.start_line) LIMIT 1",
+                (frow["id"], line, line)).fetchone()
+            if row:
+                return Resolution(_sym_target(conn, row),
+                                  note=f"line {line} falls inside this symbol")
+            return Resolution(
+                Target(kind="file", id=frow["id"], path=frow["path"],
+                       name=frow["name"], dir_id=frow["dir_id"],
+                       file_id=frow["id"]),
+                note=f"no symbol spans line {line}")
+
+        if frows:
+            ids = [r["id"] for r in frows]
+            ph = ",".join("?" * len(ids))
+            rows = conn.execute(
+                _SYM_SELECT + f" WHERE s.file_id IN ({ph}) AND s.name = ?",
+                (*ids, tail)).fetchall()
             if rows:
                 cands = sorted((_sym_target(conn, r) for r in rows),
                                key=_rank_candidate)
-                return Resolution(cands[0], cands[1:] if len(cands) > 1 else [])
+                note = ""
+                if not exact_file and len(frows) > 1:
+                    note = (f"matched {head_n.rsplit('/', 1)[-1]!r} to "
+                            f"{cands[0].path}")
+                return Resolution(cands[0], cands[1:], note)
+            if exact_file:
+                # The file is real, so don't fall through to guessing what the
+                # whole string might mean — say precisely what is wrong.
+                return Resolution(
+                    None, note=f"{head_n} exists but defines no symbol "
+                               f"named {tail!r}")
 
     row = conn.execute("SELECT * FROM dirs WHERE path = ?", (path,)).fetchone()
     if row:
@@ -177,12 +202,15 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
                                  file_id=row["id"]))
 
     # Bare symbol name.
-    rows = conn.execute(_SYM_SELECT + " WHERE s.name = ? LIMIT 200", (raw,)).fetchall()
+    rows = conn.execute(_SYM_SELECT + " WHERE s.name = ? LIMIT 201", (raw,)).fetchall()
     if rows:
-        cands = sorted((_sym_target(conn, r) for r in rows), key=_rank_candidate)
+        count = "200+" if len(rows) > 200 else str(len(rows))
+        cands = sorted((_sym_target(conn, r) for r in rows[:200]),
+                       key=_rank_candidate)
         note = ""
-        if len(cands) > 1:
-            note = f"{len(cands)} symbols named {raw!r}; showing the most likely definition"
+        if len(rows) > 1:
+            note = (f"{count} symbols named {raw!r}; "
+                    f"showing the most likely definition")
         return Resolution(cands[0], cands[1:], note)
 
     # Bare file name, e.g. 'inode.c'.
@@ -359,6 +387,19 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
             sql += " AND s.is_static = 1"
         elif static == "exclude":
             sql += " AND s.is_static = 0"
+        # Symbols are the only source that can be huge (a tree-wide scope holds
+        # millions), so when a limit is set and no Python-side filter remains,
+        # sort and cut inside SQLite instead of materialising everything.
+        if limit and rx is None:
+            order = {
+                "name": "LOWER(s.name), f.path",
+                "path": "f.path, s.start_line",
+                "kind": "s.kind, LOWER(s.name)",
+                "line": "f.path, s.start_line",
+                "size": "LOWER(s.name), f.path",
+                "lines": "(s.end_line - s.start_line) DESC, LOWER(s.name)",
+            }.get(sort, "LOWER(s.name), f.path")
+            sql += f" ORDER BY {order} LIMIT {int(limit)}"
         for r in conn.execute(sql, params):
             if rx and not rx.search(r["name"]):
                 continue
@@ -489,7 +530,9 @@ def callers(conn: sqlite3.Connection, name: str, limit: int = 200) -> list[Entry
         + " WHERE c.callee = ? GROUP BY s.id ORDER BY s.name LIMIT ?",
         (name, limit)).fetchall()
     return [Entry(kind=r["kind"], name=r["name"], path=r["path"], line=r["start_line"],
-                  end_line=r["end_line"], signature=r["signature"]) for r in rows]
+                  end_line=r["end_line"], signature=r["signature"],
+                  is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
+                  is_exported=bool(r["is_exported"])) for r in rows]
 
 
 def describe_area(path: str) -> tuple[str, str] | None:

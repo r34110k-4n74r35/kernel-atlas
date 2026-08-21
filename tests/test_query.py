@@ -98,6 +98,27 @@ def test_resolve_syscall_by_name(conn):
     assert t.symbol_kind == "syscall" and t.path == "fs/open.c"
 
 
+def test_resolve_basename_colon_symbol_picks_the_right_file(conn):
+    """'super.c:btrfs_mount' must find fs/btrfs/super.c even though
+    fs/ext4/super.c has the shorter path — the symbol disambiguates."""
+    t = query.resolve(conn, "super.c:btrfs_mount").target
+    assert t is not None and t.path == "fs/btrfs/super.c"
+    t = query.resolve(conn, "super.c:ext4_fill_super").target
+    assert t.path == "fs/ext4/super.c"
+
+
+def test_exact_file_with_unknown_symbol_gives_a_precise_error(conn):
+    res = query.resolve(conn, "fs/ext4/inode.c:not_a_real_fn")
+    assert res.target is None
+    assert "defines no symbol" in res.note and "fs/ext4/inode.c" in res.note
+
+
+def test_syscall_definitions_have_call_edges(conn):
+    """Regression: the DEFINEn body is a sibling node and used to be skipped."""
+    t = query.resolve(conn, "sys_open").target
+    assert "do_sys_open" in query.callees(conn, t.id)
+
+
 def test_resolve_missing(conn):
     res = query.resolve(conn, "definitely_not_here_xyz")
     assert res.target is None and "nothing in the index" in res.note

@@ -193,6 +193,32 @@ def test_pointer_and_array_declarators():
     assert "__alloc_pages" in syms
 
 
+def test_syscall_bodies_yield_call_edges():
+    """The body of SYSCALL_DEFINEn is a sibling compound_statement; call
+    collection must reach into it, not just into real function definitions."""
+    syms = by_name(parse("""
+        SYSCALL_DEFINE3(open, const char __user *, filename, int, flags,
+                        umode_t, mode)
+        {
+            if (force_o_largefile())
+                flags |= O_LARGEFILE;
+            return do_sys_open(AT_FDCWD, filename, flags, mode);
+        }
+    """, calls=True))
+    assert "do_sys_open" in syms["sys_open"].calls
+    assert "force_o_largefile" in syms["sys_open"].calls
+
+
+def test_function_pointer_variable_is_not_a_prototype():
+    kinds = KINDS | {"prototype"}
+    syms = by_name(parse("""
+        int real_prototype(void);
+        static int (*handler_fp)(int sig) = default_handler;
+    """, kinds))
+    assert syms["real_prototype"].kind == "prototype"
+    assert syms["handler_fp"].kind == "variable"
+
+
 def test_calls_are_collected_only_when_asked():
     src = "int outer(void) { return inner_one() + inner_two(); }"
     assert parse(src)[0].calls == ()
