@@ -9,3 +9,7 @@ dist/
 *.db-wal
 .cache/
 .DS_Store
+
+# Kernel sources and built indexes live inside the project (see config.py)
+kernels/
+indexes/

@@ -381,11 +381,11 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
         entries = entries[:limit]
 
     if with_subsystem:
-        _annotate_subsystems(conn, entries)
+        annotate_subsystems(conn, entries)
     return entries
 
 
-def _annotate_subsystems(conn: sqlite3.Connection, entries: list[Entry]) -> None:
+def annotate_subsystems(conn: sqlite3.Connection, entries: list[Entry]) -> None:
     cache: dict[str, str | None] = {}
     for e in entries:
         key = e.path
@@ -432,7 +432,7 @@ def search(conn: sqlite3.Connection, pattern: str, kinds=(), mode: str = "substr
         for r in conn.execute(sql, params)
     ]
     if with_subsystem:
-        _annotate_subsystems(conn, entries)
+        annotate_subsystems(conn, entries)
     return entries
 
 
