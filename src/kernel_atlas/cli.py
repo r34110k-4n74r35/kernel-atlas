@@ -163,6 +163,17 @@ def kinds_from_args(args, target) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def source_tree(meta: dict) -> Path:
+    tree = config.tree_for(meta.get("kernel_version", ""), meta.get("tree_path"))
+    if tree is None:
+        version = meta.get("kernel_version", "?")
+        _die(f"the source for Linux {version} is not on disk "
+             f"(expected {config.source_path(version)})\n"
+             f"  the index still answers queries; to get the source back run:\n"
+             f"    {PROG} build {version} --force")
+    return tree
+
+
 def _static_mode(args) -> str:
     if getattr(args, "static_only", False):
         return "only"
@@ -372,6 +383,10 @@ def cmd_info(args):
             if by_kind:
                 field("defines", ", ".join(f"{r['n']} {r['kind']}" for r in by_kind))
 
+    tree = config.tree_for(meta.get("kernel_version", ""), meta.get("tree_path"))
+    if tree is not None:
+        field("on disk", str(tree / t.path if t.path else tree))
+
     if area:
         print()
         print(render.paint(f"  Area: {area[0]}", "1;32", color))
@@ -423,10 +438,12 @@ def cmd_siblings(args):
         _die(f"cannot build a '{args.level}' scope for {t.display} ({scope.label})")
 
     kinds = kinds_from_args(args, t)
+    # Collect unlimited so that dropping the target itself does not eat one of
+    # the requested rows, then trim, then look up subsystems for what survives.
     entries = query.collect(
-        conn, scope, kinds, limit=args.limit, grep=args.grep,
+        conn, scope, kinds, limit=0, grep=args.grep,
         exported_only=args.exported, static=_static_mode(args),
-        with_subsystem=args.with_subsystem, sort=args.sort)
+        with_subsystem=False, sort=args.sort)
 
     if not args.include_self:
         entries = [e for e in entries
@@ -436,6 +453,11 @@ def cmd_siblings(args):
         for e in entries:
             if e.path == t.path and e.name == t.name:
                 e.is_target = True
+
+    if args.limit:
+        entries = entries[:args.limit]
+    if args.with_subsystem:
+        query.annotate_subsystems(conn, entries)
 
     sub = query.subsystem_for_target(conn, t)
     label = sub["name"] if sub else None
@@ -606,6 +628,56 @@ def cmd_tree(args):
     print(render.paint(f"\n{len(entries)} entries (depth {max_depth})", "90", color))
 
 
+def cmd_path(args):
+    """Print the on-disk path, so `$EDITOR $(ka path ext4_bmap)` just works."""
+    conn, meta = open_index(args)
+    res = resolve_or_die(conn, args.target)
+    t = res.target
+    tree = source_tree(meta)
+    full = tree / t.path if t.path else tree
+    if args.line and t.kind == "symbol":
+        print(f"{full}:{t.line}")
+    else:
+        print(full)
+
+
+def cmd_show(args):
+    conn, meta = open_index(args)
+    res = resolve_or_die(conn, args.target)
+    t = res.target
+    if t.kind == "dir":
+        _die(f"{t.path} is a directory; try '{PROG} ls {t.path}'")
+    tree = source_tree(meta)
+    full = tree / t.path
+    if not full.is_file():
+        _die(f"{full} is missing from the source tree")
+
+    lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
+    if t.kind == "symbol":
+        start = max(1, (t.line or 1) - args.context)
+        end = min(len(lines), (t.end_line or t.line or 1) + args.context)
+    elif args.lines:
+        m = re.fullmatch(r"(\d+)(?:[:-](\d+))?", args.lines)
+        if not m:
+            _die(f"--lines wants N or N:M, not {args.lines!r}")
+        start = max(1, int(m.group(1)))
+        end = min(len(lines), int(m.group(2)) if m.group(2) else start)
+    else:
+        start, end = 1, len(lines)
+
+    color = render.use_color(args.color)
+    if not args.bare:
+        sub = query.subsystem_for_target(conn, t)
+        head = f"{t.path}:{start}-{end}"
+        if t.kind == "symbol":
+            head = f"{t.path}:{t.line}  {t.name}"
+        print(render.paint(head, "1;36", color)
+              + (render.paint(f"   [{sub['name']}]", "35", color) if sub else ""))
+    for i in range(start, end + 1):
+        prefix = "" if args.bare else render.paint(f"{i:6} ", "90", color)
+        print(prefix + lines[i - 1])
+
+
 _FRAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\+\s*0x")
 _IDENT_RE = re.compile(r"\b([a-z_][a-z0-9_]{2,})\b")
 
@@ -713,7 +785,7 @@ def cmd_calls(args):
 
     if args.callers:
         entries = query.callers(conn, t.name, limit=args.limit or 100)
-        query._annotate_subsystems(conn, entries)
+        query.annotate_subsystems(conn, entries)
         args.columns = args.columns or "kind,name,path,line,subsystem"
         emit(entries, args, {"function"}, True, f"Functions that call {t.name}\n")
         return
@@ -727,7 +799,7 @@ def cmd_calls(args):
                                  path=r.target.path, line=r.target.line))
         else:
             entries.append(Entry(kind="macro", name=n, path="-"))
-    query._annotate_subsystems(conn, entries)
+    query.annotate_subsystems(conn, entries)
     args.columns = args.columns or "kind,name,path,line,subsystem"
     emit(entries, args, {"function"}, True, f"Called by {t.display}\n")
 
@@ -872,6 +944,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", "-n", type=int, default=15)
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystem)
+
+    sp = add("path", help="print the on-disk path of a folder, file or symbol")
+    sp.add_argument("target")
+    sp.add_argument("--line", action="store_true",
+                    help="append :LINE for symbols")
+    sp.set_defaults(func=cmd_path)
+
+    sp = add("show", help="print the source of a symbol or file")
+    sp.add_argument("target")
+    sp.add_argument("--context", "-C", type=int, default=0,
+                    help="extra lines around a symbol")
+    sp.add_argument("--lines", "-L", help="line range for a file, e.g. 100:140")
+    sp.add_argument("--bare", action="store_true",
+                    help="no header and no line numbers")
+    sp.set_defaults(func=cmd_show)
 
     sp = add("tree", help="draw the directory tree")
     sp.add_argument("target", nargs="?", default="")

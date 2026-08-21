@@ -186,6 +186,20 @@ def test_limit(conn):
     assert len(sib(conn, "fs/ext4/inode.c:ext4_bmap", limit=2)) <= 2
 
 
+def test_limit_counts_siblings_not_the_target(mini_index, capsys):
+    """`-n 3` must return three *other* functions, not two plus the target.
+
+    ext4_bmap sorts first among the four functions in inode.c, so applying the
+    limit before dropping the target would silently return one row too few.
+    """
+    from kernel_atlas import cli
+
+    cli.main(["--db", str(mini_index), "siblings", "fs/ext4/inode.c:ext4_bmap",
+              "-f", "names", "-n", "3"])
+    got = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert got == ["ext4_get_block", "ext4_helper", "ext4_inode_blocks_set"]
+
+
 # ---------------------------------------------------------------- subsystems
 
 def test_file_gets_its_precise_subsystem(conn):
