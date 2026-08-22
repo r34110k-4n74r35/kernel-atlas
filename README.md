@@ -503,7 +503,7 @@ or `mm` mean the *area* (so `kernel/bpf/`, not the `bpf` LSM hook variable).
 ```
 $ ka docs bpf -n 8
 
-Documentation related to kernel/bpf   [BPF [GENERAL]]
+Documentation related to kernel/bpf   [BPF [GENERAL]]   [Linux 6.18.45]
   (11 directories named 'bpf'; using kernel/bpf/)
   Documentation/bpf/bpf_design_QA.rst
   Documentation/bpf/btf.rst
@@ -519,24 +519,17 @@ ka web Documentation/mm/index.rst          # includes the docs.kernel.org HTML
 ### `locate`
 
 Resolves one target in **every** built index, so you can see a symbol move
-between the LTS you are running and mainline. Ignores `-K` / `ka use` on
-purpose.
+between the LTS you are running and mainline. The version from `ka use` or
+`-K` is listed first and marked `*`. `--db` limits the search to that file.
 
 ```
+$ ka use 6.18
 $ ka locate tcp_sendmsg
 
-tcp_sendmsg  across 2 indexes
+tcp_sendmsg  across 2 indexes  * = Linux 6.18.45
 
-  7.2      function   net/ipv4/tcp.c:1446       NETWORKING [TCP]
-  6.18.45  function   net/ipv4/tcp.c:1409       NETWORKING [TCP]
-
-$ ka locate schedule
-  7.2      function   kernel/sched/core.c:7316  SCHEDULER
-  6.18.45  function   kernel/sched/core.c:7027  SCHEDULER
-
-$ ka locate __alloc_pages_noprof
-  7.2      function   mm/page_alloc.c:5333      MEMORY MANAGEMENT - PAGE ALLOCATOR
-  6.18.45  function   mm/page_alloc.c:5268      MEMORY MANAGEMENT - PAGE ALLOCATOR
+  * 6.18.45  function   net/ipv4/tcp.c:1409       NETWORKING [TCP]
+    7.2      function   net/ipv4/tcp.c:1446       NETWORKING [TCP]
 ```
 
 ### `trace`

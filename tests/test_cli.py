@@ -202,3 +202,64 @@ def test_locate_lists_every_built_index(mini_index, tmp_path, monkeypatch, capsy
     versions = {r["version"] for r in rows}
     assert versions == {"6.12.104", "7.2"}
     assert all(r["found"] and r["path"].endswith("tcp.c") for r in rows)
+    # No pin: the highest built version is the default and is listed first.
+    assert rows[0]["version"] == "7.2" and rows[0]["active"]
+    assert rows[1]["version"] == "6.12.104" and not rows[1]["active"]
+
+
+def test_pin_selects_index_source_tree_and_locate_home(
+        mini_index, mini_tree, tmp_path, monkeypatch, capsys):
+    """After `ka use`, show/path/web/docs/info/locate must follow that version.
+
+    The copies keep the fixture's meta.kernel_version (6.12.104); the filename
+    is what `use` names, and that is what must win for trees and URLs.
+    """
+    import json
+    import shutil
+
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    (tmp_path / "indexes").mkdir()
+    shutil.copy(mini_index, tmp_path / "indexes" / "6.18.45.db")
+    shutil.copy(mini_index, tmp_path / "indexes" / "7.2.db")
+    for ver, tag in (("6.18.45", "PINNED618"), ("7.2", "OTHER72")):
+        dest = tmp_path / "kernels" / f"linux-{ver}"
+        shutil.copytree(mini_tree, dest)
+        tcp = dest / "net" / "ipv4" / "tcp.c"
+        tcp.write_text(tcp.read_text(encoding="utf-8").replace(
+            "return 0;", f"return 0; /* {tag} */", 1), encoding="utf-8")
+    config.set_default_version("6.18.45")
+
+    assert cli.main(["web", "tcp_sendmsg", "--url", "elixir"]) == 0
+    url = capsys.readouterr().out
+    assert "v6.18.45" in url
+    assert "v7.2" not in url and "v6.12.104" not in url
+
+    assert cli.main(["docs", "mm", "-f", "json"]) == 0
+    docs = json.loads(capsys.readouterr().out)
+    assert docs[0]["index"] == "6.18.45"
+    assert "v6.18.45" in docs[0]["elixir"]
+
+    assert cli.main(["show", "tcp_sendmsg", "--bare"]) == 0
+    shown = capsys.readouterr().out
+    assert "PINNED618" in shown
+    assert "OTHER72" not in shown
+
+    assert cli.main(["path", "tcp_sendmsg"]) == 0
+    assert "linux-6.18.45" in capsys.readouterr().out
+
+    assert cli.main(["info", "tcp_sendmsg", "-f", "json"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["index"] == "6.18.45"
+    assert "v6.18.45" in info["links"]["elixir"]
+
+    assert cli.main(["locate", "tcp_sendmsg", "-f", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["version"] == "6.18.45" and rows[0]["active"]
+    assert rows[1]["version"] == "7.2" and not rows[1]["active"]
+
+    assert cli.main(["-K", "7.2", "show", "tcp_sendmsg", "--bare"]) == 0
+    assert "OTHER72" in capsys.readouterr().out
+
+    assert cli.main(["-K", "7.2", "locate", "tcp_sendmsg", "-f", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["version"] == "7.2" and rows[0]["active"]

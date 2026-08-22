@@ -75,13 +75,38 @@ def default_index(*, warn: bool = True) -> Path:
     return max(available, key=_version_key)
 
 
-def open_index(args) -> tuple[sqlite3.Connection, dict]:
+def selected_index(args) -> Path:
+    """The index `-K` / `--db` / `use` would open, without connecting."""
     if getattr(args, "db", None):
-        path = Path(args.db).expanduser()
-    elif getattr(args, "kernel", None):
-        path = resolve_index_spec(args.kernel)
-    else:
-        path = default_index()
+        return Path(args.db).expanduser()
+    if getattr(args, "kernel", None):
+        return resolve_index_spec(args.kernel)
+    return default_index()
+
+
+def _looks_like_kernel_version(name: str) -> bool:
+    if not name:
+        return False
+    if name.startswith("next-"):
+        return True
+    return _version_key(Path(name))[0] == 1
+
+
+def index_version(meta: dict) -> str:
+    """Version string that matches `ka use` / `-K` / the index filename.
+
+    `--db scratch.db` keeps the version recorded in the index; a file named
+    `6.18.45.db` is 6.18.45 even if `meta` was copied from another build.
+    """
+    stem = meta.get("index_stem") or ""
+    kver = meta.get("kernel_version") or ""
+    if _looks_like_kernel_version(stem):
+        return stem
+    return kver or stem or "?"
+
+
+def open_index(args) -> tuple[sqlite3.Connection, dict]:
+    path = selected_index(args)
     if not path.is_file():
         _die(f"no index at {path} — run '{PROG} build <version>' first")
     try:
@@ -93,6 +118,7 @@ def open_index(args) -> tuple[sqlite3.Connection, dict]:
     if not meta.get("kernel_version"):
         _die(f"{path} looks like an interrupted build — rebuild it with "
              f"'{PROG} build <version> --force'")
+    meta["index_stem"] = path.stem
     return conn, meta
 
 
@@ -246,15 +272,34 @@ def kinds_from_args(args, target) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def find_source_tree(meta: dict) -> Path | None:
+    """Source tree for this index: the `ka use` name first, then recorded path."""
+    recorded = meta.get("tree_path")
+    tried: list[str] = []
+    for version in (index_version(meta), meta.get("index_stem"),
+                    meta.get("kernel_version")):
+        if not version or version in tried:
+            continue
+        tried.append(version)
+        tree = config.tree_for(version, None)
+        if tree is not None:
+            return tree
+    return config.tree_for(meta.get("kernel_version") or "", recorded)
+
+
 def source_tree(meta: dict) -> Path:
-    tree = config.tree_for(meta.get("kernel_version", ""), meta.get("tree_path"))
+    tree = find_source_tree(meta)
     if tree is None:
-        version = meta.get("kernel_version", "?")
+        version = index_version(meta)
         _die(f"the source for Linux {version} is not on disk "
              f"(expected {config.source_path(version)})\n"
              f"  the index still answers queries; to get the source back run:\n"
              f"    {PROG} build {version} --force")
     return tree
+
+
+def _linux(meta: dict) -> str:
+    return f"Linux {index_version(meta)}"
 
 
 def _static_mode(args) -> str:
@@ -300,7 +345,7 @@ def _target_spec(t: query.Target) -> str:
 
 def _links_for(meta: dict, t: query.Target) -> dict[str, str]:
     return links.links(
-        meta.get("kernel_version", ""), t.path, t.line,
+        index_version(meta), t.path, t.line,
         is_dir=(t.kind == "dir"),
         ident=(t.name if t.kind == "symbol" else None))
 
@@ -402,10 +447,13 @@ def cmd_indexes(args):
             conn.close()
         except Exception:
             meta = {}
-        source_here = config.tree_for(meta.get("kernel_version", p.stem),
-                                      meta.get("tree_path")) is not None
+        source_here = find_source_tree({
+            "index_stem": p.stem,
+            "kernel_version": meta.get("kernel_version", p.stem),
+            "tree_path": meta.get("tree_path"),
+        }) is not None
         rows.append({
-            "version": meta.get("kernel_version", p.stem),
+            "version": p.stem,
             "files": meta.get("n_files", "?"),
             "symbols": meta.get("n_symbols", "?"),
             "calls": meta.get("has_calls") == "1",
@@ -528,7 +576,7 @@ def cmd_stats(args):
         sys.stdout.write(render.render_json({"meta": meta, "symbols_by_kind": extra}))
         return
     color = render.use_color(args.color)
-    print(render.paint(f"Linux {meta.get('kernel_version', '?')} index", "1", color))
+    print(render.paint(f"{_linux(meta)} index", "1", color))
     print(f"  built        {meta.get('built_at', '?')}")
     print(f"  source       {meta.get('source', '?')}")
     print(f"  directories  {int(meta.get('n_dirs', 0)):,}")
@@ -577,6 +625,7 @@ def cmd_info(args):
             "ancestry": [{"path": p, "subsystem": s}
                          for p, s in query.ancestry(conn, t.path)],
             "links": lnks,
+            "index": index_version(meta),
             "note": res.note,
             "other_candidates": [c.display for c in res.candidates[:20]],
         }
@@ -622,9 +671,10 @@ def cmd_info(args):
             if by_kind:
                 field("defines", ", ".join(f"{r['n']} {r['kind']}" for r in by_kind))
 
-    tree = config.tree_for(meta.get("kernel_version", ""), meta.get("tree_path"))
+    tree = find_source_tree(meta)
     if tree is not None:
         field("on disk", str(tree / t.path if t.path else tree))
+    field("index", _linux(meta))
     field("elixir", lnks.get("elixir"))
     if lnks.get("docs"):
         field("docs", lnks["docs"])
@@ -710,7 +760,7 @@ def cmd_siblings(args):
     if label in query.CATCH_ALL:
         area = query.describe_area(t.path)
         label = area[0] if area else label
-    header = (f"Siblings of {t.display}\n"
+    header = (f"Siblings of {t.display}  [{_linux(meta)}]\n"
               f"  level: {scope.label}"
               + (f"   subsystem: {label}" if label else "")
               + f"   showing: {', '.join(kinds)}\n")
@@ -742,7 +792,8 @@ def cmd_ls(args):
                             grep=_checked_grep(args.grep),
                             exported_only=args.exported, static=_static_mode(args),
                             with_subsystem=args.with_subsystem, sort=args.sort)
-    emit(entries, args, set(kinds), args.with_subsystem, f"{scope.label}\n")
+    emit(entries, args, set(kinds), args.with_subsystem,
+         f"{scope.label}  [{_linux(meta)}]\n")
 
 
 def _post_filter(entries, args):
@@ -786,7 +837,7 @@ def cmd_find(args):
     cols = _split_list(args.columns) or ["kind", "name", "path", "line", "subsystem"]
     args.columns = ",".join(cols)
     emit(entries, args, {"function"}, True,
-         f"Symbols matching {args.pattern!r} ({mode})\n")
+         f"Symbols matching {args.pattern!r} ({mode})  [{_linux(meta)}]\n")
 
 
 def cmd_subsystems(args):
@@ -806,7 +857,7 @@ def cmd_subsystems(args):
                   **query.subsystem_json_fields(r)) for r in rows]))
         return
     color = render.use_color(args.color)
-    print(render.paint(f"{len(rows)} subsystems", "1", color))
+    print(render.paint(f"{len(rows)} subsystems  [{_linux(meta)}]", "1", color))
     for r in rows:
         print(f"  {r['n_files']:>6,}  {r['status'] or '?':<16} {r['name']}")
 
@@ -827,7 +878,7 @@ def cmd_subsystem(args):
     f = query.subsystem_json_fields(s)
     if args.format == "json":
         payload = dict(name=s["name"], status=s["status"], n_files=s["n_files"],
-                       web=s["web"], **f)
+                       web=s["web"], index=index_version(meta), **f)
         if args.files:
             payload["files"] = [r["path"] for r in conn.execute(
                 "SELECT f.path FROM files f JOIN path_subsys p ON p.ref_kind='file'"
@@ -837,6 +888,7 @@ def cmd_subsystem(args):
         return
     color = render.use_color(args.color)
     print(render.paint(s["name"], "1;35", color))
+    print(f"  index        {_linux(meta)}")
     print(f"  status       {s['status'] or 'unknown'}")
     for who in f["maintainers"]:
         print(f"  maintainer   {who}")
@@ -908,7 +960,8 @@ def cmd_tree(args):
     relative = [replace(e, path=e.path[len(prefix):]) for e in entries]
     print(render.paint(f"{base or 'kernel root'}/", "1;34", color))
     sys.stdout.write(render.render_tree(relative, color))
-    print(render.paint(f"\n{len(entries)} entries (depth {max_depth})", "90", color))
+    print(render.paint(f"\n{len(entries)} entries (depth {max_depth})  [{_linux(meta)}]",
+                       "90", color))
 
 
 def cmd_path(args):
@@ -968,7 +1021,8 @@ def cmd_show(args):
             head = f"{t.path}:{t.line}  {t.name}"
         label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
         print(render.paint(head, "1;36", color)
-              + (render.paint(f"   [{label}]", "35", color) if label else ""))
+              + (render.paint(f"   [{label}]", "35", color) if label else "")
+              + render.paint(f"   [{_linux(meta)}]", "90", color))
     printed = 0
     try:
         with full.open(encoding="utf-8", errors="replace") as fh:
@@ -1057,7 +1111,7 @@ def cmd_trace(args):
 
     color = render.use_color(args.color)
     print(render.paint(f"Backtrace across {len(results)} frames "
-                       f"(Linux {meta.get('kernel_version', '?')})\n", "1", color))
+                       f"({_linux(meta)})\n", "1", color))
     wname = max((len(r["frame"]) for r in results), default=10)
     for i, r in enumerate(results):
         idx = render.paint(f"#{i:<2}", "90", color)
@@ -1084,8 +1138,8 @@ def cmd_trace(args):
 def cmd_calls(args):
     conn, meta = open_index(args)
     if db.get_meta(conn).get("has_calls") != "1":
-        _die(f"this index has no call graph — rebuild with "
-             f"'{PROG} build <version> --with-calls'")
+        _die(f"this index ({index_version(meta)}) has no call graph — rebuild with "
+             f"'{PROG} build {index_version(meta)} --with-calls'")
     res = resolve_or_die(conn, args.target)
     t = res.target
     if t.kind != "symbol":
@@ -1096,7 +1150,8 @@ def cmd_calls(args):
                                args)
         query.annotate_subsystems(conn, entries)
         args.columns = args.columns or "kind,name,path,line,subsystem"
-        emit(entries, args, {"function"}, True, f"Functions that call {t.name}\n")
+        emit(entries, args, {"function"}, True,
+             f"Functions that call {t.name}  [{_linux(meta)}]\n")
         return
 
     names = query.callees(conn, t.id, limit=args.limit or 200)
@@ -1113,7 +1168,8 @@ def cmd_calls(args):
     entries = _post_filter(entries, args)
     query.annotate_subsystems(conn, entries)
     args.columns = args.columns or "kind,name,path,line,subsystem"
-    emit(entries, args, {"function"}, True, f"Called by {t.display}\n")
+    emit(entries, args, {"function"}, True,
+         f"Called by {t.display}  [{_linux(meta)}]\n")
 
 
 def cmd_web(args):
@@ -1122,7 +1178,7 @@ def cmd_web(args):
     res = resolve_or_die(conn, args.target)
     t = res.target
     lnks = _links_for(meta, t)
-    version = meta.get("kernel_version", "?")
+    version = index_version(meta)
 
     if args.url:
         url = lnks.get(args.url)
@@ -1165,11 +1221,12 @@ def cmd_docs(args):
         _die(f"no Documentation/ files related to {t.display}")
     sub = query.subsystem_for_target(conn, t)
     label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
-    version = meta.get("kernel_version", "")
+    version = index_version(meta)
     if args.format == "json":
         payload = []
         for e in entries:
-            item = {"path": e.path, "name": e.name, "lines": e.lines, "size": e.size}
+            item = {"path": e.path, "name": e.name, "lines": e.lines, "size": e.size,
+                    "index": version}
             item.update(links.links(version, e.path))
             payload.append(item)
         sys.stdout.write(render.render_json(payload))
@@ -1178,6 +1235,7 @@ def cmd_docs(args):
     head = f"Documentation related to {t.display}"
     if label:
         head += f"   [{label}]"
+    head += f"   [{_linux(meta)}]"
     print(render.paint(head, "1", color))
     if res.note:
         print(render.paint(f"  ({res.note})", "33", color))
@@ -1189,32 +1247,54 @@ def cmd_docs(args):
 
 def cmd_locate(args):
     """Resolve a target in every built index, so you can see it move across versions."""
-    available = config.list_indexes()
-    if not available:
-        _die(f"no index built yet — run '{PROG} build lts' first")
-    available = sorted(available, key=_version_key, reverse=True)
+    if getattr(args, "db", None):
+        db_path = Path(args.db).expanduser()
+        if not db_path.is_file():
+            _die(f"no index at {db_path}")
+        available = [db_path]
+        active = db_path
+    else:
+        available = config.list_indexes()
+        if not available:
+            _die(f"no index built yet — run '{PROG} build lts' first")
+        active = selected_index(args)
+
+    def _same(a: Path, b: Path | None) -> bool:
+        if b is None:
+            return False
+        try:
+            return a.resolve() == b.resolve()
+        except OSError:
+            return a == b
+
+    rest = [p for p in available if not _same(p, active)]
+    rest.sort(key=_version_key, reverse=True)
+    ordered = ([active] if active is not None and any(_same(p, active) for p in available)
+               else []) + rest
+
     spec = args.target
     rows = []
-    for path in available:
+    for path in ordered:
         conn = None
+        is_active = _same(path, active)
         try:
             try:
                 conn = db.connect(path, readonly=True)
                 meta = db.get_meta(conn)
-                # The filename is what `indexes` / `use` / `-K` talk about.
                 version = path.stem
                 if not meta.get("kernel_version"):
                     rows.append({"version": version, "found": False,
-                                 "error": "interrupted build"})
+                                 "active": is_active, "error": "interrupted build"})
                     continue
                 res = query.resolve(conn, spec)
             except sqlite3.Error as exc:
                 rows.append({"version": path.stem, "found": False,
-                             "error": str(exc)})
+                             "active": is_active, "error": str(exc)})
                 continue
             t = res.target
             if t is None:
-                rows.append({"version": version, "found": False, "note": res.note})
+                rows.append({"version": version, "found": False,
+                             "active": is_active, "note": res.note})
             else:
                 sub = query.subsystem_for_target(conn, t)
                 label = (sub["name"] if sub and sub["name"] not in query.CATCH_ALL
@@ -1223,7 +1303,7 @@ def cmd_locate(args):
                     area = query.describe_area(t.path)
                     label = area[0] if area else (sub["name"] if sub else None)
                 rows.append({
-                    "version": version, "found": True,
+                    "version": version, "found": True, "active": is_active,
                     "kind": t.symbol_kind or t.kind,
                     "name": t.name, "path": t.path or ".",
                     "line": t.line, "end_line": t.end_line,
@@ -1238,20 +1318,24 @@ def cmd_locate(args):
         return
 
     color = render.use_color(args.color)
+    active_name = next((r["version"] for r in rows if r.get("active")), None)
+    note = f"  * = {_linux({'index_stem': active_name})}" if active_name else ""
     print(render.paint(f"{spec}  across {len(rows)} index"
-                       f"{'es' if len(rows) != 1 else ''}\n", "1", color))
+                       f"{'es' if len(rows) != 1 else ''}{note}\n", "1", color))
     wver = max((len(r["version"]) for r in rows), default=8)
     for r in rows:
+        mark = "*" if r.get("active") else " "
         ver = r["version"].ljust(wver)
+        prefix = f"  {mark} {ver}"
         if not r.get("found"):
             why = r.get("error") or "not in this index"
-            print(f"  {ver}  {render.paint(why, '90', color)}")
+            print(f"{prefix}  {render.paint(why, '90', color)}")
             continue
         loc = r["path"]
         if r.get("line"):
             loc = f"{r['path']}:{r['line']}"
         sub = r.get("subsystem") or "-"
-        print(f"  {render.paint(ver, '32', color)}  {r['kind']:<10} "
+        print(f"{prefix}  {r['kind']:<10} "
               f"{loc:<42} {render.paint(sub, '35', color)}")
 
 
