@@ -59,6 +59,29 @@ def list_indexes() -> list[Path]:
     return sorted(d.glob("*.db"))
 
 
+def default_version_file() -> Path:
+    return index_dir() / ".default-version"
+
+
+def get_default_version() -> str | None:
+    """The version pinned with `ka use`, or None if nothing is pinned."""
+    try:
+        value = default_version_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def set_default_version(version: str) -> None:
+    f = default_version_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(version + "\n", encoding="utf-8")
+
+
+def clear_default_version() -> None:
+    default_version_file().unlink(missing_ok=True)
+
+
 def tree_for(version: str, recorded: str | None = None) -> Path | None:
     """Find the source tree for a version.
 

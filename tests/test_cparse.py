@@ -125,15 +125,52 @@ def test_trailing_attribute_macro_is_not_a_variable_name():
     assert syms["sem"].kind == "struct"
 
 
-def test_declaration_macros_yield_their_first_argument():
+def test_declaration_macros_yield_the_declared_name():
     syms = by_name(parse("""
         static DECLARE_WORK(free_ipc_work, free_ipc);
         static DEFINE_MUTEX(foo_lock);
         static LIST_HEAD(my_list);
+        static DECLARE_BITMAP(found_map, MAX_UNITS);
     """))
     assert syms["free_ipc_work"].kind == "variable"
     assert syms["foo_lock"].kind == "variable"
     assert syms["my_list"].kind == "variable"
+    assert syms["found_map"].kind == "variable"
+
+
+def test_per_cpu_macros_use_the_second_argument():
+    """DEFINE_PER_CPU(type, name) is name-second, unlike DECLARE_WORK."""
+    syms = by_name(parse("""
+        static DEFINE_PER_CPU(int, cpu_number);
+        static DEFINE_PER_CPU(u64, cpu_ticks);
+    """))
+    assert "cpu_number" in syms
+    assert "cpu_ticks" in syms
+    assert "int" not in syms and "u64" not in syms
+
+
+def test_export_per_cpu_symbol_is_detected():
+    syms = by_name(parse("""
+        static DEFINE_PER_CPU(int, cpu_number);
+        EXPORT_PER_CPU_SYMBOL(cpu_number);
+    """))
+    assert syms["cpu_number"].is_exported
+
+
+def test_misparsed_type_keywords_never_become_symbols():
+    """`STATIC int INIT fn(...)` with unexpanded macros must not produce a
+    variable literally named 'int'."""
+    syms = by_name(parse("STATIC int INIT get_next_block(struct bd *b)\n{\n}\n"))
+    assert "int" not in syms and "unsigned" not in syms
+
+
+def test_shouting_case_prototypes_are_macro_artifacts():
+    kinds = KINDS | {"prototype"}
+    syms = by_name(parse(
+        "DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);\n"
+        "int real_fn(void);\n", kinds))
+    assert "DEFINE_PER_CPU_SHARED_ALIGNED" not in syms
+    assert syms["real_fn"].kind == "prototype"
 
 
 def test_no_symbol_ever_has_an_empty_name():
