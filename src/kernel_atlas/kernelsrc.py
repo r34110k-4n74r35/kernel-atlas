@@ -87,6 +87,12 @@ def resolve_version(spec: str, timeout: int = 30) -> Release:
                 return rel
     except OSError:
         pass
+    if "-rc" in spec:
+        # Release candidates are only published as git snapshots, not on the
+        # CDN, so a synthesised URL would 404 confusingly.
+        raise LookupError(
+            f"{spec} is a release candidate no longer offered by kernel.org; "
+            f"only current RCs (see 'versions') can be downloaded")
     return Release(moniker="explicit", version=spec, source=tarball_url(spec), released=None)
 
 

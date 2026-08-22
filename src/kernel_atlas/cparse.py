@@ -37,7 +37,8 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_SIGNATURE = 400
 
 _SYSCALL_MACRO = re.compile(r"^(COMPAT_)?SYSCALL_DEFINE(\d)$")
-_EXPORT_MACRO = re.compile(r"^EXPORT_SYMBOL(_GPL|_NS|_NS_GPL|_FOR_MODULES)?$")
+_EXPORT_MACRO = re.compile(
+    r"^EXPORT(_PER_CPU)?_SYMBOL(_GPL|_NS|_NS_GPL|_FOR_MODULES)?$")
 
 # Alignment/section attributes written after a declarator. Without the
 # preprocessor these look exactly like the variable's name, e.g.
@@ -52,6 +53,17 @@ _ATTRIBUTE_MACROS = frozenset({
     "__must_check", "__percpu", "__rcu", "__iomem", "__user", "__kernel",
     "__randomize_layout", "__no_randomize_layout", "__attribute_const__",
     "__nocast", "__safe", "__force", "__private",
+})
+
+# Names that can only come out of a misparse of unexpanded macros, never from
+# a real declaration, e.g. `STATIC int INIT get_next_block(...)` yielding a
+# "variable" called `int`.
+_C_TYPE_KEYWORDS = frozenset({
+    "int", "long", "short", "char", "unsigned", "signed", "void", "float",
+    "double", "bool", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
+    "size_t", "ssize_t", "struct", "union", "enum", "const", "volatile",
+    "static", "extern", "register", "inline", "typedef", "if", "else", "for",
+    "while", "do", "return", "goto", "switch", "case", "default", "sizeof",
 })
 
 _DECLARATOR_FIELDS = {
@@ -189,19 +201,37 @@ def _is_file_scope(node) -> bool:
 
 
 def _macro_decl_name(src: bytes, node) -> str | None:
-    """Recover the name from a two-or-more argument declaration macro.
+    """Recover the declared name from a multi-argument declaration macro.
 
-    ``static DECLARE_WORK(free_ipc_work, free_ipc);`` parses as a
-    ``macro_type_specifier`` plus a MISSING declarator, so the declared name is
-    really the macro's first argument.
+    Conventions differ — ``DECLARE_WORK(name, fn)`` puts the name first while
+    ``DEFINE_PER_CPU(type, name)`` puts it second — and tree-sitter scatters
+    the arguments between clean ``type_descriptor`` nodes and ERROR recovery
+    nodes depending on whether the first token is a C keyword. Gather every
+    argument-ish identifier in order and return the first one that could not be
+    a type.
     """
     for child in node.named_children:
         if child.type != "macro_type_specifier":
             continue
-        for arg in child.named_children:
-            if arg.type == "type_descriptor":
-                text = _text(src, arg).strip()
-                return text if text.isidentifier() else None
+        candidates: list[str] = []
+
+        def collect(n) -> None:
+            if n.type in ("type_descriptor", "identifier", "type_identifier"):
+                text = _text(src, n).strip()
+                if text:
+                    candidates.append(text)
+            elif n.type == "ERROR":
+                for c in n.children:
+                    collect(c)
+
+        # Skip the leading identifier, which is the macro name itself.
+        for arg in list(child.named_children)[1:]:
+            collect(arg)
+
+        for cand in candidates:
+            if cand.isidentifier() and cand not in _C_TYPE_KEYWORDS:
+                return cand
+        return None
     return None
 
 
@@ -385,22 +415,38 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
             start, end = _lines(node)
 
             declarators = node.children_by_field_name("declarator")
-            if not declarators:
-                macro_name = _macro_decl_name(src, node)
-                if macro_name and VARIABLE in kinds:
-                    symbols.append(Symbol(
-                        name=macro_name, kind=VARIABLE, start_line=start,
-                        end_line=end, signature=_squash(head),
-                        is_static=is_static))
-                continue
+            macro_name = _macro_decl_name(src, node)
+            if macro_name and VARIABLE in kinds:
+                symbols.append(Symbol(
+                    name=macro_name, kind=VARIABLE, start_line=start,
+                    end_line=end, signature=_squash(head),
+                    is_static=is_static))
+
             for decl in declarators:
                 name_node = _declarator_name(decl)
                 name = _text(src, name_node).strip() if name_node is not None else ""
-                if not name:
-                    name = _macro_decl_name(src, node) or ""
-                if not name or name in _ATTRIBUTE_MACROS:
+                # Tree-sitter sometimes glues the next statement onto this
+                # declaration; EXPORT_PER_CPU_SYMBOL(foo) then looks like a
+                # function declarator rather than a call.
+                if name and _EXPORT_MACRO.match(name):
+                    plist = decl.child_by_field_name("parameters")
+                    if plist is not None:
+                        for p in plist.named_children:
+                            arg = _text(src, p).strip()
+                            if arg.isidentifier():
+                                exported.add(arg)
+                    continue
+                if macro_name:
+                    continue
+                if not name or name in _ATTRIBUTE_MACROS \
+                        or name in _C_TYPE_KEYWORDS:
                     continue
                 kind = PROTOTYPE if _is_function_prototype(decl) else VARIABLE
+                # `DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);` parses
+                # as a prototype named after the macro; real prototypes are
+                # never SHOUTING_CASE.
+                if kind == PROTOTYPE and re.fullmatch(r"[A-Z][A-Z0-9_]+", name):
+                    continue
                 if kind not in kinds:
                     continue
                 symbols.append(Symbol(

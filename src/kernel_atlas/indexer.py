@@ -86,7 +86,8 @@ def _scan_tree(tree: Path, conn: sqlite3.Connection, quiet: bool):
     while queue:
         abs_dir, rel_dir, parent_id = queue.popleft()
         try:
-            entries = sorted(os.scandir(abs_dir), key=lambda e: e.name)
+            with os.scandir(abs_dir) as it:
+                entries = sorted(it, key=lambda e: e.name)
         except OSError:
             continue
         for entry in entries:

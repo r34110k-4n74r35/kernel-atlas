@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sqlite3
 import sys
 from dataclasses import replace
@@ -38,27 +39,49 @@ def _version_key(path: Path) -> tuple:
         return (0, ())
 
 
+def resolve_index_spec(spec: str) -> Path:
+    """Turn a version or unique version prefix into an index path, or die."""
+    path = config.index_path(spec)
+    if path.is_file():
+        return path
+    matches = [p for p in config.list_indexes() if p.stem.startswith(spec)]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        _die(f"{spec!r} is ambiguous: " + ", ".join(p.stem for p in matches))
+    have = ", ".join(p.stem for p in config.list_indexes()) or "none built yet"
+    _die(f"no index for {spec!r} (built: {have})")
+
+
+def default_index(*, warn: bool = True) -> Path:
+    """The index used when neither --db nor -K is given.
+
+    Precedence: the version pinned with `{PROG} use`, then the highest built
+    version — which is predictable, unlike file modification times.
+    """
+    available = config.list_indexes()
+    if not available:
+        _die(f"no index built yet — run '{PROG} build lts' first")
+    pinned = config.get_default_version()
+    if pinned:
+        path = config.index_path(pinned)
+        if path.is_file():
+            return path
+        if warn:
+            print(f"{PROG}: pinned version {pinned} has no index any more; "
+                  f"falling back to the highest built version "
+                  f"(fix with '{PROG} use <version>' or '{PROG} use --clear')",
+                  file=sys.stderr)
+    return max(available, key=_version_key)
+
+
 def open_index(args) -> tuple[sqlite3.Connection, dict]:
     if getattr(args, "db", None):
         path = Path(args.db).expanduser()
+    elif getattr(args, "kernel", None):
+        path = resolve_index_spec(args.kernel)
     else:
-        wanted = getattr(args, "kernel", None)
-        if wanted:
-            path = config.index_path(wanted)
-            if not path.is_file():
-                matches = [p for p in config.list_indexes()
-                           if p.stem.startswith(wanted)]
-                if len(matches) == 1:
-                    path = matches[0]
-                elif matches:
-                    _die(f"-K {wanted} is ambiguous: "
-                         + ", ".join(p.stem for p in matches))
-        else:
-            available = config.list_indexes()
-            if not available:
-                _die(f"no index built yet — run '{PROG} build lts' first")
-            # Highest kernel version wins, which is predictable; mtime is not.
-            path = max(available, key=_version_key)
+        path = default_index()
     if not path.is_file():
         _die(f"no index at {path} — run '{PROG} build <version>' first")
     try:
@@ -125,7 +148,12 @@ def resolve_or_die(conn, spec: str) -> query.Resolution:
 
 def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str]:
     if getattr(args, "columns", None):
-        return _split_list(args.columns)
+        cols = _split_list(args.columns)
+        bad = [c for c in cols if c not in render.COLUMNS]
+        if bad:
+            _die(f"unknown column(s): {', '.join(bad)}"
+                 f" — valid: {', '.join(render.COLUMNS)}")
+        return cols
     only_dirs = kinds_listed <= {"dir"}
     only_files = kinds_listed <= {"file"}
     only_syms = kinds_listed and not (kinds_listed & {"dir", "file"})
@@ -284,8 +312,8 @@ def cmd_build(args):
         + (f"  {stats.calls:,} call edges\n" if stats.calls else "")
         + f"  {stats.subsystems:,} subsystems from MAINTAINERS\n"
         f"  {out}  ({size_mb:.0f} MB, {stats.seconds:.0f}s)\n"
-        f"\nTry:  {PROG} info fs/ext4\n"
-        f"      {PROG} siblings fs/ext4/inode.c"
+        f"\nTry:  {PROG} info net/ipv4\n"
+        f"      {PROG} siblings net/ipv4/tcp.c"
     )
 
 
@@ -294,24 +322,131 @@ def cmd_indexes(args):
     if not paths:
         print(f"no indexes yet — run '{PROG} build lts'")
         return
+    active = default_index() if paths else None
     rows = []
-    for p in paths:
+    for p in sorted(paths, key=_version_key, reverse=True):
         try:
             conn = db.connect(p, readonly=True)
             meta = db.get_meta(conn)
             conn.close()
         except Exception:
             meta = {}
-        rows.append((meta.get("kernel_version", p.stem), meta.get("n_files", "?"),
-                     meta.get("n_symbols", "?"), meta.get("built_at", "?"),
-                     f"{p.stat().st_size / 1048576:.0f} MB", str(p)))
+        source_here = config.tree_for(meta.get("kernel_version", p.stem),
+                                      meta.get("tree_path")) is not None
+        rows.append({
+            "version": meta.get("kernel_version", p.stem),
+            "files": meta.get("n_files", "?"),
+            "symbols": meta.get("n_symbols", "?"),
+            "calls": meta.get("has_calls") == "1",
+            "source": source_here,
+            "built_at": meta.get("built_at", "?"),
+            "size": f"{p.stat().st_size / 1048576:.0f} MB",
+            "default": p == active,
+            "path": str(p),
+        })
     if args.format == "json":
-        keys = ("version", "files", "symbols", "built_at", "size", "path")
-        sys.stdout.write(render.render_json([dict(zip(keys, r)) for r in rows]))
+        sys.stdout.write(render.render_json(rows))
         return
-    print(f"  {'VERSION':<14} {'FILES':>8} {'SYMBOLS':>10} {'BUILT':<20} {'SIZE':>8}")
+    color = render.use_color(args.color)
+    print(f"    {'VERSION':<12} {'FILES':>8} {'SYMBOLS':>10} {'CALLS':<6} "
+          f"{'SOURCE':<7} {'BUILT':<20} {'SIZE':>8}")
     for r in rows:
-        print(f"  {r[0]:<14} {r[1]:>8} {r[2]:>10} {r[3]:<20} {r[4]:>8}")
+        mark = "*" if r["default"] else " "
+        line = (f"  {mark} {r['version']:<12} {r['files']:>8} {r['symbols']:>10} "
+                f"{'yes' if r['calls'] else '-':<6} "
+                f"{'yes' if r['source'] else '-':<7} {r['built_at']:<20} "
+                f"{r['size']:>8}")
+        print(render.paint(line, "1", color) if r["default"] else line)
+    pinned = config.get_default_version()
+    note = (f"pinned with '{PROG} use {pinned}'" if pinned
+            else f"highest version (pin one with '{PROG} use <version>')")
+    print(render.paint(f"\n  * = default index — {note}", "90", color))
+
+
+def cmd_use(args):
+    if args.clear and args.version:
+        _die("pass a version or --clear, not both")
+    if args.clear:
+        was = config.get_default_version()
+        config.clear_default_version()
+        if was:
+            print(f"cleared pin on {was}; the highest built version is the default again")
+        else:
+            print("nothing was pinned")
+        return
+    if not args.version:
+        available = config.list_indexes()
+        pinned = config.get_default_version()
+        if not available:
+            print("no indexes built yet — run "
+                  f"'{PROG} build lts', then '{PROG} use <version>'")
+            return
+        if pinned:
+            pin_path = config.index_path(pinned)
+            if pin_path.is_file():
+                print(f"pinned: {pinned}")
+            else:
+                print(f"pinned: {pinned}  (index is gone — "
+                      f"'{PROG} use --clear' or '{PROG} use <version>')")
+        else:
+            print("nothing pinned; defaulting to the highest built version")
+        active = default_index(warn=False)
+        print(f"active index: {active.stem}  ({active})")
+        return
+    path = resolve_index_spec(args.version)
+    config.set_default_version(path.stem)
+    print(f"default index is now {path.stem}\n"
+          f"  every command without -K/--db will use it; "
+          f"undo with '{PROG} use --clear'")
+
+
+def _unlink_index(path: Path) -> int:
+    """Delete an index and any SQLite sidecar files. Returns bytes freed."""
+    freed = 0
+    for extra in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"),
+                  path.with_suffix(".db-journal")):
+        if extra.is_file():
+            freed += extra.stat().st_size
+            extra.unlink()
+    return freed
+
+
+def cmd_remove(args):
+    # Resolve everything first so 'remove 6.18 6.18.45' (the second is the
+    # expansion of the first) does not fail halfway through.
+    unique: list[Path] = []
+    for spec in args.versions:
+        path = resolve_index_spec(spec)
+        if path not in unique:
+            unique.append(path)
+
+    freed = 0
+    for path in unique:
+        version = path.stem
+        size = _unlink_index(path)
+        freed += size
+        print(f"removed index   {path}  ({size / 1048576:.0f} MB)")
+
+        if config.get_default_version() == version:
+            config.clear_default_version()
+            print("  (it was the pinned default; the pin has been cleared)")
+
+        tree = config.source_path(version)
+        if args.source:
+            if tree.is_dir():
+                try:
+                    shutil.rmtree(tree)
+                except OSError as exc:
+                    print(f"  could not remove source {tree}: {exc}",
+                          file=sys.stderr)
+                else:
+                    print(f"removed source  {tree}")
+            else:
+                print(f"no source tree at {tree}")
+        elif tree.is_dir():
+            print(f"  (source kept at {tree}; remove it too with --source)")
+    print(f"\nfreed {freed / 1048576:.0f} MB of index files"
+          + (" (source trees not counted)" if args.source else ""))
 
 
 def cmd_stats(args):
@@ -530,14 +665,39 @@ def cmd_ls(args):
     emit(entries, args, set(kinds), args.with_subsystem, f"{scope.label}\n")
 
 
+def _post_filter(entries, args):
+    """Apply --grep and the static filters to already-fetched entries."""
+    pattern = _checked_grep(getattr(args, "grep", None))
+    if pattern:
+        rx = re.compile(pattern, re.IGNORECASE)
+        entries = [e for e in entries if rx.search(e.name)]
+    if getattr(args, "static_only", False):
+        entries = [e for e in entries if e.is_static]
+    elif getattr(args, "no_static", False):
+        entries = [e for e in entries if not e.is_static]
+    return entries
+
+
 def cmd_find(args):
     conn, meta = open_index(args)
     mode = "exact" if args.exact else ("glob" if args.glob else
                                        ("prefix" if args.prefix else "substring"))
-    kinds = _split_list(args.kinds)
+    if _split_list(args.kinds):
+        kinds = [k for k in kinds_from_args(args, None) if k in query.SYMBOL_KINDS]
+        if not kinds:
+            _die("find only searches symbols; try --kinds function,struct,...")
+    else:
+        kinds = []
+    # Over-fetch when a Python-side filter will shrink the result set.
+    narrowing = args.grep or args.static_only or args.no_static
+    limit = args.limit or 50
     entries = query.search(conn, args.pattern, kinds=kinds, mode=mode,
-                           limit=args.limit or 50, exported_only=args.exported,
-                           with_subsystem=args.format != "names")
+                           limit=limit * 20 if narrowing else limit,
+                           exported_only=args.exported,
+                           with_subsystem=False)
+    entries = _post_filter(entries, args)[:limit]
+    if args.format != "names":
+        query.annotate_subsystems(conn, entries)
     cols = _split_list(args.columns) or ["kind", "name", "path", "line", "subsystem"]
     args.columns = ",".join(cols)
     emit(entries, args, {"function"}, True,
@@ -546,16 +706,15 @@ def cmd_find(args):
 
 def cmd_subsystems(args):
     conn, meta = open_index(args)
-    sql = "SELECT * FROM subsystems"
-    params: list = []
-    if args.grep:
-        sql += " WHERE name LIKE ?"
-        params.append(f"%{args.grep}%")
-    sql += f" ORDER BY {'n_files DESC' if args.sort == 'size' else 'name'}"
+    rows = conn.execute(
+        "SELECT * FROM subsystems "
+        f"ORDER BY {'n_files DESC' if args.sort == 'size' else 'name'}").fetchall()
+    pattern = _checked_grep(args.grep)
+    if pattern:
+        rx = re.compile(pattern, re.IGNORECASE)
+        rows = [r for r in rows if rx.search(r["name"] or "")]
     if args.limit:
-        sql += " LIMIT ?"
-        params.append(args.limit)
-    rows = conn.execute(sql, params).fetchall()
+        rows = rows[:args.limit]
     if args.format == "json":
         sys.stdout.write(render.render_json(
             [dict(name=r["name"], status=r["status"], n_files=r["n_files"],
@@ -661,7 +820,7 @@ def cmd_tree(args):
 
 
 def cmd_path(args):
-    """Print the on-disk path, so `$EDITOR $(ka path ext4_bmap)` just works."""
+    """Print the on-disk path, so `$EDITOR $(ka path tcp_sendmsg)` just works."""
     conn, meta = open_index(args)
     res = resolve_or_die(conn, args.target)
     t = res.target
@@ -725,7 +884,7 @@ def _frames_from_text(text: str) -> list[str]:
         if m:
             frames.extend(m)
             continue
-        # 'ext4_bmap' or '#3  0x... in ext4_bmap (...)' or a bare name per line
+        # 'tcp_sendmsg' or '#3  0x... in tcp_sendmsg (...)' or a bare name per line
         if " in " in line:
             tail = line.split(" in ", 1)[1]
             cand = _IDENT_RE.findall(tail)
@@ -816,7 +975,8 @@ def cmd_calls(args):
         _die(f"{t.display} is not a symbol")
 
     if args.callers:
-        entries = query.callers(conn, t.name, limit=args.limit or 100)
+        entries = _post_filter(query.callers(conn, t.name, limit=args.limit or 100),
+                               args)
         query.annotate_subsystems(conn, entries)
         args.columns = args.columns or "kind,name,path,line,subsystem"
         emit(entries, args, {"function"}, True, f"Functions that call {t.name}\n")
@@ -833,6 +993,7 @@ def cmd_calls(args):
             # A callee with no definition anywhere in the index: usually a
             # compiler builtin or a macro the parser could not attribute.
             entries.append(Entry(kind="?", name=n, path="-"))
+    entries = _post_filter(entries, args)
     query.annotate_subsystems(conn, entries)
     args.columns = args.columns or "kind,name,path,line,subsystem"
     emit(entries, args, {"function"}, True, f"Called by {t.display}\n")
@@ -890,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=PROG,
         description="Index a Linux kernel tree and explore its structure, "
                     "symbols and subsystems.",
-        epilog=f"Start with:  {PROG} build lts     then:  {PROG} info fs/ext4",
+        epilog=f"Start with:  {PROG} build lts     then:  {PROG} info net/ipv4",
     )
     _global_opts(p, suppress=False)
 
@@ -929,13 +1090,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_indexes)
 
+    sp = add("use", help="pin which kernel version commands use by default")
+    sp.add_argument("version", nargs="?",
+                    help="version or unique prefix; omit to show the current one")
+    sp.add_argument("--clear", action="store_true",
+                    help="unpin; go back to the highest built version")
+    sp.set_defaults(func=cmd_use)
+
+    sp = add("remove", aliases=["rm"], help="delete built indexes")
+    sp.add_argument("versions", nargs="+", metavar="VERSION",
+                    help="one or more versions (or unique prefixes) to delete")
+    sp.add_argument("--source", action="store_true",
+                    help="also delete the kernel source tree under kernels/")
+    sp.set_defaults(func=cmd_remove)
+
     sp = add("stats", help="overview of an index")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_stats)
 
     sp = add("info", help="explain one folder, file or symbol")
-    sp.add_argument("target", help="fs/ext4 | fs/ext4/inode.c | ext4_bmap | "
-                                   "fs/ext4/inode.c:ext4_bmap | fs/ext4/inode.c:120")
+    sp.add_argument("target", help="net/ipv4 | net/ipv4/tcp.c | tcp_sendmsg | "
+                                   "net/ipv4/tcp.c:tcp_sendmsg | net/ipv4/tcp.c:120")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.add_argument("--max-subsystems", type=int, default=3)
     sp.add_argument("--max-candidates", type=int, default=10)
@@ -961,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("find", help="search for a symbol by name")
     sp.add_argument("pattern")
     sp.add_argument("--exact", action="store_true")
-    sp.add_argument("--glob", action="store_true", help="pattern is a glob (ext4_*)")
+    sp.add_argument("--glob", action="store_true", help="pattern is a glob (tcp_*)")
     sp.add_argument("--prefix", action="store_true")
     _add_filter_opts(sp)
     _add_output_opts(sp, sorts=False)
