@@ -90,7 +90,7 @@ def connect(path: Path, readonly: bool = True) -> sqlite3.Connection:
     if readonly:
         if not path.is_file():
             raise FileNotFoundError(path)
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)

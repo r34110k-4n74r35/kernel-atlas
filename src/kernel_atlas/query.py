@@ -109,6 +109,18 @@ def parent_path(path: str) -> str:
     return path.rsplit("/", 1)[0]
 
 
+def like_escape(s: str) -> str:
+    """Escape ``\\``, ``%`` and ``_`` so a kernel path is a literal LIKE prefix."""
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def like_under(path: str) -> str:
+    """LIKE pattern for every path strictly below `path` (``''`` → the whole tree)."""
+    if not path:
+        return "%"
+    return like_escape(path) + "/%"
+
+
 def _sym_target(conn: sqlite3.Connection, row: sqlite3.Row) -> Target:
     return Target(
         kind="symbol", id=row["id"], path=row["path"], name=row["name"],
@@ -125,11 +137,29 @@ FROM symbols s JOIN files f ON f.id = s.file_id
 """
 
 
+_COPY_PREFIXES = ("tools/", "samples/", "Documentation/", "usr/")
+
+_KIND_RANK = {
+    "function": 0, "syscall": 0, "struct": 1, "typedef": 1, "enum": 1,
+    "union": 1, "macro": 2, "variable": 3, "prototype": 4,
+}
+
+
+def _def_rank(path: str, symbol_kind: str | None, is_static: bool) -> tuple:
+    """Quality of a definition: real code first, then shallower paths.
+
+    Shorter *string* length used to win, so ``include/linux/raid/pq.h``
+    (a ``#define GFP_KERNEL 0`` stub) beat ``include/linux/gfp_types.h``.
+    """
+    path = path or ""
+    copy = 1 if path.startswith(_COPY_PREFIXES) else 0
+    return (_KIND_RANK.get(symbol_kind or "", 5), int(is_static), copy,
+            path.count("/"), len(path))
+
+
 def _rank_candidate(t: Target) -> tuple:
-    """Prefer real definitions over prototypes, and exported over file-local."""
-    kind_rank = {"function": 0, "syscall": 0, "struct": 1, "typedef": 1, "enum": 1,
-                 "union": 1, "macro": 2, "variable": 3, "prototype": 4}
-    return (kind_rank.get(t.symbol_kind or "", 5), t.is_static, len(t.path))
+    """Prefer real definitions over prototypes, copies, and nested stubs."""
+    return _def_rank(t.path, t.symbol_kind, t.is_static)
 
 
 def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
@@ -331,12 +361,14 @@ def build_scope(conn: sqlite3.Connection, t: Target, level: str) -> Scope:
 
     if level == "subtree":
         base = t.path if t.kind == "dir" else parent_path(t.path)
-        like = f"{base}/%" if base else "%"
+        like = like_under(base)
         return Scope(
             f"everything under {base or 'the kernel root'}",
-            "SELECT * FROM dirs WHERE path = ? OR path LIKE ?", (base, like),
-            "SELECT * FROM files WHERE path LIKE ?", (like,),
-            "s.file_id IN (SELECT id FROM files WHERE path LIKE ?)", (like,))
+            "SELECT * FROM dirs WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+            (base, like),
+            "SELECT * FROM files WHERE path LIKE ? ESCAPE '\\'", (like,),
+            "s.file_id IN (SELECT id FROM files WHERE path LIKE ? ESCAPE '\\')",
+            (like,))
 
     # level == "dir": the container directory.
     if t.kind == "dir":
@@ -374,27 +406,86 @@ def default_kinds(t: Target) -> tuple[str, ...]:
     return (t.symbol_kind or "function",)
 
 
+def _enable_regexp(conn: sqlite3.Connection) -> None:
+    """Install a Python REGEXP so --grep can filter inside SQLite (and LIMIT)."""
+
+    def regexp(pattern: str, value: str | None) -> bool:
+        if not pattern or value is None:
+            return False
+        try:
+            return re.search(pattern, value, re.IGNORECASE) is not None
+        except re.error:
+            return False
+
+    conn.create_function("REGEXP", 2, regexp, deterministic=True)
+
+
+def _bounded(conn: sqlite3.Connection, sql: str, params: tuple, *,
+             order: str, limit: int, grep: str | None) -> tuple[str, tuple]:
+    """Wrap a SELECT so grep and LIMIT run in SQLite instead of in Python."""
+    extra: list = []
+    tail = ""
+    if grep:
+        _enable_regexp(conn)
+        tail += " WHERE name REGEXP ?"
+        extra.append(grep)
+    if limit and limit > 0:
+        tail += f" ORDER BY {order} LIMIT {int(limit)}"
+    if not tail:
+        return sql, params
+    return f"SELECT * FROM ({sql}){tail}", tuple(params) + tuple(extra)
+
+
+_DIR_ORDER = {
+    "name": "LOWER(name), path",
+    "path": "path",
+    "kind": "LOWER(name), path",
+    "line": "path",
+    "size": "n_files DESC, LOWER(name)",
+    "lines": "n_files DESC, LOWER(name)",
+}
+_FILE_ORDER = {
+    "name": "LOWER(name), path",
+    "path": "path",
+    "kind": "LOWER(name), path",
+    "line": "path",
+    "size": "size DESC, LOWER(name)",
+    "lines": "lines DESC, LOWER(name)",
+}
+_SYM_ORDER = {
+    "name": "LOWER(name), path",
+    "path": "path, start_line",
+    "kind": "kind, LOWER(name)",
+    "line": "path, start_line",
+    "size": "LOWER(name), path",
+    "lines": "(end_line - start_line) DESC, LOWER(name)",
+}
+
+
 def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
             grep: str | None = None, exported_only: bool = False,
             static: str = "any", with_subsystem: bool = False,
             sort: str = "name") -> list[Entry]:
     kinds = tuple(kinds)
     entries: list[Entry] = []
-    rx = re.compile(grep, re.IGNORECASE) if grep else None
 
     if "dir" in kinds and scope.dir_sql:
-        for r in conn.execute(scope.dir_sql, scope.dir_params):
+        sql, params = _bounded(
+            conn, scope.dir_sql, scope.dir_params,
+            order=_DIR_ORDER.get(sort, _DIR_ORDER["name"]),
+            limit=limit, grep=grep)
+        for r in conn.execute(sql, params):
             if not r["path"]:
-                continue
-            if rx and not rx.search(r["name"]):
                 continue
             entries.append(Entry(kind="dir", name=r["name"], path=r["path"],
                                  n_files=r["n_files"], n_subdirs=r["n_subdirs"]))
 
     if "file" in kinds and scope.file_sql:
-        for r in conn.execute(scope.file_sql, scope.file_params):
-            if rx and not rx.search(r["name"]):
-                continue
+        sql, params = _bounded(
+            conn, scope.file_sql, scope.file_params,
+            order=_FILE_ORDER.get(sort, _FILE_ORDER["name"]),
+            limit=limit, grep=grep)
+        for r in conn.execute(sql, params):
             entries.append(Entry(kind="file", name=r["name"], path=r["path"],
                                  size=r["size"], lines=r["lines"],
                                  n_symbols=r["n_symbols"]))
@@ -410,22 +501,11 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
             sql += " AND s.is_static = 1"
         elif static == "exclude":
             sql += " AND s.is_static = 0"
-        # Symbols are the only source that can be huge (a tree-wide scope holds
-        # millions), so when a limit is set and no Python-side filter remains,
-        # sort and cut inside SQLite instead of materialising everything.
-        if limit and limit > 0 and rx is None:
-            order = {
-                "name": "LOWER(s.name), f.path",
-                "path": "f.path, s.start_line",
-                "kind": "s.kind, LOWER(s.name)",
-                "line": "f.path, s.start_line",
-                "size": "LOWER(s.name), f.path",
-                "lines": "(s.end_line - s.start_line) DESC, LOWER(s.name)",
-            }.get(sort, "LOWER(s.name), f.path")
-            sql += f" ORDER BY {order} LIMIT {int(limit)}"
+        sql, params = _bounded(
+            conn, sql, params,
+            order=_SYM_ORDER.get(sort, _SYM_ORDER["name"]),
+            limit=limit, grep=grep)
         for r in conn.execute(sql, params):
-            if rx and not rx.search(r["name"]):
-                continue
             entries.append(Entry(
                 kind=r["kind"], name=r["name"], path=r["path"],
                 line=r["start_line"], end_line=r["end_line"],
@@ -523,7 +603,7 @@ def ancestry(conn: sqlite3.Connection, path: str) -> list[tuple[str, str | None]
         label = sub["name"] if sub and sub["name"] not in CATCH_ALL else None
         if label is None:
             area = maintainers.top_level_area(p)
-            label = area[0] if area else (sub["name"] if sub else None)
+            label = area[0] if area else None
         out.append((p, label))
     return out
 
@@ -533,8 +613,9 @@ def subsystem_by_name(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
     if exact:
         return exact
     return conn.execute(
-        "SELECT * FROM subsystems WHERE name LIKE ? ORDER BY n_files DESC LIMIT 50",
-        (f"%{name}%",)).fetchall()
+        "SELECT * FROM subsystems WHERE name LIKE ? ESCAPE '\\'"
+        " ORDER BY n_files DESC LIMIT 50",
+        (f"%{like_escape(name)}%",)).fetchall()
 
 
 def subsystem_json_fields(row: sqlite3.Row) -> dict:
@@ -548,16 +629,23 @@ def subsystem_json_fields(row: sqlite3.Row) -> dict:
 
 
 def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 200) -> list[str]:
-    return [r["callee"] for r in conn.execute(
-        "SELECT DISTINCT callee FROM calls WHERE caller_id = ? ORDER BY callee LIMIT ?",
-        (symbol_id, limit))]
+    sql = "SELECT DISTINCT callee FROM calls WHERE caller_id = ? ORDER BY callee"
+    params: list = [symbol_id]
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return [r["callee"] for r in conn.execute(sql, params)]
 
 
 def callers(conn: sqlite3.Connection, name: str, limit: int = 200) -> list[Entry]:
-    rows = conn.execute(
-        _SYM_SELECT.replace("FROM symbols s", "FROM calls c JOIN symbols s ON s.id = c.caller_id")
-        + " WHERE c.callee = ? GROUP BY s.id ORDER BY s.name LIMIT ?",
-        (name, limit)).fetchall()
+    sql = (_SYM_SELECT.replace("FROM symbols s",
+                               "FROM calls c JOIN symbols s ON s.id = c.caller_id")
+           + " WHERE c.callee = ? GROUP BY s.id ORDER BY s.name")
+    params: list = [name]
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
     return [Entry(kind=r["kind"], name=r["name"], path=r["path"], line=r["start_line"],
                   end_line=r["end_line"], signature=r["signature"],
                   is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
@@ -589,8 +677,8 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
         remain = cap - len(out)
         add_rows(conn.execute(
             "SELECT path, name, size, lines FROM files"
-            " WHERE path LIKE ? ORDER BY path LIMIT ?",
-            (f"Documentation/{prefer}/%", remain)))
+            " WHERE path LIKE ? ESCAPE '\\' ORDER BY path LIMIT ?",
+            (like_under(f"Documentation/{prefer}"), remain)))
 
     sub = subsystem_for_target(conn, t)
     if sub is not None and sub["name"] not in CATCH_ALL and len(out) < cap:
@@ -612,12 +700,13 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
         remain = cap - len(out)
         if remain <= 0:
             break
+        esc = like_escape(needle)
         add_rows(conn.execute(
             "SELECT path, name, size, lines FROM files"
-            " WHERE path LIKE ? OR path LIKE ?"
+            " WHERE path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'"
             " ORDER BY path LIMIT ?",
-            (f"Documentation/%/{needle}/%",
-             f"Documentation/%/{needle}.%",
+            (f"Documentation/%/{esc}/%",
+             f"Documentation/%/{esc}.%",
              remain)))
 
     def sort_key(e: Entry):

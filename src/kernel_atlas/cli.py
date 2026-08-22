@@ -39,12 +39,35 @@ def _version_key(path: Path) -> tuple:
         return (0, ())
 
 
+def version_prefix_match(stem: str, spec: str) -> bool:
+    """True if `spec` is `stem` or a prefix of it at a version-component boundary.
+
+    ``6.18`` matches ``6.18.45``; ``6.1`` does not. ``next`` matches
+    ``next-20260101``. String ``startswith`` would treat ``6.1`` as a prefix of
+    ``6.18.45``, which is how you accidentally pin the wrong LTS.
+    """
+    if not spec or not stem:
+        return False
+    if stem == spec:
+        return True
+    return stem.startswith(spec + ".") or stem.startswith(spec + "-")
+
+
+def _same_path(a: Path, b: Path | None) -> bool:
+    if b is None:
+        return False
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
 def resolve_index_spec(spec: str) -> Path:
     """Turn a version or unique version prefix into an index path, or die."""
     path = config.index_path(spec)
     if path.is_file():
         return path
-    matches = [p for p in config.list_indexes() if p.stem.startswith(spec)]
+    matches = [p for p in config.list_indexes() if version_prefix_match(p.stem, spec)]
     if len(matches) == 1:
         return matches[0]
     if matches:
@@ -109,17 +132,33 @@ def open_index(args) -> tuple[sqlite3.Connection, dict]:
     path = selected_index(args)
     if not path.is_file():
         _die(f"no index at {path} — run '{PROG} build <version>' first")
+    conn = None
     try:
         conn = db.connect(path, readonly=True)
         meta = db.get_meta(conn)
-    except sqlite3.DatabaseError as exc:
+    except (sqlite3.DatabaseError, OSError) as exc:
+        if conn is not None:
+            conn.close()
         _die(f"{path} is not a usable index ({exc}) — rebuild it with "
              f"'{PROG} build <version> --force'")
     if not meta.get("kernel_version"):
+        conn.close()
         _die(f"{path} looks like an interrupted build — rebuild it with "
              f"'{PROG} build <version> --force'")
     meta["index_stem"] = path.stem
+    _OPEN_INDEXES.append(conn)
     return conn, meta
+
+
+_OPEN_INDEXES: list[sqlite3.Connection] = []
+
+
+def _close_indexes() -> None:
+    while _OPEN_INDEXES:
+        try:
+            _OPEN_INDEXES.pop().close()
+        except sqlite3.Error:
+            pass
 
 
 _SOURCE_SUFFIXES = (".c", ".h", ".S", ".rs", ".dts", ".rst")
@@ -146,7 +185,7 @@ def _suggestions(conn, spec: str, limit: int = 5) -> list[str]:
         if len(trimmed) < 3:
             break
         if looks_like_path:
-            like = trimmed.replace("%", "\\%") + "%"
+            like = query.like_escape(trimmed) + "%"
             rows = conn.execute(
                 "SELECT path || '/' AS p FROM dirs WHERE name LIKE ? ESCAPE '\\'"
                 " UNION ALL"
@@ -231,13 +270,20 @@ def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str
 
 
 def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: bool,
-         header: str = ""):
+         header: str = "", index: str | None = None):
     fmt = args.format
     machine = fmt in ("json", "csv", "names", "plain")
     color = render.use_color(args.color)
     cols = pick_columns(args, kinds_listed, with_subsystem)
     if not machine and header:
         print(render.paint(header, "1", color))
+    if fmt == "json":
+        rows = [render.entry_dict(e) for e in entries]
+        if index:
+            for row in rows:
+                row["index"] = index
+        sys.stdout.write(render.render_json(rows))
+        return
     text = render.render(entries, cols, fmt, color, render.term_width())
     sys.stdout.write(text)
     if not machine:
@@ -262,10 +308,10 @@ def kinds_from_args(args, target) -> tuple[str, ...]:
             out.extend(("function", "syscall"))
         elif k in ("type", "types"):
             out.extend(("struct", "union", "enum", "typedef"))
-        elif k.rstrip("s") in query.ALL_KINDS:
-            out.append(k.rstrip("s"))
         elif k in query.ALL_KINDS:
             out.append(k)
+        elif k.endswith("s") and k[:-1] in query.ALL_KINDS:
+            out.append(k[:-1])
         else:
             _die(f"unknown kind {k!r} (valid: {', '.join(query.ALL_KINDS)}, "
                  f"or all/symbols/paths/functions/types)")
@@ -428,8 +474,8 @@ def cmd_build(args):
         + (f"  {stats.calls:,} call edges\n" if stats.calls else "")
         + f"  {stats.subsystems:,} subsystems from MAINTAINERS\n"
         f"  {out}  ({size_mb:.0f} MB, {stats.seconds:.0f}s)\n"
-        f"\nTry:  {PROG} info net/ipv4\n"
-        f"      {PROG} siblings net/ipv4/tcp.c"
+        f"\nTry:  {PROG} info mm\n"
+        f"      {PROG} siblings mm/page_alloc.c"
     )
 
 
@@ -460,7 +506,7 @@ def cmd_indexes(args):
             "source": source_here,
             "built_at": meta.get("built_at", "?"),
             "size": f"{p.stat().st_size / 1048576:.0f} MB",
-            "default": p == active,
+            "default": _same_path(p, active),
             "path": str(p),
         })
     if args.format == "json":
@@ -589,7 +635,8 @@ def cmd_stats(args):
     print(render.paint("\n  largest top-level areas", "1", color))
     for r in conn.execute(
         "SELECT d.name, COUNT(f.id) n FROM dirs d JOIN files f"
-        " ON f.path LIKE d.path || '/%' WHERE d.depth = 1"
+        " ON substr(f.path, 1, length(d.path) + 1) = d.path || '/'"
+        " WHERE d.depth = 1"
         " GROUP BY d.id ORDER BY n DESC LIMIT 8"
     ):
         area = maintainers.TOP_LEVEL_AREAS.get(r["name"])
@@ -638,7 +685,7 @@ def cmd_info(args):
     print()
 
     def field(k, v):
-        if v:
+        if v is not None and v != "":
             print(f"  {k:<12} {v}")
 
     if t.kind == "symbol":
@@ -659,8 +706,8 @@ def cmd_info(args):
             field("contains", f"{row['n_subdirs']} subdirectories, "
                               f"{row['n_files']} files")
             total = conn.execute(
-                "SELECT COUNT(*) n FROM files WHERE path LIKE ?",
-                (f"{t.path}/%" if t.path else "%",)).fetchone()["n"]
+                "SELECT COUNT(*) n FROM files WHERE path LIKE ? ESCAPE '\\'",
+                (query.like_under(t.path),)).fetchone()["n"]
             if total != row["n_files"]:
                 field("subtree", f"{total:,} files in total")
         else:
@@ -733,6 +780,11 @@ def cmd_siblings(args):
         _die(f"cannot build a '{args.level}' scope for {t.display} ({scope.label})")
 
     kinds = kinds_from_args(args, t)
+    if (args.level == "tree"
+            and any(k in query.SYMBOL_KINDS for k in kinds)
+            and not args.limit):
+        _die("listing symbols across the whole tree needs -n N "
+             "(there are millions; try -n 50, or 'find' for a name search)")
     # Fetch one extra row so that dropping the target itself does not eat one
     # of the requested rows; subsystems are looked up only for what survives.
     entries = query.collect(
@@ -759,12 +811,13 @@ def cmd_siblings(args):
     label = sub["name"] if sub else None
     if label in query.CATCH_ALL:
         area = query.describe_area(t.path)
-        label = area[0] if area else label
+        label = area[0] if area else None
     header = (f"Siblings of {t.display}  [{_linux(meta)}]\n"
               f"  level: {scope.label}"
               + (f"   subsystem: {label}" if label else "")
               + f"   showing: {', '.join(kinds)}\n")
-    emit(entries, args, set(kinds), args.with_subsystem, header)
+    emit(entries, args, set(kinds), args.with_subsystem, header,
+         index=index_version(meta))
 
 
 def cmd_ls(args):
@@ -793,7 +846,7 @@ def cmd_ls(args):
                             exported_only=args.exported, static=_static_mode(args),
                             with_subsystem=args.with_subsystem, sort=args.sort)
     emit(entries, args, set(kinds), args.with_subsystem,
-         f"{scope.label}  [{_linux(meta)}]\n")
+         f"{scope.label}  [{_linux(meta)}]\n", index=index_version(meta))
 
 
 def _post_filter(entries, args):
@@ -837,7 +890,8 @@ def cmd_find(args):
     cols = _split_list(args.columns) or ["kind", "name", "path", "line", "subsystem"]
     args.columns = ",".join(cols)
     emit(entries, args, {"function"}, True,
-         f"Symbols matching {args.pattern!r} ({mode})  [{_linux(meta)}]\n")
+         f"Symbols matching {args.pattern!r} ({mode})  [{_linux(meta)}]\n",
+         index=index_version(meta))
 
 
 def cmd_subsystems(args):
@@ -903,10 +957,11 @@ def cmd_subsystem(args):
     print(f"  files        {s['n_files']:,}")
 
     print(render.paint("\n  Top directories", "1", color))
+    n = args.limit if args.limit else 10**9
     for r in conn.execute(
         "SELECT d.path, d.n_files FROM dirs d JOIN path_subsys p"
         " ON p.ref_kind='dir' AND p.ref_id=d.id WHERE p.subsystem_id=?"
-        " ORDER BY d.n_files DESC, d.path LIMIT ?", (s["id"], args.limit or 15)
+        " ORDER BY d.n_files DESC, d.path LIMIT ?", (s["id"], n)
     ):
         print(f"    {r['path'] + '/':<50} {r['n_files']:>5} files")
 
@@ -930,8 +985,8 @@ def cmd_tree(args):
 
     rows = conn.execute(
         "SELECT path, name, depth, n_files, n_subdirs FROM dirs"
-        " WHERE (path = ? OR path LIKE ?) AND depth <= ? ORDER BY path",
-        (base, f"{base}/%" if base else "%", base_depth + max_depth)).fetchall()
+        " WHERE (path = ? OR path LIKE ? ESCAPE '\\') AND depth <= ? ORDER BY path",
+        (base, query.like_under(base), base_depth + max_depth)).fetchall()
     entries = [Entry(kind="dir", name=r["name"], path=r["path"],
                      n_files=r["n_files"], n_subdirs=r["n_subdirs"])
                for r in rows if r["path"]]
@@ -939,11 +994,11 @@ def cmd_tree(args):
         # Visual depth: files `max_depth` components below `base`, not one
         # extra level deeper than the directories (the old Python filter).
         slash_max = (base.count("/") + max_depth) if base else (max_depth - 1)
-        like = f"{base}/%" if base else "%"
+        like = query.like_under(base)
         if slash_max >= 0:
             frows = conn.execute(
                 "SELECT path, name, size, lines, n_symbols FROM files"
-                f" WHERE path LIKE ? AND {_SLASH_COUNT} <= ? ORDER BY path",
+                f" WHERE path LIKE ? ESCAPE '\\' AND {_SLASH_COUNT} <= ? ORDER BY path",
                 (like, slash_max)).fetchall()
             entries += [Entry(kind="file", name=r["name"], path=r["path"],
                               size=r["size"], lines=r["lines"],
@@ -951,7 +1006,11 @@ def cmd_tree(args):
                         for r in frows]
     entries = [e for e in entries if e.path != base]
     if args.format == "json":
-        sys.stdout.write(render.render_json([render.entry_dict(e) for e in entries]))
+        payload = [render.entry_dict(e) for e in entries]
+        ver = index_version(meta)
+        for row in payload:
+            row["index"] = ver
+        sys.stdout.write(render.render_json(payload))
         return
 
     # render_tree nests on path components, so strip the base to avoid redrawing
@@ -1084,7 +1143,8 @@ def cmd_trace(args):
         _die("could not find any symbol names in that input")
 
     results = []
-    for name in frames[:args.limit or 100]:
+    picked = frames if args.limit == 0 else frames[:args.limit]
+    for name in picked:
         res = query.resolve(conn, name)
         t = res.target
         if t is None or t.kind != "symbol":
@@ -1145,16 +1205,21 @@ def cmd_calls(args):
     if t.kind != "symbol":
         _die(f"{t.display} is not a symbol")
 
+    narrowing = bool(args.grep or args.static_only or args.no_static)
+    fetch = args.limit * 20 if args.limit and narrowing else args.limit
+
     if args.callers:
-        entries = _post_filter(query.callers(conn, t.name, limit=args.limit or 100),
-                               args)
+        entries = _post_filter(query.callers(conn, t.name, limit=fetch), args)
+        if args.limit:
+            entries = entries[:args.limit]
         query.annotate_subsystems(conn, entries)
         args.columns = args.columns or "kind,name,path,line,subsystem"
         emit(entries, args, {"function"}, True,
-             f"Functions that call {t.name}  [{_linux(meta)}]\n")
+             f"Functions that call {t.name}  [{_linux(meta)}]\n",
+             index=index_version(meta))
         return
 
-    names = query.callees(conn, t.id, limit=args.limit or 200)
+    names = query.callees(conn, t.id, limit=fetch)
     entries: list[Entry] = []
     for n in names:
         r = query.resolve(conn, n)
@@ -1166,10 +1231,13 @@ def cmd_calls(args):
             # compiler builtin or a macro the parser could not attribute.
             entries.append(Entry(kind="?", name=n, path="-"))
     entries = _post_filter(entries, args)
+    if args.limit:
+        entries = entries[:args.limit]
     query.annotate_subsystems(conn, entries)
     args.columns = args.columns or "kind,name,path,line,subsystem"
     emit(entries, args, {"function"}, True,
-         f"Called by {t.display}  [{_linux(meta)}]\n")
+         f"Called by {t.display}  [{_linux(meta)}]\n",
+         index=index_version(meta))
 
 
 def cmd_web(args):
@@ -1259,24 +1327,16 @@ def cmd_locate(args):
             _die(f"no index built yet — run '{PROG} build lts' first")
         active = selected_index(args)
 
-    def _same(a: Path, b: Path | None) -> bool:
-        if b is None:
-            return False
-        try:
-            return a.resolve() == b.resolve()
-        except OSError:
-            return a == b
-
-    rest = [p for p in available if not _same(p, active)]
+    rest = [p for p in available if not _same_path(p, active)]
     rest.sort(key=_version_key, reverse=True)
-    ordered = ([active] if active is not None and any(_same(p, active) for p in available)
+    ordered = ([active] if active is not None and any(_same_path(p, active) for p in available)
                else []) + rest
 
     spec = args.target
     rows = []
     for path in ordered:
         conn = None
-        is_active = _same(path, active)
+        is_active = _same_path(path, active)
         try:
             try:
                 conn = db.connect(path, readonly=True)
@@ -1451,8 +1511,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_stats)
 
     sp = add("info", help="explain one folder, file or symbol")
-    sp.add_argument("target", help="net/ipv4 | net/ipv4/tcp.c | tcp_sendmsg | "
-                                   "net/ipv4/tcp.c:tcp_sendmsg | net/ipv4/tcp.c:120")
+    sp.add_argument("target", help="mm | mm/page_alloc.c | tcp_sendmsg | "
+                                   "tcp.c:tcp_sendmsg | mm/page_alloc.c:5268")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.add_argument("--max-subsystems", type=_nonneg_int, default=3)
     sp.add_argument("--max-candidates", type=_nonneg_int, default=10)
@@ -1551,7 +1611,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target")
     sp.add_argument("--callers", action="store_true",
                     help="show callers instead of callees")
-    _add_output_opts(sp, sorts=False)
+    _add_output_opts(sp, sorts=False, limit_default=200)
     sp.set_defaults(func=cmd_calls, sort="name", kinds=None, exported=False,
                     static_only=False, no_static=False)
 
@@ -1572,6 +1632,8 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
+    finally:
+        _close_indexes()
     return 0
 
 

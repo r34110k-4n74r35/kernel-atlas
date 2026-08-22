@@ -50,6 +50,7 @@ TOP_LEVEL_AREAS: dict[str, tuple[str, str]] = {
     "tools": ("Tools", "Userspace tools shipped with the kernel (perf, bpftool, selftests)."),
     "usr": ("Initramfs", "Build plumbing for the embedded initial ramdisk."),
     "virt": ("Virtualization", "KVM host-side virtualization support."),
+    "LICENSES": ("Licenses", "SPDX license texts shipped with the kernel."),
 }
 
 _TAG_RE = re.compile(r"^([A-Z]):\s*(.*)$")
