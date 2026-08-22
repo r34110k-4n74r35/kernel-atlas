@@ -10,7 +10,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from . import config, cparse, db, indexer, kernelsrc, maintainers, query, render
+from . import config, cparse, db, indexer, kernelsrc, links, maintainers, query, render
 from .query import Entry
 
 PROG = "kernel-atlas"
@@ -146,6 +146,40 @@ def resolve_or_die(conn, spec: str) -> query.Resolution:
     return res
 
 
+def _resolve_area(conn, spec: str) -> query.Resolution:
+    """Prefer a directory named `spec` over a symbol that happens to share it.
+
+    `bpf` is a variable in security/bpf/hooks.c *and* the directory kernel/bpf/.
+    For commands about an area (docs), the directory is the useful answer.
+    `kernel/bpf` is preferred over deeper homonyms like security/bpf/.
+    """
+    raw = (spec or "").strip().strip("/")
+    if raw and "/" not in raw and ":" not in raw and raw not in (".",):
+        rows = conn.execute(
+            "SELECT * FROM dirs WHERE name = ?", (raw,)).fetchall()
+        if rows:
+            def rank(r):
+                p = r["path"]
+                if p == raw:
+                    return (0, 0, p)
+                if p == f"kernel/{raw}":
+                    return (1, 0, p)
+                return (2, len(p), p)
+            rows = sorted(rows, key=rank)
+            picked = rows[0]
+            t = query.Target(kind="dir", id=picked["id"], path=picked["path"],
+                             name=picked["name"], dir_id=picked["id"])
+            others = [query.Target(kind="dir", id=r["id"], path=r["path"],
+                                   name=r["name"], dir_id=r["id"])
+                      for r in rows[1:]]
+            note = ""
+            if others and picked["path"] != raw:
+                note = (f"{len(rows)} directories named {raw!r}; "
+                        f"using {picked['path']}/")
+            return query.Resolution(t, others, note)
+    return resolve_or_die(conn, spec)
+
+
 def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str]:
     if getattr(args, "columns", None):
         cols = _split_list(args.columns)
@@ -238,6 +272,43 @@ def _checked_grep(pattern: str | None) -> str | None:
         except re.error as exc:
             _die(f"--grep {pattern!r} is not a valid regex: {exc}")
     return pattern
+
+
+def _nonneg_int(value: str) -> int:
+    try:
+        i = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be an integer, not {value!r}")
+    if i < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return i
+
+
+def _positive_int(value: str) -> int:
+    i = _nonneg_int(value)
+    if i < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return i
+
+
+def _target_spec(t: query.Target) -> str:
+    """A spec `ka` will accept again (`.` for the kernel root)."""
+    if t.kind == "symbol":
+        return t.display
+    return t.path or "."
+
+
+def _links_for(meta: dict, t: query.Target) -> dict[str, str]:
+    return links.links(
+        meta.get("kernel_version", ""), t.path, t.line,
+        is_dir=(t.kind == "dir"),
+        ident=(t.name if t.kind == "symbol" else None))
+
+
+# How many bytes of a file `show` will dump without --lines. Matches the
+# indexer: anything bigger is almost certainly generated.
+_MAX_SHOW = 2 * 1024 * 1024
+_SLASH_COUNT = "(LENGTH(path) - LENGTH(REPLACE(path, '/', '')))"
 
 
 # --------------------------------------------------------------------------
@@ -484,10 +555,12 @@ def cmd_info(args):
     t = res.target
     color = render.use_color(args.color)
 
-    subs = query.all_subsystems(
+    subs = [s for s in query.all_subsystems(
         conn, "dir" if t.kind == "dir" else "file",
         t.id if t.kind == "dir" else (t.file_id or t.id))
+        if s["name"] not in query.CATCH_ALL]
     area = query.describe_area(t.path)
+    lnks = _links_for(meta, t)
 
     if args.format == "json":
         payload = {
@@ -503,6 +576,7 @@ def cmd_info(args):
                      **query.subsystem_json_fields(s)) for s in subs],
             "ancestry": [{"path": p, "subsystem": s}
                          for p, s in query.ancestry(conn, t.path)],
+            "links": lnks,
             "note": res.note,
             "other_candidates": [c.display for c in res.candidates[:20]],
         }
@@ -551,6 +625,11 @@ def cmd_info(args):
     tree = config.tree_for(meta.get("kernel_version", ""), meta.get("tree_path"))
     if tree is not None:
         field("on disk", str(tree / t.path if t.path else tree))
+    field("elixir", lnks.get("elixir"))
+    if lnks.get("docs"):
+        field("docs", lnks["docs"])
+    if lnks.get("ident"):
+        field("ident", lnks["ident"])
 
     if area:
         print()
@@ -572,7 +651,7 @@ def cmd_info(args):
         if len(subs) > args.max_subsystems:
             print(f"     ... and {len(subs) - args.max_subsystems} more "
                   f"(--max-subsystems to show)")
-    else:
+    elif not area:
         print("\n  No MAINTAINERS section claims this path.")
 
     anc = query.ancestry(conn, t.path)
@@ -591,7 +670,8 @@ def cmd_info(args):
         if len(res.candidates) > args.max_candidates:
             print(f"    ... and {len(res.candidates) - args.max_candidates} more")
 
-    print(f"\n  Next:  {PROG} siblings {t.display}")
+    print(f"\n  Next:  {PROG} siblings {_target_spec(t)}"
+          f"\n         {PROG} web {_target_spec(t)}")
 
 
 def cmd_siblings(args):
@@ -690,12 +770,17 @@ def cmd_find(args):
         kinds = []
     # Over-fetch when a Python-side filter will shrink the result set.
     narrowing = args.grep or args.static_only or args.no_static
-    limit = args.limit or 50
+    limit = args.limit  # default 50; 0 = all
+    if limit and narrowing:
+        fetch = limit * 20
+    else:
+        fetch = limit
     entries = query.search(conn, args.pattern, kinds=kinds, mode=mode,
-                           limit=limit * 20 if narrowing else limit,
+                           limit=fetch,
                            exported_only=args.exported,
                            with_subsystem=False)
-    entries = _post_filter(entries, args)[:limit]
+    filtered = _post_filter(entries, args)
+    entries = filtered[:limit] if limit else filtered
     if args.format != "names":
         query.annotate_subsystems(conn, entries)
     cols = _split_list(args.columns) or ["kind", "name", "path", "line", "subsystem"]
@@ -741,12 +826,14 @@ def cmd_subsystem(args):
     s = rows[0]
     f = query.subsystem_json_fields(s)
     if args.format == "json":
-        files = [r["path"] for r in conn.execute(
-            "SELECT f.path FROM files f JOIN path_subsys p ON p.ref_kind='file'"
-            " AND p.ref_id=f.id WHERE p.subsystem_id=? ORDER BY f.path", (s["id"],))]
-        sys.stdout.write(render.render_json(
-            dict(name=s["name"], status=s["status"], n_files=s["n_files"],
-                 web=s["web"], files=files, **f)))
+        payload = dict(name=s["name"], status=s["status"], n_files=s["n_files"],
+                       web=s["web"], **f)
+        if args.files:
+            payload["files"] = [r["path"] for r in conn.execute(
+                "SELECT f.path FROM files f JOIN path_subsys p ON p.ref_kind='file'"
+                " AND p.ref_id=f.id WHERE p.subsystem_id=? ORDER BY f.path",
+                (s["id"],))]
+        sys.stdout.write(render.render_json(payload))
         return
     color = render.use_color(args.color)
     print(render.paint(s["name"], "1;35", color))
@@ -784,7 +871,7 @@ def cmd_tree(args):
     conn, meta = open_index(args)
     res = resolve_or_die(conn, args.target or "")
     t = res.target
-    base = t.path if t.kind == "dir" else t.path.rsplit("/", 1)[0]
+    base = t.path if t.kind == "dir" else query.parent_path(t.path)
     color = render.use_color(args.color)
     max_depth = args.depth
     base_depth = base.count("/") + 1 if base else 0
@@ -797,14 +884,19 @@ def cmd_tree(args):
                      n_files=r["n_files"], n_subdirs=r["n_subdirs"])
                for r in rows if r["path"]]
     if args.files:
-        frows = conn.execute(
-            "SELECT path, name, size, lines, n_symbols FROM files"
-            " WHERE path LIKE ? ORDER BY path",
-            (f"{base}/%" if base else "%",)).fetchall()
-        entries += [Entry(kind="file", name=r["name"], path=r["path"],
-                          size=r["size"], lines=r["lines"], n_symbols=r["n_symbols"])
-                    for r in frows
-                    if r["path"].count("/") <= base_depth + max_depth]
+        # Visual depth: files `max_depth` components below `base`, not one
+        # extra level deeper than the directories (the old Python filter).
+        slash_max = (base.count("/") + max_depth) if base else (max_depth - 1)
+        like = f"{base}/%" if base else "%"
+        if slash_max >= 0:
+            frows = conn.execute(
+                "SELECT path, name, size, lines, n_symbols FROM files"
+                f" WHERE path LIKE ? AND {_SLASH_COUNT} <= ? ORDER BY path",
+                (like, slash_max)).fetchall()
+            entries += [Entry(kind="file", name=r["name"], path=r["path"],
+                              size=r["size"], lines=r["lines"],
+                              n_symbols=r["n_symbols"])
+                        for r in frows]
     entries = [e for e in entries if e.path != base]
     if args.format == "json":
         sys.stdout.write(render.render_json([render.entry_dict(e) for e in entries]))
@@ -842,31 +934,56 @@ def cmd_show(args):
     full = tree / t.path
     if not full.is_file():
         _die(f"{full} is missing from the source tree")
+    try:
+        with full.open("rb") as fh:
+            head = fh.read(8192)
+        if b"\0" in head:
+            _die(f"{t.path} looks like a binary file")
+    except OSError as exc:
+        _die(f"cannot read {full}: {exc}")
 
-    lines = full.read_text(encoding="utf-8", errors="replace").splitlines()
     if t.kind == "symbol":
         start = max(1, (t.line or 1) - args.context)
-        end = min(len(lines), (t.end_line or t.line or 1) + args.context)
+        end: int | None = (t.end_line or t.line or 1) + args.context
     elif args.lines:
         m = re.fullmatch(r"(\d+)(?:[:-](\d+))?", args.lines)
         if not m:
             _die(f"--lines wants N or N:M, not {args.lines!r}")
         start = max(1, int(m.group(1)))
-        end = min(len(lines), int(m.group(2)) if m.group(2) else start)
+        end = int(m.group(2)) if m.group(2) else start
+        if end < start:
+            _die(f"--lines {args.lines!r}: end is before start")
     else:
-        start, end = 1, len(lines)
+        size = full.stat().st_size
+        if size > _MAX_SHOW:
+            _die(f"{t.path} is {size:,} bytes; pass --lines N:M or open it with "
+                 f"$EDITOR $({PROG} path {t.path})")
+        start, end = 1, None
 
     color = render.use_color(args.color)
     if not args.bare:
         sub = query.subsystem_for_target(conn, t)
-        head = f"{t.path}:{start}-{end}"
+        head = f"{t.path}:{start}" + (f"-{end}" if end else "")
         if t.kind == "symbol":
             head = f"{t.path}:{t.line}  {t.name}"
+        label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
         print(render.paint(head, "1;36", color)
-              + (render.paint(f"   [{sub['name']}]", "35", color) if sub else ""))
-    for i in range(start, end + 1):
-        prefix = "" if args.bare else render.paint(f"{i:6} ", "90", color)
-        print(prefix + lines[i - 1])
+              + (render.paint(f"   [{label}]", "35", color) if label else ""))
+    printed = 0
+    try:
+        with full.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh, 1):
+                if i < start:
+                    continue
+                if end is not None and i > end:
+                    break
+                prefix = "" if args.bare else render.paint(f"{i:6} ", "90", color)
+                print(prefix + line.rstrip("\n"))
+                printed += 1
+    except OSError as exc:
+        _die(f"cannot read {full}: {exc}")
+    if printed == 0:
+        _die(f"{t.path} has no line {start}")
 
 
 _FRAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\+\s*0x")
@@ -999,18 +1116,159 @@ def cmd_calls(args):
     emit(entries, args, {"function"}, True, f"Called by {t.display}\n")
 
 
+def cmd_web(args):
+    """Print Elixir / git.kernel.org / GitHub / docs.kernel.org URLs."""
+    conn, meta = open_index(args)
+    res = resolve_or_die(conn, args.target)
+    t = res.target
+    lnks = _links_for(meta, t)
+    version = meta.get("kernel_version", "?")
+
+    if args.url:
+        url = lnks.get(args.url)
+        if not url:
+            why = ""
+            if args.url == "docs":
+                why = " (not a Documentation/ file)"
+            elif args.url == "ident":
+                why = " (not a symbol)"
+            _die(f"no {args.url} URL for {t.display}{why}")
+        print(url)
+        return
+
+    if args.format == "json":
+        sys.stdout.write(render.render_json({
+            "target": t.display, "version": version, "links": lnks,
+        }))
+        return
+
+    color = render.use_color(args.color)
+    loc = t.path or "."
+    if t.kind == "symbol" and t.line:
+        loc = f"{t.path}:{t.line}"
+    print(render.paint(f"{loc}  {t.name if t.kind == 'symbol' else ''}".rstrip(),
+                       "1;36", color)
+          + render.paint(f"   [Linux {version}]", "90", color))
+    order = ("elixir", "ident", "git", "github", "docs")
+    width = max(len(k) for k in order if k in lnks)
+    for key in order:
+        if key in lnks:
+            print(f"  {key:<{width}}  {lnks[key]}")
+
+
+def cmd_docs(args):
+    conn, meta = open_index(args)
+    res = _resolve_area(conn, args.target)
+    t = res.target
+    entries = query.documentation_for(conn, t, limit=args.limit)
+    if not entries:
+        _die(f"no Documentation/ files related to {t.display}")
+    sub = query.subsystem_for_target(conn, t)
+    label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
+    version = meta.get("kernel_version", "")
+    if args.format == "json":
+        payload = []
+        for e in entries:
+            item = {"path": e.path, "name": e.name, "lines": e.lines, "size": e.size}
+            item.update(links.links(version, e.path))
+            payload.append(item)
+        sys.stdout.write(render.render_json(payload))
+        return
+    color = render.use_color(args.color)
+    head = f"Documentation related to {t.display}"
+    if label:
+        head += f"   [{label}]"
+    print(render.paint(head, "1", color))
+    if res.note:
+        print(render.paint(f"  ({res.note})", "33", color))
+    for e in entries:
+        print(f"  {e.path}")
+    print(render.paint(f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
+                       f"   Next: {PROG} web {entries[0].path}", "90", color))
+
+
+def cmd_locate(args):
+    """Resolve a target in every built index, so you can see it move across versions."""
+    available = config.list_indexes()
+    if not available:
+        _die(f"no index built yet — run '{PROG} build lts' first")
+    available = sorted(available, key=_version_key, reverse=True)
+    spec = args.target
+    rows = []
+    for path in available:
+        conn = None
+        try:
+            try:
+                conn = db.connect(path, readonly=True)
+                meta = db.get_meta(conn)
+                # The filename is what `indexes` / `use` / `-K` talk about.
+                version = path.stem
+                if not meta.get("kernel_version"):
+                    rows.append({"version": version, "found": False,
+                                 "error": "interrupted build"})
+                    continue
+                res = query.resolve(conn, spec)
+            except sqlite3.Error as exc:
+                rows.append({"version": path.stem, "found": False,
+                             "error": str(exc)})
+                continue
+            t = res.target
+            if t is None:
+                rows.append({"version": version, "found": False, "note": res.note})
+            else:
+                sub = query.subsystem_for_target(conn, t)
+                label = (sub["name"] if sub and sub["name"] not in query.CATCH_ALL
+                         else None)
+                if not label:
+                    area = query.describe_area(t.path)
+                    label = area[0] if area else (sub["name"] if sub else None)
+                rows.append({
+                    "version": version, "found": True,
+                    "kind": t.symbol_kind or t.kind,
+                    "name": t.name, "path": t.path or ".",
+                    "line": t.line, "end_line": t.end_line,
+                    "subsystem": label, "note": res.note or None,
+                })
+        finally:
+            if conn is not None:
+                conn.close()
+
+    if args.format == "json":
+        sys.stdout.write(render.render_json(rows))
+        return
+
+    color = render.use_color(args.color)
+    print(render.paint(f"{spec}  across {len(rows)} index"
+                       f"{'es' if len(rows) != 1 else ''}\n", "1", color))
+    wver = max((len(r["version"]) for r in rows), default=8)
+    for r in rows:
+        ver = r["version"].ljust(wver)
+        if not r.get("found"):
+            why = r.get("error") or "not in this index"
+            print(f"  {ver}  {render.paint(why, '90', color)}")
+            continue
+        loc = r["path"]
+        if r.get("line"):
+            loc = f"{r['path']}:{r['line']}"
+        sub = r.get("subsystem") or "-"
+        print(f"  {render.paint(ver, '32', color)}  {r['kind']:<10} "
+              f"{loc:<42} {render.paint(sub, '35', color)}")
+
+
 # --------------------------------------------------------------------------
 # parser
 # --------------------------------------------------------------------------
 
-def _add_output_opts(p, sorts=True):
+def _add_output_opts(p, sorts=True, limit_default=0):
     g = p.add_argument_group("output")
     g.add_argument("--format", "-f", default="table",
                    choices=("table", "plain", "names", "json", "csv", "tree"),
                    help="output format (default: table)")
     g.add_argument("--columns", "-c",
                    help="comma-separated columns: " + ",".join(render.COLUMNS))
-    g.add_argument("--limit", "-n", type=int, default=0, help="max rows (0 = all)")
+    g.add_argument("--limit", "-n", type=_nonneg_int, default=limit_default,
+                   help="max rows (0 = all)" if limit_default == 0 else
+                        f"max rows (default: {limit_default}; 0 = all)")
     g.add_argument("--grep", "-g", help="only names matching this regex")
     if sorts:
         g.add_argument("--sort", default="name",
@@ -1051,7 +1309,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=PROG,
         description="Index a Linux kernel tree and explore its structure, "
                     "symbols and subsystems.",
-        epilog=f"Start with:  {PROG} build lts     then:  {PROG} info net/ipv4",
+        epilog=f"Start with:  {PROG} build lts     then:  {PROG} info mm",
     )
     _global_opts(p, suppress=False)
 
@@ -1074,7 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="version or alias: lts (default), stable, mainline, 6.12.104")
     sp.add_argument("--src", help="index an existing local kernel tree instead")
     sp.add_argument("--output", "-o", help="write the index here")
-    sp.add_argument("--jobs", "-j", type=int, help="parallel parser processes")
+    sp.add_argument("--jobs", "-j", type=_positive_int, help="parallel parser processes")
     sp.add_argument("--kinds", help="symbol kinds to index (default: "
                                     + ",".join(cparse.DEFAULT_KINDS) + ")")
     sp.add_argument("--with-calls", action="store_true",
@@ -1112,8 +1370,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="net/ipv4 | net/ipv4/tcp.c | tcp_sendmsg | "
                                    "net/ipv4/tcp.c:tcp_sendmsg | net/ipv4/tcp.c:120")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
-    sp.add_argument("--max-subsystems", type=int, default=3)
-    sp.add_argument("--max-candidates", type=int, default=10)
+    sp.add_argument("--max-subsystems", type=_nonneg_int, default=3)
+    sp.add_argument("--max-candidates", type=_nonneg_int, default=10)
     sp.set_defaults(func=cmd_info)
 
     sp = add("siblings", aliases=["sib"],
@@ -1139,20 +1397,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--glob", action="store_true", help="pattern is a glob (tcp_*)")
     sp.add_argument("--prefix", action="store_true")
     _add_filter_opts(sp)
-    _add_output_opts(sp, sorts=False)
+    _add_output_opts(sp, sorts=False, limit_default=50)
     sp.set_defaults(func=cmd_find, sort="name")
 
     sp = add("subsystems", help="list subsystems from MAINTAINERS")
     sp.add_argument("--grep", "-g")
     sp.add_argument("--sort", default="size", choices=("size", "name"))
-    sp.add_argument("--limit", "-n", type=int, default=0)
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=0)
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystems)
 
     sp = add("subsystem", help="detail for one subsystem")
     sp.add_argument("name")
     sp.add_argument("--files", action="store_true", help="also list every file")
-    sp.add_argument("--limit", "-n", type=int, default=15)
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=15)
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystem)
 
@@ -1164,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("show", help="print the source of a symbol or file")
     sp.add_argument("target")
-    sp.add_argument("--context", "-C", type=int, default=0,
+    sp.add_argument("--context", "-C", type=_nonneg_int, default=0,
                     help="extra lines around a symbol")
     sp.add_argument("--lines", "-L", help="line range for a file, e.g. 100:140")
     sp.add_argument("--bare", action="store_true",
@@ -1173,16 +1431,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("tree", help="draw the directory tree")
     sp.add_argument("target", nargs="?", default="")
-    sp.add_argument("--depth", "-d", type=int, default=2)
+    sp.add_argument("--depth", "-d", type=_nonneg_int, default=2)
     sp.add_argument("--files", action="store_true", help="include files")
     sp.add_argument("--format", "-f", default="tree", choices=("tree", "json"))
     sp.set_defaults(func=cmd_tree)
+
+    sp = add("web", help="print Elixir / git.kernel.org / GitHub / docs URLs")
+    sp.add_argument("target")
+    sp.add_argument("--url", choices=("elixir", "ident", "git", "github", "docs"),
+                    help="print just this URL, for `open $(ka web … --url elixir)`")
+    sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.set_defaults(func=cmd_web)
+
+    sp = add("docs", help="Documentation/ files related to a target")
+    sp.add_argument("target")
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=30)
+    sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.set_defaults(func=cmd_docs)
+
+    sp = add("locate",
+             help="resolve a target in every built index (compare versions)")
+    sp.add_argument("target")
+    sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.set_defaults(func=cmd_locate)
 
     sp = add("trace",
                         help="annotate a backtrace: which subsystem is each frame in?")
     sp.add_argument("frames", nargs="*",
                     help="frame names, or pipe an oops/ftrace log on stdin")
-    sp.add_argument("--limit", "-n", type=int, default=100)
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=100)
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_trace)
 

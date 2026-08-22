@@ -102,6 +102,13 @@ def _norm(spec: str) -> str:
     return spec.rstrip("/")
 
 
+def parent_path(path: str) -> str:
+    """Directory containing a file path; '' for a top-level file or the root."""
+    if not path or "/" not in path:
+        return ""
+    return path.rsplit("/", 1)[0]
+
+
 def _sym_target(conn: sqlite3.Connection, row: sqlite3.Row) -> Target:
     return Target(
         kind="symbol", id=row["id"], path=row["path"], name=row["name"],
@@ -155,19 +162,31 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
 
         if frows and tail.isdigit():
             line = int(tail)
-            frow = frows[0]
-            row = conn.execute(
-                _SYM_SELECT + " WHERE s.file_id = ? AND s.start_line <= ?"
-                " AND s.end_line >= ? ORDER BY (s.end_line - s.start_line) LIMIT 1",
-                (frow["id"], line, line)).fetchone()
-            if row:
-                return Resolution(_sym_target(conn, row),
-                                  note=f"line {line} falls inside this symbol")
+            hits = []
+            for fr in frows:
+                row = conn.execute(
+                    _SYM_SELECT + " WHERE s.file_id = ? AND s.start_line <= ?"
+                    " AND s.end_line >= ? ORDER BY (s.end_line - s.start_line)"
+                    " LIMIT 1", (fr["id"], line, line)).fetchone()
+                if row:
+                    hits.append(_sym_target(conn, row))
+            if hits:
+                hits.sort(key=_rank_candidate)
+                note = f"line {line} falls inside this symbol"
+                if not exact_file and len(frows) > 1:
+                    note += (f" (matched {head_n.rsplit('/', 1)[-1]!r} to "
+                             f"{hits[0].path})")
+                return Resolution(hits[0], hits[1:], note)
+            if exact_file:
+                frow = frows[0]
+                return Resolution(
+                    Target(kind="file", id=frow["id"], path=frow["path"],
+                           name=frow["name"], dir_id=frow["dir_id"],
+                           file_id=frow["id"]),
+                    note=f"no symbol spans line {line}")
             return Resolution(
-                Target(kind="file", id=frow["id"], path=frow["path"],
-                       name=frow["name"], dir_id=frow["dir_id"],
-                       file_id=frow["id"]),
-                note=f"no symbol spans line {line}")
+                None, note=f"no symbol spans line {line} in any file named "
+                           f"{head_n.rsplit('/', 1)[-1]!r}")
 
         if frows:
             ids = [r["id"] for r in frows]
@@ -258,13 +277,17 @@ def all_subsystems(conn: sqlite3.Connection, ref_kind: str,
 CATCH_ALL = {"THE REST"}
 
 
+def visible_subsystems(rows: list) -> list:
+    """Drop THE REST when a more specific MAINTAINERS section also matched."""
+    specific = [r for r in rows if r["name"] not in CATCH_ALL]
+    return specific if specific else list(rows)
+
+
 def best_subsystem(conn: sqlite3.Connection, ref_kind: str,
                    ref_id: int) -> sqlite3.Row | None:
     rows = all_subsystems(conn, ref_kind, ref_id)
-    for r in rows:
-        if r["name"] not in CATCH_ALL:
-            return r
-    return rows[0] if rows else None
+    shown = visible_subsystems(rows)
+    return shown[0] if shown else None
 
 
 def subsystem_for_target(conn: sqlite3.Connection, t: Target) -> sqlite3.Row | None:
@@ -307,7 +330,7 @@ def build_scope(conn: sqlite3.Connection, t: Target, level: str) -> Scope:
                      "s.file_id = ?", (fid,))
 
     if level == "subtree":
-        base = t.path if t.kind == "dir" else t.path.rsplit("/", 1)[0]
+        base = t.path if t.kind == "dir" else parent_path(t.path)
         like = f"{base}/%" if base else "%"
         return Scope(
             f"everything under {base or 'the kernel root'}",
@@ -390,7 +413,7 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
         # Symbols are the only source that can be huge (a tree-wide scope holds
         # millions), so when a limit is set and no Python-side filter remains,
         # sort and cut inside SQLite instead of materialising everything.
-        if limit and rx is None:
+        if limit and limit > 0 and rx is None:
             order = {
                 "name": "LOWER(s.name), f.path",
                 "path": "f.path, s.start_line",
@@ -418,7 +441,7 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
         "lines": lambda e: (-(e.lines or e.span or 0), e.name.lower()),
     }
     entries.sort(key=keys.get(sort, keys["name"]))
-    if limit:
+    if limit and limit > 0:
         entries = entries[:limit]
 
     if with_subsystem:
@@ -436,7 +459,11 @@ def annotate_subsystems(conn: sqlite3.Connection, entries: list[Entry]) -> None:
             row = conn.execute(f"SELECT id FROM {table} WHERE path = ?",
                                (key,)).fetchone()
             sub = best_subsystem(conn, ref_kind, row["id"]) if row else None
-            cache[key] = sub["name"] if sub else None
+            name = sub["name"] if sub else None
+            if name in CATCH_ALL:
+                area = describe_area(key)
+                name = area[0] if area else None
+            cache[key] = name
         e.subsystem = cache[key]
 
 
@@ -462,8 +489,10 @@ def search(conn: sqlite3.Connection, pattern: str, kinds=(), mode: str = "substr
         params.append("%" + pattern.replace("%", "\\%").replace("_", "\\_") + "%")
     if exported_only:
         sql += " AND s.is_exported = 1"
-    sql += " ORDER BY LENGTH(s.name), s.name LIMIT ?"
-    params.append(max(limit, 1))
+    sql += " ORDER BY LENGTH(s.name), s.name"
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
 
     entries = [
         Entry(kind=r["kind"], name=r["name"], path=r["path"], line=r["start_line"],
@@ -533,6 +562,70 @@ def callers(conn: sqlite3.Connection, name: str, limit: int = 200) -> list[Entry
                   end_line=r["end_line"], signature=r["signature"],
                   is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
                   is_exported=bool(r["is_exported"])) for r in rows]
+
+
+def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> list[Entry]:
+    """Documentation/ files that belong with this target.
+
+    Order: the obvious Documentation/<name>/ tree first, then files claimed
+    by the same MAINTAINERS section, then path-name fallbacks.
+    """
+    cap = limit if limit and limit > 0 else 10**9
+    seen: set[str] = set()
+    out: list[Entry] = []
+
+    def add_rows(rows) -> None:
+        for r in rows:
+            if r["path"] in seen:
+                continue
+            seen.add(r["path"])
+            out.append(Entry(kind="file", name=r["name"], path=r["path"],
+                             size=r["size"], lines=r["lines"]))
+
+    parts = [p for p in (t.path or "").split("/") if p]
+    prefer = t.name if t.kind == "dir" and t.name else (parts[0] if parts else "")
+
+    if prefer:
+        remain = cap - len(out)
+        add_rows(conn.execute(
+            "SELECT path, name, size, lines FROM files"
+            " WHERE path LIKE ? ORDER BY path LIMIT ?",
+            (f"Documentation/{prefer}/%", remain)))
+
+    sub = subsystem_for_target(conn, t)
+    if sub is not None and sub["name"] not in CATCH_ALL and len(out) < cap:
+        add_rows(conn.execute(
+            "SELECT f.path, f.name, f.size, f.lines FROM files f"
+            " JOIN path_subsys p ON p.ref_kind='file' AND p.ref_id=f.id"
+            " WHERE p.subsystem_id=? AND f.path LIKE 'Documentation/%'"
+            " ORDER BY f.path LIMIT ?", (sub["id"], cap - len(out))))
+
+    needles: list[str] = []
+    if parts:
+        needles.append(parts[0])
+        last = parts[-1]
+        if t.kind != "dir" and "." in last:
+            last = last.rsplit(".", 1)[0]
+        if last not in needles:
+            needles.append(last)
+    for needle in needles:
+        remain = cap - len(out)
+        if remain <= 0:
+            break
+        add_rows(conn.execute(
+            "SELECT path, name, size, lines FROM files"
+            " WHERE path LIKE ? OR path LIKE ?"
+            " ORDER BY path LIMIT ?",
+            (f"Documentation/%/{needle}/%",
+             f"Documentation/%/{needle}.%",
+             remain)))
+
+    def sort_key(e: Entry):
+        primary = 0 if prefer and e.path.startswith(f"Documentation/{prefer}/") else 1
+        return (primary, e.path)
+
+    out.sort(key=sort_key)
+    return out[:cap]
 
 
 def describe_area(path: str) -> tuple[str, str] | None:
