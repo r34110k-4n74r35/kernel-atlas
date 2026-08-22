@@ -221,6 +221,7 @@ FILES: dict[str, str] = {
     "drivers/net/ethernet/intel/igb/igb_main.c": INTEL_DRIVER_C,
     "arch/x86/mm/fault.c": "void do_page_fault(void) { }\n",
     "Documentation/filesystems/ext4/about.rst": "ext4 docs\n",
+    "Documentation/mm/page_alloc.rst": "page allocator\n",
 }
 
 

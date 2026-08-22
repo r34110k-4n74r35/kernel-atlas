@@ -10,9 +10,13 @@ questions of the form:
 - *What else lives next to this folder / file / function?*
 - *Which subsystem owns this symbol, and who maintains it?*
 - *I have a function name from an oops. Where is it defined?*
-- *Show me the source of this function, or an absolute path I can open in an editor.*
+- *Show me the source, an editor path, or the Elixir / docs.kernel.org page.*
+- *Did this symbol move between the LTS I am running and mainline?*
 
-Once an index is built, every query is local and offline.
+Once an index is built, every query is local and offline. `ka web` is the
+exception: it only *prints* URLs (Bootlin Elixir, git.kernel.org, GitHub,
+docs.kernel.org) so you can jump to a cross-referencer without leaving the
+terminal.
 
 ```
 $ ka info tcp_sendmsg
@@ -24,6 +28,8 @@ net/ipv4/tcp.c:tcp_sendmsg
   signature    int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
   linkage      EXPORT_SYMBOL (available to modules)
   on disk      ~/kernel-atlas/kernels/linux-7.2/net/ipv4/tcp.c
+  elixir       https://elixir.bootlin.com/linux/v7.2/source/net/ipv4/tcp.c#L1446
+  ident        https://elixir.bootlin.com/linux/v7.2/ident/tcp_sendmsg
 
   Area: Networking
     Network stack: sockets, TCP/IP, netfilter, per-protocol code.
@@ -48,6 +54,7 @@ net/ipv4/tcp.c:tcp_sendmsg
 - [The main idea: "same level"](#the-main-idea-same-level)
 - [Commands in detail](#commands-in-detail)
 - [A tour across subsystems](#a-tour-across-subsystems)
+- [Recipes](#recipes)
 - [Controlling the output](#controlling-the-output)
 - [How subsystems are determined](#how-subsystems-are-determined)
 - [How parsing works, and its limits](#how-parsing-works-and-its-limits)
@@ -92,6 +99,9 @@ ka info mm                    # what is this directory, who maintains it?
 ka siblings kernel/sched      # what sits next to the scheduler?
 ka find tcp_sendmsg           # where is this symbol?
 ka show tcp_sendmsg           # print its source
+ka web tcp_sendmsg            # Elixir / git.kernel.org / GitHub URLs
+ka docs mm                    # Documentation/ files for this area
+ka locate tcp_sendmsg         # same symbol in every built index
 dmesg | ka trace              # map a whole backtrace to subsystems
 ```
 
@@ -285,6 +295,7 @@ ka siblings tcp_sendmsg --level subsystem             # every NETWORKING [TCP] f
 ka siblings net/ipv4/tcp.c --kinds function           # functions next to a *file*
 ka siblings tcp_sendmsg --level dir --kinds file      # files around a *symbol*
 ka siblings kernel/sched --include-self               # keep the target, marked >
+ka siblings tcp_sendmsg --exported                    # module-visible API of the file
 ```
 
 `ka ls` is the complement: it looks *inside* rather than *beside* (children of
@@ -327,19 +338,22 @@ Useful as a first orientation when you have just built an index.
 
 The "what is this?" command. For a directory it reports how many files and
 subdirectories sit in it, the top-level *area* (a plain-English description of
-`mm/`, `net/`, `kernel/`, …), every `MAINTAINERS` section that claims the path
-(most precise first, with maintainers and lists), a walk of parent directories
-each labelled with *their* subsystem, and the on-disk path.
+`mm/`, `net/`, `kernel/`, …), every *interesting* `MAINTAINERS` section that
+claims the path (most precise first, with maintainers and lists — the
+catch-all `THE REST` section is omitted; the Area line already covers that
+case), a walk of parent directories each labelled with *their* subsystem, the
+on-disk path, and an Elixir URL.
 
 For a file it also reports size, line count, and how many symbols of each kind
 the file defines.
 
 For a symbol it reports the kind (`function`, `syscall`, `struct`, …), the
-line span, the signature, and the linkage: `EXPORT_SYMBOL` (callable from
-modules), `static` (file-local), or global.
+line span, the signature, the linkage: `EXPORT_SYMBOL` (callable from
+modules), `static` (file-local), or global, plus Elixir's *ident* page (every
+use of that name in the tree).
 
-`-f json` dumps the same facts for scripts. `--max-subsystems` and
-`--max-candidates` trim the two lists that can get long.
+`-f json` dumps the same facts for scripts, including a `links` object.
+`--max-subsystems` and `--max-candidates` trim the two lists that can get long.
 
 ### `siblings` (`sib`)
 
@@ -366,18 +380,23 @@ ka ls security --kinds dir -S
 
 ### `tree`
 
-Draws a directory tree. `-d N` is depth (default 2). `--files` includes files.
-`-f json` is a flat list rather than ASCII art.
+Draws a directory tree. `-d N` is visual depth (default 2). `--files` includes
+files at that same depth — `ka tree mm -d 1 --files` is the children of `mm/`,
+not everything under it. A top-level file (`ka tree Makefile`) trees the
+kernel root. `-f json` is a flat list rather than ASCII art.
 
 ```bash
 ka tree net -d 1
 ka tree kernel/sched -d 1 --files
+ka tree rust -d 1                 # Rust crate layout; no C symbols in those files
+ka tree virt -d 1
 ```
 
 ### `find`
 
 Searches **symbols** by name. The default is a case-sensitive substring with
-a limit of 50 (unlike `siblings`, which defaults to all).
+a limit of 50 (unlike `siblings`, which defaults to all). Pass `-n 0` for
+every hit.
 
 | Flag | Match |
 | --- | --- |
@@ -389,13 +408,19 @@ a limit of 50 (unlike `siblings`, which defaults to all).
 `--kinds` here is restricted to symbol kinds (`function`, `syscall`, `struct`,
 …). `--exported`, `--static-only`, `--grep` (regex on the name, applied after
 the search) all work. Each hit is labelled with its subsystem so you can see
-when one name lives in three different areas.
+when one name lives in three different areas. Paths that only match `THE REST`
+are labelled with the top-level area instead (`Core kernel`, `Tools`, …).
 
 ```bash
 ka find tcp_sendmsg --exact
 ka find __alloc_pages --prefix
 ka find 'sys_*' --glob --kinds syscall
 ka find sendmsg --kinds function --exported
+ka find GFP_KERNEL --kinds macro --exact
+ka find kthread --exact
+#   function  kthread  kernel/kthread.c             Core kernel
+#   struct    kthread  kernel/kthread.c             Core kernel
+#   function  kthread  drivers/block/aoe/aoecmd.c   ATA OVER ETHERNET
 ```
 
 ### `path`
@@ -410,7 +435,7 @@ grep -rn lock_sock $(ka path net/ipv4)
 ```
 
 `--line` appends `:LINE` for symbols. This needs the source tree under
-`kernels/`; queries (`info`, `siblings`, `find`) do not.
+`kernels/`; `info`, `siblings`, `find`, `web`, `docs` and `locate` do not.
 
 ### `show`
 
@@ -437,6 +462,81 @@ ka show tcp_sendmsg -C 5                 # 5 lines of context either side
 ka show net/ipv4/tcp.c -L 1446:1455      # a line range from a file
 ka show net/ipv4/tcp.c                   # the whole file
 ka show tcp_sendmsg --bare               # no header, no line numbers
+```
+
+Whole files larger than 2 MB (generated blobs, huge headers) need `--lines N:M`
+or `$EDITOR $(ka path …)`. Binary files are refused.
+
+### `web`
+
+Prints URLs for the same target on Bootlin Elixir, git.kernel.org, GitHub, and
+— for `Documentation/*.rst` — docs.kernel.org. Nothing is opened; pipe into
+`open` / `xdg-open` if you want a browser.
+
+```
+$ ka web tcp_sendmsg
+
+net/ipv4/tcp.c:1446  tcp_sendmsg   [Linux 7.2]
+  elixir  https://elixir.bootlin.com/linux/v7.2/source/net/ipv4/tcp.c#L1446
+  ident   https://elixir.bootlin.com/linux/v7.2/ident/tcp_sendmsg
+  git     https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/ipv4/tcp.c?h=v7.2#n1446
+  github  https://github.com/torvalds/linux/blob/v7.2/net/ipv4/tcp.c#L1446
+```
+
+`ident` is Elixir's cross-reference for the symbol name (every call site, not
+just the definition). `--url elixir|ident|git|github|docs` prints a single
+URL:
+
+```bash
+open $(ka web tcp_sendmsg --url elixir)
+open $(ka web Documentation/mm/index.rst --url docs)
+ka -K 6.18 web tcp_sendmsg --url git
+# stable tags use the stable git tree and gregkh/linux, not torvalds/linux
+```
+
+### `docs`
+
+Lists `Documentation/` files that belong with a target. Bare names like `bpf`
+or `mm` mean the *area* (so `kernel/bpf/`, not the `bpf` LSM hook variable).
+`Documentation/<name>/` is listed first.
+
+```
+$ ka docs bpf -n 8
+
+Documentation related to kernel/bpf   [BPF [GENERAL]]
+  (11 directories named 'bpf'; using kernel/bpf/)
+  Documentation/bpf/bpf_design_QA.rst
+  Documentation/bpf/btf.rst
+  ...
+```
+
+```bash
+ka docs mm
+ka docs kernel/bpf
+ka web Documentation/mm/index.rst          # includes the docs.kernel.org HTML
+```
+
+### `locate`
+
+Resolves one target in **every** built index, so you can see a symbol move
+between the LTS you are running and mainline. Ignores `-K` / `ka use` on
+purpose.
+
+```
+$ ka locate tcp_sendmsg
+
+tcp_sendmsg  across 2 indexes
+
+  7.2      function   net/ipv4/tcp.c:1446       NETWORKING [TCP]
+  6.18.45  function   net/ipv4/tcp.c:1409       NETWORKING [TCP]
+
+$ ka locate schedule
+  7.2      function   kernel/sched/core.c:7316  SCHEDULER
+  6.18.45  function   kernel/sched/core.c:7027  SCHEDULER
+
+$ ka locate __alloc_pages_noprof
+  7.2      function   mm/page_alloc.c:5333      MEMORY MANAGEMENT - PAGE ALLOCATOR
+  6.18.45  function   mm/page_alloc.c:5268      MEMORY MANAGEMENT - PAGE ALLOCATOR
 ```
 
 ### `trace`
@@ -512,11 +612,14 @@ ka info mm
 ka find __alloc_pages --prefix -n 4
 #   macro     __alloc_pages         include/linux/gfp.h   MEMORY MANAGEMENT - CORE
 #   function  __alloc_pages_noprof  mm/page_alloc.c       MEMORY MANAGEMENT - PAGE ALLOCATOR
+ka find GFP_KERNEL --kinds macro --exact
+#   include/linux/gfp_types.h:377   MEMORY MANAGEMENT - CORE
 ```
 
 The real page allocator is `__alloc_pages_noprof`; `__alloc_pages` is a wrapper
 macro. Searching rather than guessing the name is the reliable way across
-releases.
+releases. `ka docs mm` lists `Documentation/mm/*.rst` first (the programming
+handbook), then admin-guide pages.
 
 ### Scheduler, next to the rest of `kernel/`
 
@@ -524,9 +627,13 @@ releases.
 ka siblings kernel/sched -n 8
 # bpf/  cgroup/  dma/  entry/  events/  futex/  ...
 ka ls kernel/sched --kinds file --sort lines
-ka info schedule          # kernel/sched/core.c, subsystem SCHEDULER
+ka info schedule          # kernel/sched/core.c:7316, subsystem SCHEDULER
 ka subsystem SCHEDULER    # who to mail, which git tree
+ka locate schedule        # line 7316 on 7.2, 7027 on 6.18.45
 ```
+
+`kernel/futex` has no dedicated `MAINTAINERS` section. `info` then shows the
+Area (Core kernel) and skips dumping `THE REST` and its 94k files.
 
 ### Networking
 
@@ -536,7 +643,12 @@ ka siblings net/ipv4/tcp.c --sort lines -n 5
 # tcp_output.c 4664 lines   — send path
 # udp.c, route.c, ...
 ka siblings tcp_sendmsg                  # other functions in tcp.c
+ka siblings tcp_sendmsg --exported -n 5  # the module-visible API of that file
 ka siblings tcp_sendmsg --level subsystem
+ka -K 6.18.45 calls tcp_sendmsg
+# lock_sock, tcp_sendmsg_locked, release_sock
+ka -K 6.18.45 calls tcp_sendmsg --callers
+# tcp_bpf_sendmsg  (the BPF sockmap hook)
 ```
 
 Sorting a directory by line count is a decent way to find where the work is.
@@ -576,7 +688,36 @@ ka info drivers/net/ethernet/intel/igb
 Both are correct. `MAINTAINERS` asks you to prefer the most precise area;
 `info` lists it first.
 
-### Syscalls, BPF, io_uring, arch
+### BPF, io_uring, crypto, virt, rust, init
+
+```bash
+ka info kernel/bpf
+# BPF [GENERAL], Alexei Starovoitov, bpf@vger.kernel.org
+ka ls kernel/bpf --kinds file --sort lines -n 5
+# verifier.c  20065 lines — start here
+ka docs bpf                 # Documentation/bpf/, not the LSM hook named bpf
+ka show sys_bpf
+
+ka info io_uring            # IO_URING, Jens Axboe
+ka ls io_uring --kinds file --sort lines -n 5
+# io_uring.c  3270 lines
+ka find 'sys_io_uring*' --glob --kinds syscall
+# sys_io_uring_enter / _setup / _register
+
+ka info crypto
+ka ls crypto --kinds file --sort lines -n 5
+# testmgr.h is a 1.4 MB generated-looking header; skip it
+
+ka info virt/kvm            # Area: Virtualization
+ka tree virt -d 1           # kvm/  lib/
+
+ka tree rust -d 1           # crates; .rs files are in the index with no symbols
+ka info init                # Area: Init — start_kernel() lives here
+ka info ipc                 # System V IPC
+ka ls . --kinds dir         # every top-level area of the tree
+```
+
+### Syscalls and arch
 
 `SYSCALL_DEFINEn` macros are reassembled into the real symbol names
 (`sys_bpf`, `compat_sys_iopl`), so syscalls are searchable even though they
@@ -588,10 +729,66 @@ ka find 'sys_*' --glob --kinds syscall -n 8
 # sys_brk   mm/mmap.c              MEMORY MAPPING
 # sys_bind  net/socket.c           NETWORKING [SOCKETS]
 # sys_fork  kernel/fork.c          EXEC & BINFMT API, ELF
-ka show sys_bpf
-ka info io_uring                  # IO_URING, Jens Axboe
 ka siblings arch/x86              # every other architecture port
 ka tree arch/x86 -d 1
+ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
+```
+
+## Recipes
+
+### I have an oops
+
+```bash
+dmesg | ka trace
+ka show kthread
+ka web kthread --url elixir        # definition plus clickable call sites
+ka locate kthread                  # did this line move on mainline?
+```
+
+### I want to email the right list
+
+```bash
+ka info drivers/net/ethernet/intel/igb
+ka subsystem 'INTEL ETHERNET'
+```
+
+The first `MAINTAINERS` section `info` prints is the one to use.
+
+### I am reading code in the browser
+
+```bash
+open $(ka web tcp_sendmsg --url elixir)
+open $(ka web tcp_sendmsg --url ident)     # every use of the name
+open $(ka web Documentation/mm/index.rst --url docs)
+```
+
+### I want the handbook that goes with this code
+
+```bash
+ka docs mm
+ka docs bpf
+ka show Documentation/mm/index.rst
+```
+
+### Open it in an editor
+
+```bash
+vim   $(ka path tcp_sendmsg)
+code -g $(ka path tcp_sendmsg --line)
+grep -rn lock_sock $(ka path net/ipv4)
+```
+
+`--line` appends `:LINE`. `path` / `show` need the tree under `kernels/`;
+`info`, `siblings`, `find`, `web`, `docs`, `locate` do not.
+
+### Script it
+
+```bash
+ka siblings kernel/sched -f names | head
+ka ls net/ipv4 --kinds function -f json | jq -r '.[].name'
+ka find tcp_ --prefix -f csv > tcp-symbols.csv
+ka locate tcp_sendmsg -f json | jq -r '.[] | "\(.version) \(.path):\(.line)"'
+ka ls mm/page_alloc.c --kinds function --grep 'alloc' -f plain
 ```
 
 ## Controlling the output
@@ -602,7 +799,7 @@ Listing commands (`siblings`, `ls`, `find`, `calls`) accept:
 | --- | --- |
 | `--format`, `-f` | `table` (default), `plain`, `names`, `json`, `csv`, `tree` |
 | `--columns`, `-c` | comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature` |
-| `--limit`, `-n` | max rows; `0` = all |
+| `--limit`, `-n` | max rows; `0` = all (`find` defaults to 50; `-n 0` still means all) |
 | `--sort` | `name`, `path`, `kind`, `line`, `size`, `lines` (size/lines sort descending) |
 | `--grep`, `-g` | keep only names matching a regex (case-insensitive) |
 | `--with-subsystem`, `-S` | add a subsystem column |
@@ -651,10 +848,11 @@ N: regex            matched against the whole path
 ```
 
 When several sections match, the most precise one wins. The catch-all `THE
-REST` section claims every path in the tree, so it is only *shown* as the
-answer when nothing more specific matches — and in that case a plain-English
-description of the top-level directory (`mm/` → Memory management, `net/` →
-Networking) is preferred.
+REST` section claims every path in the tree, so it is never *shown* as the
+answer: a more specific section wins when one exists, and otherwise the
+plain-English *Area* of the top-level directory is used (`mm/` → Memory
+management, `kernel/` → Core kernel). `find` follows the same rule, so a
+hit in `tools/` is labelled `Tools` rather than `THE REST`.
 
 ## How parsing works, and its limits
 
@@ -698,6 +896,12 @@ unique (`-K 6` is ambiguous if you have both 6.12 and 6.18).
 **"the source for Linux X is not on disk"** — `path` and `show` need the tree
 under `kernels/`. Other commands do not. `ka build X --force` re-downloads.
 
+**"is N bytes; pass --lines"** — `show` will not dump a file bigger than 2 MB
+whole. Use `--lines N:M`, or open it with `$EDITOR $(ka path …)`.
+
+**"no Documentation/ files related to …"** — that area has no matching
+`Documentation/` path. Try `ka ls Documentation --kinds dir` or `ka docs mm`.
+
 **"pinned version has no index any more"** — you `remove`d the version `use`
 was pointing at (or the pin is stale). `ka use --clear` or `ka use <other>`.
 
@@ -729,6 +933,7 @@ they need no network and never touch your real indexes.
 | `indexer.py` | tree walk, parallel parsing, subsystem attachment, atomic build |
 | `db.py` | SQLite schema |
 | `query.py` | target resolution, container/level model, search |
+| `links.py` | Elixir / git.kernel.org / GitHub / docs.kernel.org URLs |
 | `render.py` | table / plain / json / csv / tree output |
 | `cli.py` | command line interface |
 

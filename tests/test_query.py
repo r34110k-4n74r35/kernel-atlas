@@ -119,9 +119,18 @@ def test_syscall_definitions_have_call_edges(conn):
     assert "do_sys_open" in query.callees(conn, t.id)
 
 
-def test_resolve_missing(conn):
-    res = query.resolve(conn, "definitely_not_here_xyz")
-    assert res.target is None and "nothing in the index" in res.note
+def test_resolve_basename_colon_line_picks_the_file_that_has_the_symbol(conn):
+    """'super.c:1' used to use the shortest path (fs/ext4/super.c, an include)
+    and miss btrfs_mount on line 1 of fs/btrfs/super.c."""
+    t = query.resolve(conn, "super.c:1").target
+    assert t is not None and t.name == "btrfs_mount"
+    assert t.path == "fs/btrfs/super.c"
+
+
+def test_parent_path_of_a_top_level_file_is_the_root():
+    assert query.parent_path("Makefile") == ""
+    assert query.parent_path("mm/page_alloc.c") == "mm"
+    assert query.parent_path("") == ""
 
 
 # ---------------------------------------------------------------- siblings
@@ -249,6 +258,11 @@ def test_ancestry_walks_the_path(conn):
     assert "fs" in anc
 
 
+def test_resolve_missing(conn):
+    res = query.resolve(conn, "definitely_not_here_xyz")
+    assert res.target is None and "nothing in the index" in res.note
+
+
 # ---------------------------------------------------------------- extras
 
 def test_search_substring_and_exact(conn):
@@ -284,3 +298,30 @@ def test_backtrace_frame_extraction():
 def test_backtrace_gdb_style():
     assert _frames_from_text("#3  0xffffffff81 in ext4_bmap (mapping=0x0)") == \
         ["ext4_bmap"]
+
+
+def test_info_hides_the_rest_when_a_real_subsystem_matched(conn):
+    t = query.resolve(conn, "mm/page_alloc.c").target
+    all_names = [r["name"] for r in query.all_subsystems(conn, "file", t.id)]
+    assert "THE REST" in all_names
+    shown = [r["name"] for r in query.visible_subsystems(
+        query.all_subsystems(conn, "file", t.id))]
+    assert "THE REST" not in shown
+    assert shown[0] == "MEMORY MANAGEMENT"
+
+
+def test_documentation_claimed_by_subsystem_and_by_path(conn):
+    ext4 = query.resolve(conn, "fs/ext4").target
+    paths = [e.path for e in query.documentation_for(conn, ext4)]
+    assert "Documentation/filesystems/ext4/about.rst" in paths
+
+    mm = query.resolve(conn, "mm").target
+    paths = [e.path for e in query.documentation_for(conn, mm)]
+    assert paths[0] == "Documentation/mm/page_alloc.rst"
+
+
+def test_annotate_hides_the_rest_in_favour_of_the_area(conn):
+    t = query.resolve(conn, "Makefile").target
+    e = query.Entry(kind="file", name=t.name, path=t.path)
+    query.annotate_subsystems(conn, [e])
+    assert e.subsystem != "THE REST"

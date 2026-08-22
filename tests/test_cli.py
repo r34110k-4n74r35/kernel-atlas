@@ -113,3 +113,92 @@ def test_pin_roundtrip_in_config(tmp_path, monkeypatch):
     assert config.get_default_version() == "6.1"
     config.clear_default_version()
     assert config.get_default_version() is None
+
+
+def test_negative_limit_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["siblings", "mm", "-n", "-1"])
+    err = capsys.readouterr().err
+    assert ">= 0" in err or "invalid" in err.lower()
+
+
+def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
+    import json
+    assert cli.main(["--db", str(mini_index), "info", "mm", "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    names = [s["name"] for s in data["subsystems"]]
+    assert "THE REST" not in names
+    assert "MEMORY MANAGEMENT" in names
+    assert "elixir.bootlin.com" in data["links"]["elixir"]
+
+
+def test_web_and_docs_commands(mini_index, capsys):
+    assert cli.main(["--db", str(mini_index), "web", "tcp_sendmsg",
+                     "--url", "elixir"]) == 0
+    url = capsys.readouterr().out.strip()
+    assert "elixir.bootlin.com" in url and "tcp.c" in url
+
+    assert cli.main(["--db", str(mini_index), "docs", "fs/ext4"]) == 0
+    out = capsys.readouterr().out
+    assert "Documentation/filesystems/ext4/about.rst" in out
+
+    assert cli.main(["--db", str(mini_index), "docs", "mm"]) == 0
+    out = capsys.readouterr().out
+    assert "Documentation/mm/page_alloc.rst" in out
+    assert "using mm/" not in out
+
+
+def test_docs_bare_name_picks_the_area_directory_not_a_symbol(mini_index, capsys):
+    """`mm` is both the top-level directory and arch/x86/mm/."""
+    from kernel_atlas.cli import _resolve_area
+    from kernel_atlas import db
+    conn = db.connect(mini_index, readonly=True)
+    t = _resolve_area(conn, "mm").target
+    conn.close()
+    assert t.kind == "dir" and t.path == "mm"
+
+
+def test_tree_files_stay_at_requested_depth(mini_index, capsys):
+    import json
+    assert cli.main(["--db", str(mini_index), "tree", "fs", "-d", "1",
+                     "--files", "-f", "json"]) == 0
+    paths = {e["path"] for e in json.loads(capsys.readouterr().out)}
+    assert "fs/open.c" in paths
+    assert "fs/ext4" in paths
+    assert "fs/ext4/inode.c" not in paths, "depth 1 must not include grandchildren files"
+
+
+def test_tree_of_a_top_level_file_uses_the_kernel_root(mini_index, capsys):
+    import json
+    assert cli.main(["--db", str(mini_index), "tree", "Makefile", "-d", "1",
+                     "-f", "json"]) == 0
+    paths = {e["path"] for e in json.loads(capsys.readouterr().out)}
+    assert "mm" in paths and "fs" in paths
+    assert "Makefile" not in paths
+
+
+def test_subsystem_json_omits_files_unless_asked(mini_index, capsys):
+    import json
+    assert cli.main(["--db", str(mini_index), "subsystem", "EXT4 FILE SYSTEM",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "files" not in data
+    assert cli.main(["--db", str(mini_index), "subsystem", "EXT4 FILE SYSTEM",
+                     "-f", "json", "--files"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert any(p.endswith("inode.c") for p in data["files"])
+
+
+def test_locate_lists_every_built_index(mini_index, tmp_path, monkeypatch, capsys):
+    import json
+    import shutil
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    d = tmp_path / "indexes"
+    d.mkdir()
+    shutil.copy(mini_index, d / "6.12.104.db")
+    shutil.copy(mini_index, d / "7.2.db")
+    assert cli.main(["locate", "tcp_sendmsg", "-f", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    versions = {r["version"] for r in rows}
+    assert versions == {"6.12.104", "7.2"}
+    assert all(r["found"] and r["path"].endswith("tcp.c") for r in rows)
