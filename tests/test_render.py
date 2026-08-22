@@ -1,5 +1,5 @@
 from kernel_atlas.query import Entry
-from kernel_atlas.render import render_plain, render_table, render_tree
+from kernel_atlas.render import human_size, render_plain, render_table, render_tree
 
 
 def _syms():
@@ -25,6 +25,18 @@ def test_tree_format_nests_files_under_directories():
 
 def test_plain_format_is_grep_shaped_for_symbols():
     assert render_plain(_syms()).splitlines() == ["fs/x.c:10:a_fn", "fs/x.c:20:b_fn"]
+
+
+def test_plain_format_omits_a_missing_line_number():
+    e = Entry(kind="function", name="x", path="a.c")
+    assert render_plain([e]).strip() == "a.c:x"
+
+
+def test_human_size_zero_is_zero_bytes_not_a_dash():
+    assert human_size(None) == "-"
+    assert human_size(0) == "0B"
+    assert human_size(512) == "512B"
+    assert human_size(1024) == "1.0K"
 
 
 def test_table_alignment_header_matches_rows():

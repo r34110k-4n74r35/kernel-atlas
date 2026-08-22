@@ -66,6 +66,23 @@ def test_use_rejects_unknown_and_ambiguous_versions(home, capsys):
     assert "ambiguous" in capsys.readouterr().err
 
 
+def test_version_prefix_is_component_aware():
+    assert cli.version_prefix_match("6.18.45", "6.18")
+    assert cli.version_prefix_match("6.18.45", "6")
+    assert cli.version_prefix_match("6.18.45", "6.18.45")
+    assert not cli.version_prefix_match("6.18.45", "6.1")
+    assert not cli.version_prefix_match("6.18.45", "6.18.4")
+    assert cli.version_prefix_match("7.2", "7")
+    assert cli.version_prefix_match("next-20260101", "next")
+    assert not cli.version_prefix_match("6.18.45", "")
+
+
+def test_use_6_1_does_not_select_6_18(home, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["use", "6.1"])
+    assert "no index" in capsys.readouterr().err
+
+
 def test_default_index_is_the_pin_then_the_highest_version(home):
     assert cli.default_index().stem == "7.2"
     config.set_default_version("6.18.45")
@@ -263,3 +280,19 @@ def test_pin_selects_index_source_tree_and_locate_home(
     assert cli.main(["-K", "7.2", "locate", "tcp_sendmsg", "-f", "json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["version"] == "7.2" and rows[0]["active"]
+
+
+def test_ls_json_includes_index_version(mini_index, capsys):
+    import json
+    assert cli.main(["--db", str(mini_index), "ls", "mm", "-f", "json", "-n", "1"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data and data[0]["index"] == "6.12.104"
+
+
+def test_tree_wide_symbol_listing_requires_a_limit(mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "siblings", "mm",
+                  "--level", "tree", "--kinds", "function"])
+    assert "-n" in capsys.readouterr().err
+    assert cli.main(["--db", str(mini_index), "siblings", "mm",
+                     "--level", "tree", "--kinds", "function", "-n", "5"]) == 0

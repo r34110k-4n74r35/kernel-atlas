@@ -269,6 +269,8 @@ def test_search_substring_and_exact(conn):
     assert "ext4_bmap" in names(query.search(conn, "bmap"))
     assert names(query.search(conn, "bmap", mode="exact")) == []
     assert names(query.search(conn, "ext4_bmap", mode="exact")) == ["ext4_bmap"]
+    assert "ext4_bmap" in names(query.search(conn, "EXT4_BMAP", mode="substring"))
+    assert names(query.search(conn, "EXT4_BMAP", mode="exact")) == []
 
 
 def test_search_glob_and_kinds(conn):
@@ -325,3 +327,36 @@ def test_annotate_hides_the_rest_in_favour_of_the_area(conn):
     e = query.Entry(kind="file", name=t.name, path=t.path)
     query.annotate_subsystems(conn, [e])
     assert e.subsystem != "THE REST"
+
+
+def test_like_under_escapes_sql_wildcards():
+    assert query.like_under("") == "%"
+    assert query.like_under("mm") == "mm/%"
+    assert query.like_under("io_uring") == r"io\_uring/%"
+    assert query.like_escape("100%") == r"100\%"
+
+
+def test_ancestry_never_labels_the_rest(conn):
+    for path in ("mm/page_alloc.c", "net/ipv4/tcp.c", "Makefile"):
+        labels = [s for _, s in query.ancestry(conn, path)]
+        assert "THE REST" not in labels
+
+
+def test_licenses_is_a_named_area():
+    from kernel_atlas.maintainers import top_level_area
+    assert top_level_area("LICENSES/preferred/GPL-2.0")[0] == "Licenses"
+
+
+def test_rank_prefers_shallow_headers_over_nested_stubs_and_tools():
+    def t(path, kind="macro", static=False):
+        return query.Target(kind="symbol", id=1, path=path, name="GFP_KERNEL",
+                            symbol_kind=kind, is_static=static)
+
+    ranked = sorted(
+        [t("include/linux/raid/pq.h"),
+         t("include/linux/gfp_types.h"),
+         t("tools/include/linux/gfp_types.h")],
+        key=query._rank_candidate,
+    )
+    assert ranked[0].path == "include/linux/gfp_types.h"
+    assert ranked[-1].path.startswith("tools/")

@@ -39,12 +39,14 @@ def paint(text: str, code: str, on: bool) -> str:
 
 
 def human_size(n: int | None) -> str:
-    if not n:
+    if n is None:
         return "-"
-    for unit in ("B", "K", "M", "G"):
-        if n < 1024 or unit == "G":
-            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+    if n < 1024:
+        return f"{n}B"
+    for unit in ("K", "M", "G"):
         n /= 1024
+        if n < 1024 or unit == "G":
+            return f"{n:.1f}{unit}"
     return str(n)
 
 
@@ -142,8 +144,10 @@ def render_plain(entries: list[Entry]) -> str:
     for e in entries:
         if e.kind in ("dir", "file"):
             out.append(e.path + ("/" if e.kind == "dir" else ""))
-        else:
+        elif e.line is not None:
             out.append(f"{e.path}:{e.line}:{e.name}")
+        else:
+            out.append(f"{e.path}:{e.name}")
     return "\n".join(out) + ("\n" if out else "")
 
 
