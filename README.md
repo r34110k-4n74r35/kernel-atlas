@@ -15,7 +15,7 @@ file and C symbol, and maps each path to a **subsystem** using the kernel's own
 Queries are local and offline. `ka web` only *prints* URLs (Bootlin Elixir,
 git.kernel.org, GitHub, docs.kernel.org).
 
-Examples below are from **Linux 6.18.45** (current LTS). Line numbers move
+Examples below are from **Linux 6.18.46** (current LTS). Line numbers move
 between releases; `ka locate` is how you compare them.
 
 ```
@@ -27,10 +27,10 @@ net/ipv4/tcp.c:tcp_sendmsg
   defined in   net/ipv4/tcp.c:1409-1418 (10 lines)
   signature    int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
   linkage      EXPORT_SYMBOL (available to modules)
-  on disk      ~/kernel-atlas/kernels/linux-6.18.45/net/ipv4/tcp.c
-  index        Linux 6.18.45
-  elixir       https://elixir.bootlin.com/linux/v6.18.45/source/net/ipv4/tcp.c#L1409
-  ident        https://elixir.bootlin.com/linux/v6.18.45/ident/tcp_sendmsg
+  on disk      ~/kernel-atlas/kernels/linux-6.18.46/net/ipv4/tcp.c
+  index        Linux 6.18.46
+  elixir       https://elixir.bootlin.com/linux/v6.18.46/source/net/ipv4/tcp.c#L1409
+  ident        https://elixir.bootlin.com/linux/v6.18.46/ident/tcp_sendmsg
 
   Area: Networking
     Network stack: sockets, TCP/IP, netfilter, per-protocol code.
@@ -106,7 +106,7 @@ ka locate tcp_sendmsg         # same symbol in every built index
 dmesg | ka trace              # map a backtrace to subsystems
 ```
 
-Listing commands print `[Linux 6.18.45]` so the output always names the index
+Listing commands print `[Linux 6.18.46]` so the output always names the index
 that answered.
 
 ## Where everything lives
@@ -117,9 +117,9 @@ hidden cache, so the code you are studying is next to the tool:
 ```
 kernel-atlas/
 ├── kernels/
-│   └── linux-6.18.45/      <- real kernel tree: open it, grep it
+│   └── linux-6.18.46/      <- real kernel tree: open it, grep it
 ├── indexes/
-│   ├── 6.18.45.db
+│   ├── 6.18.46.db
 │   └── .default-version    <- written by `ka use`, gitignored
 └── src/kernel_atlas/
 ```
@@ -144,13 +144,13 @@ Three knobs pick which index a command uses, in this order:
    pinned (or that index is gone), the **highest built version**.
 
 A unique **prefix** is enough, but only at a version-component boundary:
-`6.18` selects `6.18.45`; `6.1` does **not**. `ka use 6` is ambiguous if you
+`6.18` selects `6.18.46`; `6.1` does **not**. `ka use 6` is ambiguous if you
 have both 6.12 and 6.18.
 
 ```bash
 ka use                  # what is pinned, and what is actually active
-ka use 6.18             # pin by unique prefix → 6.18.45
-ka use 6.18.45          # pin by exact version
+ka use 6.18             # pin by unique prefix → 6.18.46
+ka use 6.18.46          # pin by exact version
 ka use --clear          # unpin; go back to "highest built version"
 ka indexes              # one row per index; * is the default
 
@@ -164,12 +164,12 @@ cleared and commands fall back to the highest remaining index (with a warning
 the first time).
 
 ```bash
-ka remove 6.18                # delete indexes/6.18.45.db; keep the source
-ka rm 6.18.45 --source        # also delete kernels/linux-6.18.45/  (~1.6 GB)
+ka remove 6.18                # delete indexes/6.18.46.db; keep the source
+ka rm 6.18.46 --source        # also delete kernels/linux-6.18.46/  (~1.6 GB)
 ```
 
 `remove` (alias `rm`) resolves every name *before* deleting, so
-`ka remove 6.18 6.18.45` is the same index named twice, not an error. SQLite
+`ka remove 6.18 6.18.46` is the same index named twice, not an error. SQLite
 sidecar files (`.db-wal`, `.db-shm`, `.db-journal`) go with the index.
 
 The kernel source is **kept by default**: rebuilding from a tree already on
@@ -204,7 +204,7 @@ into place only on success): an interrupted build cannot look finished.
 | `--no-verify` | skip the checksum (not recommended) |
 | `--quiet` | no progress output |
 
-Linux 6.18.45 on a laptop is about 6,000 directories, 91,000 files, 4.05
+Linux 6.18.46 on a laptop is about 6,000 directories, 91,000 files, 4.05
 million symbols, 3,100 subsystems, a minute to index. Most of the size is the
 kernel's ~2.9 million macros; `--kinds function,syscall,struct,enum,typedef`
 is much smaller if you do not need them. `ka stats` summarises an index.
@@ -390,7 +390,7 @@ exactly that symbol:
 
 ```
 $ ka show tcp_sendmsg
-net/ipv4/tcp.c:1409  tcp_sendmsg   [NETWORKING [TCP]]   [Linux 6.18.45]
+net/ipv4/tcp.c:1409  tcp_sendmsg   [NETWORKING [TCP]]   [Linux 6.18.46]
   1409 int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
   1410 {
   1411 	int ret;
@@ -422,14 +422,14 @@ opened; pipe into `open` / `xdg-open` if you want a browser.
 ```
 $ ka web tcp_sendmsg
 
-net/ipv4/tcp.c:1409  tcp_sendmsg   [Linux 6.18.45]
-  elixir  https://elixir.bootlin.com/linux/v6.18.45/source/net/ipv4/tcp.c#L1409
-  ident   https://elixir.bootlin.com/linux/v6.18.45/ident/tcp_sendmsg
-  git     https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/tcp.c?h=v6.18.45#n1409
-  github  https://github.com/gregkh/linux/blob/v6.18.45/net/ipv4/tcp.c#L1409
+net/ipv4/tcp.c:1409  tcp_sendmsg   [Linux 6.18.46]
+  elixir  https://elixir.bootlin.com/linux/v6.18.46/source/net/ipv4/tcp.c#L1409
+  ident   https://elixir.bootlin.com/linux/v6.18.46/ident/tcp_sendmsg
+  git     https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/ipv4/tcp.c?h=v6.18.46#n1409
+  github  https://github.com/gregkh/linux/blob/v6.18.46/net/ipv4/tcp.c#L1409
 ```
 
-`ident` is Elixir's cross-reference for the symbol name. `--url elixir|ident|git|github|docs` prints a single URL. Three-part versions (6.18.45) use the stable tree and `gregkh/linux`; two-part versions (7.2) use torvalds. docs.kernel.org is versioned by major.minor (`v6.18`), not the patch level.
+`ident` is Elixir's cross-reference for the symbol name. `--url elixir|ident|git|github|docs` prints a single URL. Three-part versions (6.18.46) use the stable tree and `gregkh/linux`; two-part versions (7.2) use torvalds. docs.kernel.org is versioned by major.minor (`v6.18`), not the patch level.
 
 ```bash
 open $(ka web tcp_sendmsg --url elixir)
@@ -455,9 +455,9 @@ between the LTS you are running and mainline. The version from `ka use` or
 ```
 $ ka locate tcp_sendmsg
 
-tcp_sendmsg  across 1 index  * = Linux 6.18.45
+tcp_sendmsg  across 1 index  * = Linux 6.18.46
 
-  * 6.18.45  function   net/ipv4/tcp.c:1409       NETWORKING [TCP]
+  * 6.18.46  function   net/ipv4/tcp.c:1409       NETWORKING [TCP]
 ```
 
 Build a second version when you want a side-by-side comparison.
@@ -471,7 +471,7 @@ file, a line and a subsystem. It does **not** need a call-graph index.
 $ dmesg | ka trace
 $ ka trace tcp_sendmsg __alloc_pages_noprof kthread
 
-Backtrace across 3 frames (Linux 6.18.45)
+Backtrace across 3 frames (Linux 6.18.46)
 
   #0  tcp_sendmsg           net/ipv4/tcp.c:1409       NETWORKING [TCP]
   #1  __alloc_pages_noprof  mm/page_alloc.c:5268      MEMORY MANAGEMENT - PAGE ALLOCATOR
@@ -526,7 +526,7 @@ macro) is listed with kind `?`.
 ## A tour across subsystems
 
 The same few commands work everywhere. What changes is the path you hand them.
-Numbers are from 6.18.45.
+Numbers are from 6.18.46.
 
 ### Memory management
 
@@ -705,7 +705,7 @@ Global options work before **or** after the subcommand:
 
 | Option | Meaning |
 | --- | --- |
-| `-K`, `--kernel` | which index (`6.18.45`, or a unique prefix like `6.18`) |
+| `-K`, `--kernel` | which index (`6.18.46`, or a unique prefix like `6.18`) |
 | `--db PATH` | a specific index file |
 | `--color` | `auto` (default), `always`, `never` |
 
@@ -784,7 +784,7 @@ Known limits:
 
 **"no index for X"** — `ka indexes` lists what you have. Prefixes must be
 unique *and* land on a version-component boundary (`-K 6` is ambiguous if you
-have both 6.12 and 6.18; `-K 6.1` does not select `6.18.45`).
+have both 6.12 and 6.18; `-K 6.1` does not select `6.18.46`).
 
 **"this index has no call graph"** — rebuild that version with
 `--with-calls --force`. `ka trace` does not need it.
