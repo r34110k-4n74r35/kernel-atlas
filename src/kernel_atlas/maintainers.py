@@ -81,6 +81,18 @@ def _specificity(pattern: str) -> int:
     return literal.count("/") * 20 + len(literal)
 
 
+def _regex_specificity(pattern: str) -> int:
+    """A name regex should beat a broad wildcard but not an exact deep path.
+
+    ``N: imx`` is semantically more precise than ``F: arch/*/boot/dts/`` even
+    though it has no path prefix.  The longest literal-looking run is a useful,
+    deterministic proxy; scores remain capped below a typical exact deep file.
+    """
+    runs = re.findall(r"[A-Za-z0-9_/-]+", pattern)
+    longest = max((len(run) for run in runs), default=0)
+    return 20 + min(60, longest * 2)
+
+
 def _to_regex(pattern: str) -> re.Pattern | None:
     pattern = pattern.strip()
     if not pattern:
@@ -88,15 +100,42 @@ def _to_regex(pattern: str) -> re.Pattern | None:
     trailing_dir = pattern.endswith("/")
     core = pattern[:-1] if trailing_dir else pattern
     out: list[str] = []
-    for ch in core:
+    i = 0
+    while i < len(core):
+        ch = core[i]
+        # The kernel file contains a small number of shell-escaped wildcards
+        # (notably netcons\*).  get_maintainer.pl treats them as prefix
+        # wildcards in practice, so ignore the protective slash here too.
+        if ch == "\\" and i + 1 < len(core):
+            nxt = core[i + 1]
+            if nxt in "*?":
+                ch = nxt
+                i += 1
+            else:
+                out.append(re.escape(nxt))
+                i += 2
+                continue
         if ch == "*":
             out.append("[^/]*")
         elif ch == "?":
             out.append("[^/]")
-        elif ch in ".^$+(){}[]|\\":
-            out.append("\\" + ch)
+        elif ch == "[":
+            end = core.find("]", i + 1)
+            if end < 0:
+                out.append(r"\[")
+            else:
+                content = core[i + 1:end]
+                if not content:
+                    out.append(r"\[\]")
+                else:
+                    if content[0] in "!^":
+                        content = "^" + content[1:]
+                    content = content.replace("\\", r"\\")
+                    out.append("[" + content + "]")
+                i = end
         else:
-            out.append(ch)
+            out.append(re.escape(ch))
+        i += 1
     body = "".join(out)
     # A trailing slash covers the directory itself and everything beneath it.
     suffix = "(/.*)?" if trailing_dir else ""
@@ -176,15 +215,21 @@ def parse_maintainers(text: str) -> list[Section]:
 class SubsystemMap:
     """Resolve a repo-relative path to the MAINTAINERS sections that claim it."""
 
-    def __init__(self, sections: list[Section]):
+    def __init__(self, sections: list[Section], tree: Path | None = None):
         self.sections = sections
+        self._tree = tree
         self._exact: dict[str, list[tuple[int, int]]] = {}
         self._dirs: dict[str, list[tuple[int, int]]] = {}
         self._wild: dict[str, list[tuple[re.Pattern, int, int]]] = {}
         self._excludes: dict[int, list[re.Pattern]] = {}
-        self._name_res: list[tuple[re.Pattern, int]] = []
-        self._name_probe: list[re.Pattern] = []
+        self._name_res: list[tuple[re.Pattern, int, int]] = []
+        self._name_probe: list[re.Pattern | None] = []
         self._build(sections)
+
+    def _is_existing_dir(self, pattern: str) -> bool:
+        return self._tree is not None and not pattern.endswith("/") and \
+            not any(c in pattern for c in "*?[") and \
+            (self._tree / pattern).is_dir()
 
     def _build(self, sections: list[Section]) -> None:
         for sec in sections:
@@ -192,7 +237,7 @@ class SubsystemMap:
                 score = _specificity(pat)
                 has_wild = any(c in pat for c in "*?[")
                 if not has_wild:
-                    if pat.endswith("/"):
+                    if pat.endswith("/") or self._is_existing_dir(pat):
                         self._dirs.setdefault(pat.rstrip("/"), []).append((sec.id, score))
                     else:
                         self._exact.setdefault(pat, []).append((sec.id, score))
@@ -202,12 +247,14 @@ class SubsystemMap:
                         bucket = _literal_prefix_dir(pat)
                         self._wild.setdefault(bucket, []).append((rx, sec.id, score))
             for pat in sec.excludes:
-                rx = _to_regex(pat)
+                normalized = pat + "/" if self._is_existing_dir(pat) else pat
+                rx = _to_regex(normalized)
                 if rx is not None:
                     self._excludes.setdefault(sec.id, []).append(rx)
             for pat in sec.regexes:
                 try:
-                    self._name_res.append((re.compile(pat), sec.id))
+                    self._name_res.append(
+                        (re.compile(pat), sec.id, _regex_specificity(pat)))
                 except re.error:
                     continue
 
@@ -215,9 +262,16 @@ class SubsystemMap:
         # case be rejected with a handful of regex calls instead of hundreds.
         for i in range(0, len(self._name_res), 40):
             chunk = self._name_res[i:i + 40]
+            # Combining capturing regexes changes numeric backreference group
+            # numbers.  Fall back to the individual expressions for that rare
+            # chunk; current kernel patterns are capture-free, so the fast path
+            # remains the common one.
+            if any(rx.groups for rx, _, _ in chunk):
+                self._name_probe.append(None)
+                continue
             try:
                 self._name_probe.append(
-                    re.compile("|".join(f"(?:{rx.pattern})" for rx, _ in chunk))
+                    re.compile("|".join(f"(?:{rx.pattern})" for rx, _, _ in chunk))
                 )
             except re.error:
                 self._name_probe.append(None)
@@ -241,9 +295,9 @@ class SubsystemMap:
 
         for i, probe in enumerate(self._name_probe):
             if probe is None or probe.search(path):
-                for rx, sid in self._name_res[i * 40:(i + 1) * 40]:
+                for rx, sid, score in self._name_res[i * 40:(i + 1) * 40]:
                     if rx.search(path):
-                        hits[sid] = max(hits.get(sid, -10**9), 5)
+                        hits[sid] = max(hits.get(sid, -10**9), score)
 
         out: list[tuple[Section, int]] = []
         for sid, score in hits.items():
@@ -257,7 +311,7 @@ class SubsystemMap:
 def load(tree: Path) -> SubsystemMap:
     path = tree / "MAINTAINERS"
     text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-    return SubsystemMap(parse_maintainers(text))
+    return SubsystemMap(parse_maintainers(text), tree)
 
 
 def top_level_area(path: str) -> tuple[str, str] | None:

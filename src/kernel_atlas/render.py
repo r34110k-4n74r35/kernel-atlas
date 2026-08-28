@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+from collections import Counter
 
 from .query import Entry
 
@@ -31,7 +32,7 @@ def use_color(choice: str = "auto") -> bool:
         return False
     if choice == "always":
         return True
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
 
 
 def paint(text: str, code: str, on: bool) -> str:
@@ -164,7 +165,34 @@ def entry_dict(e: Entry, columns=None) -> dict:
         "is_static": e.is_static, "is_inline": e.is_inline,
         "is_exported": e.is_exported, "subsystem": e.subsystem,
     }
-    return {k: v for k, v in d.items() if v is not None}
+    if e.is_target:
+        d["is_target"] = True
+    if columns is None:
+        return {k: v for k, v in d.items() if v is not None}
+
+    selected = {}
+    for col in columns:
+        if col == "dir":
+            value = e.path.rsplit("/", 1)[0] if "/" in e.path else "."
+        elif col == "span":
+            value = e.span
+        elif col == "symbols":
+            value = e.n_symbols
+        elif col == "subdirs":
+            value = e.n_subdirs
+        elif col == "files":
+            value = e.n_files
+        elif col == "flags":
+            value = _flags(e)
+        else:
+            value = d.get(col)
+        # Explicit columns are a schema request.  Keep a requested key even
+        # when this particular row has no value for it so heterogeneous JSON
+        # listings remain straightforward to consume.
+        selected[col] = value
+    if e.is_target:
+        selected["is_target"] = True
+    return selected
 
 
 def render_json(payload) -> str:
@@ -183,8 +211,9 @@ def render_csv(entries: list[Entry], columns) -> str:
 def render_tree(entries: list[Entry], color: bool) -> str:
     """Nested view of the paths present in `entries`.
 
-    Symbols hang beneath their file as their own leaves; keying them by name
-    and line means two symbols in one file can never overwrite each other.
+    Symbols hang beneath their file as leaves in a list.  A list is important:
+    named aggregate typedefs commonly produce two symbols with the same name
+    and source line, and neither may overwrite the other.
     """
     root: dict = {}
     for e in entries:
@@ -199,16 +228,34 @@ def render_tree(entries: list[Entry], color: bool) -> str:
         else:
             for part in parts:
                 node = node.setdefault(part, {})
-            label = f"{e.name}:{e.line}" if e.line else e.name
-            node.setdefault(label, {})["__entry__"] = e
+            node.setdefault("__leaves__", []).append(e)
 
     out = io.StringIO()
 
     def walk(node: dict, prefix: str) -> None:
-        keys = [k for k in node if k != "__entry__"]
-        for i, key in enumerate(sorted(keys)):
-            last = i == len(keys) - 1
-            child = node[key]
+        # Dict insertion order reflects the already-sorted input.  Re-sorting
+        # here used to silently undo ``--sort line`` and ``--sort lines``.
+        children = [("node", key, child) for key, child in node.items()
+                    if key not in ("__entry__", "__leaves__")]
+        leaves = node.get("__leaves__", [])
+        counts = Counter((e.name, e.line) for e in leaves)
+        leaf_seen: Counter = Counter()
+        items = children + [("leaf", "", e) for e in leaves]
+        for i, (item_kind, key, value) in enumerate(items):
+            last = i == len(items) - 1
+            if item_kind == "leaf":
+                e = value
+                label = f"{e.name}:{e.line}" if e.line else e.name
+                if counts[(e.name, e.line)] > 1:
+                    label += f" [{e.kind}]"
+                    leaf_seen[(e.name, e.line, e.kind)] += 1
+                    if leaf_seen[(e.name, e.line, e.kind)] > 1:
+                        label += f" #{leaf_seen[(e.name, e.line, e.kind)]}"
+                label = paint(label, _KIND_COLOR.get(e.kind, "0"), color)
+                out.write(f"{prefix}{'└── ' if last else '├── '}{label}\n")
+                continue
+
+            child = value
             e = child.get("__entry__")
             label = key + ("/" if e is not None and e.kind == "dir" else "")
             if e is not None:
@@ -223,7 +270,7 @@ def render_tree(entries: list[Entry], color: bool) -> str:
 def render(entries: list[Entry], columns, fmt: str, color: bool,
            max_width: int = 0) -> str:
     if fmt == "json":
-        return render_json([entry_dict(e) for e in entries])
+        return render_json([entry_dict(e, columns) for e in entries])
     if fmt == "plain":
         return render_plain(entries)
     if fmt == "names":

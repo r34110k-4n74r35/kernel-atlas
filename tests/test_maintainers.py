@@ -1,6 +1,14 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from fixture import MAINTAINERS
 
-from kernel_atlas.maintainers import SubsystemMap, parse_maintainers, top_level_area
+from kernel_atlas.maintainers import (
+    SubsystemMap,
+    load,
+    parse_maintainers,
+    top_level_area,
+)
 
 
 def build():
@@ -82,3 +90,66 @@ def test_top_level_area_descriptions():
     assert top_level_area("fs/ext4/inode.c")[0] == "Filesystems"
     assert top_level_area("mm/page_alloc.c")[0] == "Memory management"
     assert top_level_area("nonexistent/x.c") is None
+
+
+def test_character_class_globs_match_files_not_literal_brackets():
+    smap = SubsystemMap(parse_maintainers("""\
+ARM GIC
+M: Maintainer <m@example.com>
+F: drivers/irqchip/irq-gic*.[ch]
+
+SCMI
+M: Maintainer <m@example.com>
+F: drivers/clk/clk-sc[mp]i.c
+"""))
+    assert names(smap, "drivers/irqchip/irq-gic.c") == ["ARM GIC"]
+    assert names(smap, "drivers/irqchip/irq-gic.h") == ["ARM GIC"]
+    assert names(smap, "drivers/clk/clk-scmi.c") == ["SCMI"]
+    assert names(smap, "drivers/clk/clk-scpi.c") == ["SCMI"]
+
+
+def test_escaped_star_used_by_netconsole_is_a_prefix_wildcard():
+    smap = SubsystemMap(parse_maintainers(r"""NETCONSOLE
+M: Maintainer <m@example.com>
+F: tools/testing/selftests/drivers/net/netcons\*
+"""))
+    assert names(smap, "tools/testing/selftests/drivers/net/netcons_basic.sh") == \
+        ["NETCONSOLE"]
+
+
+def test_existing_directory_without_trailing_slash_is_recursive():
+    with TemporaryDirectory() as tmp:
+        tree = Path(tmp)
+        driver = tree / "drivers/infiniband/hw/erdma"
+        driver.mkdir(parents=True)
+        (driver / "erdma_cmdq.c").write_text("", encoding="utf-8")
+        (tree / "MAINTAINERS").write_text("""\
+ALIBABA ELASTIC RDMA DRIVER
+M: Maintainer <m@example.com>
+F: drivers/infiniband/hw/erdma
+""", encoding="utf-8")
+        smap = load(tree)
+        assert names(smap, "drivers/infiniband/hw/erdma/erdma_cmdq.c") == \
+            ["ALIBABA ELASTIC RDMA DRIVER"]
+
+
+def test_name_regex_with_backreference_keeps_its_group_numbering():
+    smap = SubsystemMap(parse_maintainers(r"""FIRST
+N: (x)
+
+REPEATED WORD
+N: (foo)\1
+"""))
+    assert names(smap, "foofoo") == ["REPEATED WORD"]
+
+
+def test_specific_name_regex_ranks_ahead_of_broad_file_glob():
+    smap = SubsystemMap(parse_maintainers("""\
+GENERIC DEVICE TREE
+F: arch/*/boot/dts/
+
+IMX PLATFORM
+N: imx
+"""))
+    assert names(smap, "arch/arm64/boot/dts/imx8mq.dts") == [
+        "IMX PLATFORM", "GENERIC DEVICE TREE"]

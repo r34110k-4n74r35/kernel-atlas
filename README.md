@@ -2,9 +2,9 @@
 
 A map of the Linux kernel for people who are still learning their way around it.
 
-`kernel-atlas` downloads a kernel from kernel.org, indexes every directory,
-file and C symbol, and maps each path to a **subsystem** using the kernel's own
-`MAINTAINERS` file. Then you can ask:
+`kernel-atlas` downloads a kernel from kernel.org, records its directory and
+file map, extracts the C symbols it can parse, and maps each path to a
+**subsystem** using the kernel's own `MAINTAINERS` file. Then you can ask:
 
 - What else lives next to this folder, file, or function?
 - Which subsystem owns this symbol, and who maintains it?
@@ -161,7 +161,9 @@ ka -K 7.2 info tcp_sendmsg       # another index, this command only
 `ka indexes` marks the default with `*`. A pin is the file
 `indexes/.default-version`. If you `ka remove` that version, the pin is
 cleared and commands fall back to the highest remaining index (with a warning
-the first time).
+the first time). The displayed version comes from the index metadata; if a
+custom database filename differs, `indexes` also shows that filename as the
+selection alias.
 
 ```bash
 ka remove 6.18                # delete indexes/6.18.46.db; keep the source
@@ -175,7 +177,9 @@ sidecar files (`.db-wal`, `.db-shm`, `.db-journal`) go with the index.
 The kernel source is **kept by default**: rebuilding from a tree already on
 disk takes about a minute and no download. Pass `--source` only when you also
 want that disk back. This does not ask for confirmation — the version
-argument is the confirmation. `ka indexes` afterwards shows what is left.
+argument is the confirmation. Only the matching tool-managed tree recorded by
+the index can be removed; an arbitrary custom `--src` tree is always kept.
+`ka indexes` afterwards shows what is left.
 
 ## Building indexes
 
@@ -189,25 +193,36 @@ ka build lts --force          # rebuild over an existing index
 ```
 
 Version aliases are resolved live against kernel.org. Downloads resume if the
-connection drops and are checked against kernel.org's `sha256sums.asc`.
-Extraction and indexing are atomic (scratch directory / scratch file, renamed
-into place only on success): an interrupted build cannot look finished.
+connection drops. Published CDN archives are checked against kernel.org's
+`sha256sums.asc`; if that checksum cannot be obtained, the build fails unless
+you explicitly pass `--no-verify`. Current release-candidate archives are the
+exception: kernel.org generates them from cgit without a published checksum,
+so `build mainline` uses the release feed's HTTPS URL and prints an explicit
+warning. Extraction and indexing use unique same-directory scratch paths that
+are renamed into place only on success, so interrupted and concurrent builds
+cannot publish one another's partial work.
 
 | `build` option | Effect |
 | --- | --- |
-| `--src PATH` | index a kernel tree you already have (version from its `Makefile`) |
+| `--src PATH` | index a kernel tree you already have (version from its `Makefile`, unless an explicit positional version is supplied) |
 | `--kinds LIST` | symbol kinds to index (default: `function,syscall,struct,union,enum,typedef,macro,variable`; add `prototype` if wanted) |
 | `--with-calls` | also record the call graph (enables `ka calls`; a few hundred MB extra) |
 | `--jobs N` | parser processes (default: one per CPU, max 16) |
 | `--output PATH` | write the index somewhere specific |
 | `--keep-tarball` | keep the `.tar.xz` after extraction |
 | `--no-verify` | skip the checksum (not recommended) |
+| `--force` | replace an existing index (reusing its source tree when present) |
 | `--quiet` | no progress output |
+
+With `--src`, download aliases such as `lts` are not version labels: omit the
+positional argument to detect the tree's `Makefile` version, or supply an
+explicit literal version for a vendor/local tree.
 
 Linux 6.18.46 on a laptop is about 6,000 directories, 91,000 files, 4.05
 million symbols, 3,100 subsystems, a minute to index. Most of the size is the
 kernel's ~2.9 million macros; `--kinds function,syscall,struct,enum,typedef`
-is much smaller if you do not need them. `ka stats` summarises an index.
+is much smaller if you do not need them. The build summary and `ka stats`
+separately report files that were parsed, skipped, or failed.
 
 ## Naming a target
 
@@ -285,8 +300,9 @@ lists the kernel root.
 
 See [Building indexes](#building-indexes) and
 [Choosing a kernel version](#choosing-a-kernel-version). After a successful
-build, two first queries are printed. These commands only touch files under
-`indexes/` (and, with `--source`, `kernels/`). They never change your system
+build, two first queries are printed. By default these commands only touch
+files under `indexes/` (and, with `--source`, `kernels/`). An explicit
+`build --output PATH` may write at that path. They never change your system
 `PATH`.
 
 ### `stats`
@@ -382,8 +398,9 @@ code -g $(ka path tcp_sendmsg --line)    # /.../net/ipv4/tcp.c:1409
 grep -rn lock_sock $(ka path net/ipv4)
 ```
 
-`--line` appends `:LINE` for symbols. This needs the source tree under
-`kernels/`; `info`, `siblings`, `find`, `web`, `docs` and `locate` do not.
+`--line` appends `:LINE` for symbols. This needs the exact source tree recorded
+in the index (the managed tree under `kernels/` or the original `--src` tree);
+`info`, `siblings`, `find`, `web`, `docs` and `locate` do not.
 
 `show` prints source without leaving the terminal. Given a symbol, it prints
 exactly that symbol:
@@ -679,11 +696,12 @@ ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
 
 **Open it in an editor.** `vim $(ka path tcp_sendmsg)` or
 `code -g $(ka path tcp_sendmsg --line)`. `--line` appends `:LINE`.
-`path` / `show` need the tree under `kernels/`; most other commands do not.
+`path` / `show` need the exact source tree recorded in the index (normally
+under `kernels/`, or the original `--src` tree); most other commands do not.
 
 ## Controlling the output
 
-Listing commands (`siblings`, `ls`, `find`, `calls`) accept:
+Listing commands (`siblings`, `ls`, `find`, `calls`) share these controls:
 
 | Option | Values / meaning |
 | --- | --- |
@@ -698,16 +716,23 @@ Listing commands (`siblings`, `ls`, `find`, `calls`) accept:
 | `--static-only` / `--no-static` | keep only / drop `static` symbols |
 
 `find` substring/prefix matching is case-insensitive; `--exact` and `--glob`
-are not. Listing JSON stays an array of objects so `jq '.[].name'` works;
-each row also has an `index` field naming the kernel version.
+are not, and the three explicit matching modes are mutually exclusive. Listing
+JSON stays an array of objects so `jq '.[].name'` works; each row also has an
+`index` field naming the kernel version. With `--columns`, JSON is projected to
+those fields too. `--static-only` and `--no-static` are mutually exclusive.
 
-Global options work before **or** after the subcommand:
+For commands that read an index, global options work before **or** after the
+subcommand:
 
 | Option | Meaning |
 | --- | --- |
 | `-K`, `--kernel` | which index (`6.18.46`, or a unique prefix like `6.18`) |
 | `--db PATH` | a specific index file |
 | `--color` | `auto` (default), `always`, `never` |
+
+`-K` and `--db` are mutually exclusive. Index-selection options are rejected
+by lifecycle commands such as `build`, `indexes`, `use`, and `remove`, where
+they would otherwise have no meaning.
 
 `names` and `plain` print bare values with no header or footer, so they pipe
 cleanly. `plain` is `path` for files/dirs and `path:line:name` for symbols —
@@ -742,12 +767,15 @@ X: path             excluded, even if an F: line above matched
 N: regex            matched against the whole path
 ```
 
-When several sections match, the most precise one wins. The catch-all `THE
-REST` section claims every path in the tree, so it is never *shown* as the
-answer: a more specific section wins when one exists, and otherwise the
-plain-English *Area* of the top-level directory is used (`mm/` → Memory
-management, `kernel/` → Core kernel). `find` follows the same rule, so a
-hit in `tools/` is labelled `Tools` rather than `THE REST`.
+When several sections match, the most precise one wins, while every matching
+section is retained for `info` and `subsystem --files`. Existing directories
+named by `F:` or `X:` are recursive even when the line omits its trailing
+slash; `?`, `*`, and bracket classes such as `[ch]` follow the kernel matcher.
+The catch-all `THE REST` section claims every path in the tree, so it is never
+*shown* as the answer: a more specific section wins when one exists, and
+otherwise the plain-English *Area* of the top-level directory is used (`mm/`
+→ Memory management, `kernel/` → Core kernel). `find` follows the same rule,
+so a hit in `tools/` is labelled `Tools` rather than `THE REST`.
 
 ## How parsing works, and its limits
 
@@ -759,8 +787,8 @@ idioms are handled explicitly:
   becomes a statement and the body a *sibling* block. It is rebuilt as
   `sys_open`, including its call edges. `COMPAT_SYSCALL_DEFINE4(...)` becomes
   `compat_sys_…`, a different symbol.
-- `EXPORT_SYMBOL` / `EXPORT_SYMBOL_GPL` / `EXPORT_PER_CPU_SYMBOL` mark a
-  symbol as available to modules.
+- The canonical `EXPORT_SYMBOL*` family—including GPL, namespace, and
+  per-CPU variants—marks a symbol as available to modules.
 - `DECLARE_WORK(name, fn)`, `DEFINE_MUTEX(name)`, `LIST_HEAD(name)`,
   `DECLARE_BITMAP(name, n)`, `DEFINE_PER_CPU(type, name)` declare `name`.
 - Trailing attribute macros (`____cacheline_aligned_in_smp`) are not mistaken
@@ -773,10 +801,20 @@ Known limits:
 
 - Code inside `#if` branches is indexed regardless of `.config`.
 - A name defined per-architecture resolves to one likely definition;
-  `ka find --exact <name>` shows all of them.
+  `ka find --exact <name> -n 0` shows all of them.
 - Functions generated entirely by macros other than the ones above are missed.
+- Conditional/configuration-specific export wrappers are not marked exported;
+  the index marks literal uses of the canonical `EXPORT*_SYMBOL*` family.
 - The call graph resolves names, not function pointers.
 - Only C is parsed. Assembly and Rust files appear as files, without symbols.
+- C/H files over 2 MiB are line-counted but not sent to tree-sitter, because
+  generated headers can contain millions of definitions. Their status is
+  recorded as `skipped_oversize` and included in build statistics.
+- Symlinks are represented in the file map but are not followed or parsed, so
+  directory cycles and links outside the selected tree cannot broaden the
+  index unexpectedly.
+- A read or parser failure is stored on the affected file and counted in the
+  build summary instead of being reported as a successful parse.
 
 ## Troubleshooting
 
@@ -789,8 +827,10 @@ have both 6.12 and 6.18; `-K 6.1` does not select `6.18.46`).
 **"this index has no call graph"** — rebuild that version with
 `--with-calls --force`. `ka trace` does not need it.
 
-**"the source for Linux X is not on disk"** — `path` and `show` need the tree
-under `kernels/`. Other commands do not. `ka build X --force` re-downloads.
+**"the source for Linux X is not on disk"** — `path` and `show` need the exact
+tree recorded when the index was built. Other commands do not. `ka build X
+--force` uses the valid managed tree at `kernels/linux-X`, downloading it when
+absent; a removed custom `--src` tree must be restored or re-indexed.
 
 **"is N bytes; pass --lines"** — `show` will not dump a file bigger than 2 MB
 whole. Use `--lines N:M`, or open it with `$EDITOR $(ka path …)`.
@@ -801,11 +841,12 @@ whole. Use `--lines N:M`, or open it with `$EDITOR $(ka path …)`.
 **"pinned version has no index any more"** — you `remove`d the version `use`
 was pointing at (or the pin is stale). `ka use --clear` or `ka use <other>`.
 
-**"looks like an interrupted build"** — killed mid-index on an older version
-of this tool; `--force` rebuilds. Builds are atomic now.
+**"not a usable index" / "unsupported index schema"** — the file is partial,
+corrupt, or was built with an incompatible schema. Rebuild that version with
+`--force`. Completed builds are published atomically.
 
 **The index disagrees with the file I just edited** — the index is a snapshot.
-Rebuild with `--force` after editing files under `kernels/`.
+Rebuild with `--force` after editing its managed or custom source tree.
 
 ## Development
 

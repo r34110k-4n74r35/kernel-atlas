@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import config, cparse, db, indexer, kernelsrc, links, maintainers, query, render
 from .query import Entry
@@ -32,11 +32,23 @@ def _split_list(value: str | None) -> list[str]:
 
 
 def _version_key(path: Path) -> tuple:
-    """Sort '7.2' above '6.18.45'. Non-numeric stems sort last."""
-    try:
-        return (1, tuple(int(p) for p in path.stem.split("-")[0].split(".")))
-    except ValueError:
-        return (0, ())
+    """Sort by the leading numeric release, including vendor/local suffixes.
+
+    For one numeric base, final releases sort above deterministic vendor/local
+    suffixes, which sort above release candidates.  The suffixes themselves do
+    not have a universal version scheme, but they must not make Linux 6.6 sort
+    below every plain numeric version such as Linux 6.1.
+    """
+    stem = path.stem
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(.*)", stem)
+    if not m:
+        return (0, (), 0, 0, stem)
+    numbers = tuple(int(p) for p in m.group(1).split("."))
+    suffix = m.group(2)
+    rc = re.fullmatch(r"-rc(\d+)", suffix)
+    phase = 2 if not suffix else (0 if rc else 1)
+    # For the same numeric release: final > local/vendor > rc10 > rc2.
+    return (1, numbers, phase, int(rc.group(1)) if rc else 0, suffix, stem)
 
 
 def version_prefix_match(stem: str, spec: str) -> bool:
@@ -53,6 +65,21 @@ def version_prefix_match(stem: str, spec: str) -> bool:
     return stem.startswith(spec + ".") or stem.startswith(spec + "-")
 
 
+def _index_version_key(path: Path) -> tuple:
+    """Sort usable indexes by recorded version, ahead of corrupt aliases."""
+    conn = None
+    try:
+        conn = db.connect(path, readonly=True)
+        version = db.validate_schema(conn).get("kernel_version")
+        version = config.validate_version(version)
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return (0, _version_key(path))
+    finally:
+        if conn is not None:
+            conn.close()
+    return (1, _version_key(Path(f"{version}.db")))
+
+
 def _same_path(a: Path, b: Path | None) -> bool:
     if b is None:
         return False
@@ -64,7 +91,11 @@ def _same_path(a: Path, b: Path | None) -> bool:
 
 def resolve_index_spec(spec: str) -> Path:
     """Turn a version or unique version prefix into an index path, or die."""
-    path = config.index_path(spec)
+    try:
+        spec = config.validate_version(spec)
+        path = config.index_path(spec)
+    except ValueError as exc:
+        _die(str(exc))
     if path.is_file():
         return path
     matches = [p for p in config.list_indexes() if version_prefix_match(p.stem, spec)]
@@ -95,7 +126,7 @@ def default_index(*, warn: bool = True) -> Path:
                   f"falling back to the highest built version "
                   f"(fix with '{PROG} use <version>' or '{PROG} use --clear')",
                   file=sys.stderr)
-    return max(available, key=_version_key)
+    return max(available, key=_index_version_key)
 
 
 def selected_index(args) -> Path:
@@ -107,24 +138,15 @@ def selected_index(args) -> Path:
     return default_index()
 
 
-def _looks_like_kernel_version(name: str) -> bool:
-    if not name:
-        return False
-    if name.startswith("next-"):
-        return True
-    return _version_key(Path(name))[0] == 1
-
-
 def index_version(meta: dict) -> str:
-    """Version string that matches `ka use` / `-K` / the index filename.
+    """Kernel version recorded by the build.
 
-    `--db scratch.db` keeps the version recorded in the index; a file named
-    `6.18.45.db` is 6.18.45 even if `meta` was copied from another build.
+    An index filename is only a selection alias.  In particular, a custom
+    ``--output indexes/other-name.db`` must not generate links for a kernel
+    version that was never indexed.
     """
     stem = meta.get("index_stem") or ""
     kver = meta.get("kernel_version") or ""
-    if _looks_like_kernel_version(stem):
-        return stem
     return kver or stem or "?"
 
 
@@ -135,15 +157,11 @@ def open_index(args) -> tuple[sqlite3.Connection, dict]:
     conn = None
     try:
         conn = db.connect(path, readonly=True)
-        meta = db.get_meta(conn)
+        meta = db.validate_schema(conn)
     except (sqlite3.DatabaseError, OSError) as exc:
         if conn is not None:
             conn.close()
         _die(f"{path} is not a usable index ({exc}) — rebuild it with "
-             f"'{PROG} build <version> --force'")
-    if not meta.get("kernel_version"):
-        conn.close()
-        _die(f"{path} looks like an interrupted build — rebuild it with "
              f"'{PROG} build <version> --force'")
     meta["index_stem"] = path.stem
     _OPEN_INDEXES.append(conn)
@@ -229,7 +247,7 @@ def _resolve_area(conn, spec: str) -> query.Resolution:
                     return (0, 0, p)
                 if p == f"kernel/{raw}":
                     return (1, 0, p)
-                return (2, len(p), p)
+                return (2, *query._path_rank(p))
             rows = sorted(rows, key=rank)
             picked = rows[0]
             t = query.Target(kind="dir", id=picked["id"], path=picked["path"],
@@ -246,12 +264,16 @@ def _resolve_area(conn, spec: str) -> query.Resolution:
 
 
 def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str]:
-    if getattr(args, "columns", None):
+    if getattr(args, "columns", None) is not None:
         cols = _split_list(args.columns)
+        if not cols:
+            _die("--columns must name at least one column")
         bad = [c for c in cols if c not in render.COLUMNS]
         if bad:
             _die(f"unknown column(s): {', '.join(bad)}"
                  f" — valid: {', '.join(render.COLUMNS)}")
+        if with_subsystem and "subsystem" not in cols:
+            cols.append("subsystem")
         return cols
     only_dirs = kinds_listed <= {"dir"}
     only_files = kinds_listed <= {"file"}
@@ -270,15 +292,20 @@ def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str
 
 
 def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: bool,
-         header: str = "", index: str | None = None):
+         header: str = "", index: str | None = None,
+         default_columns: tuple[str, ...] | None = None):
     fmt = args.format
     machine = fmt in ("json", "csv", "names", "plain")
     color = render.use_color(args.color)
+    explicit_columns = getattr(args, "columns", None) is not None
     cols = pick_columns(args, kinds_listed, with_subsystem)
+    if not explicit_columns and default_columns:
+        cols = list(default_columns)
     if not machine and header:
         print(render.paint(header, "1", color))
     if fmt == "json":
-        rows = [render.entry_dict(e) for e in entries]
+        rows = [render.entry_dict(e, cols if explicit_columns else None)
+                for e in entries]
         if index:
             for row in rows:
                 row["index"] = index
@@ -289,6 +316,16 @@ def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: boo
     if not machine:
         n = len(entries)
         print(render.paint(f"\n{n} result{'s' if n != 1 else ''}", "90", color))
+
+
+def _entry_is_target(e: Entry, t: query.Target) -> bool:
+    if e.ref_id is not None:
+        if t.kind == "symbol":
+            return e.kind == t.symbol_kind and e.ref_id == t.id
+        return e.kind == t.kind and e.ref_id == t.id
+    return (e.path == t.path and e.name == t.name
+            and (t.kind != "symbol"
+                 or (e.kind == t.symbol_kind and e.line == t.line)))
 
 
 def kinds_from_args(args, target) -> tuple[str, ...]:
@@ -318,30 +355,94 @@ def kinds_from_args(args, target) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def symbol_filter_kinds(args, kinds: tuple[str, ...]) -> tuple[str, ...]:
+    """Make linkage filters explicit instead of silently ignoring path rows."""
+    enabled = []
+    if getattr(args, "exported", False):
+        enabled.append("--exported")
+    if getattr(args, "static_only", False):
+        enabled.append("--static-only")
+    if getattr(args, "no_static", False):
+        enabled.append("--no-static")
+    if not enabled:
+        return kinds
+    symbols = tuple(k for k in kinds if k in query.SYMBOL_KINDS)
+    if not symbols:
+        _die(f"{'/'.join(enabled)} only applies to symbols; choose a symbol kind")
+    return symbols
+
+
 def find_source_tree(meta: dict) -> Path | None:
-    """Source tree for this index: the `ka use` name first, then recorded path."""
+    """Find the exact source tree recorded for an index when it still exists.
+
+    An index filename chooses the index, not a different source snapshot.  Its
+    recorded tree is therefore the only tree guaranteed to match symbol lines.
+    """
     recorded = meta.get("tree_path")
-    tried: list[str] = []
-    for version in (index_version(meta), meta.get("index_stem"),
-                    meta.get("kernel_version")):
-        if not version or version in tried:
+    kernel_version = meta.get("kernel_version") or ""
+    if recorded:
+        recorded_path = Path(recorded).expanduser()
+        if (recorded_path / "MAINTAINERS").is_file():
+            return recorded_path
+        # A recorded path identifies the exact tree that produced the index.
+        # Substituting a managed tree merely because its version string matches
+        # can pair stale/different source with these symbol line numbers.
+        return None
+
+    for version in (kernel_version,):
+        if not version:
             continue
-        tried.append(version)
-        tree = config.tree_for(version, None)
+        try:
+            tree = config.tree_for(version, None)
+        except ValueError:
+            continue
         if tree is not None:
             return tree
-    return config.tree_for(meta.get("kernel_version") or "", recorded)
+    return None
 
 
 def source_tree(meta: dict) -> Path:
     tree = find_source_tree(meta)
     if tree is None:
         version = index_version(meta)
+        try:
+            expected = config.source_path(version)
+        except ValueError:
+            expected = config.sources_dir() / f"linux-{version!r}"
         _die(f"the source for Linux {version} is not on disk "
-             f"(expected {config.source_path(version)})\n"
+             f"(expected {expected})\n"
              f"  the index still answers queries; to get the source back run:\n"
              f"    {PROG} build {version} --force")
     return tree
+
+
+def source_member(tree: Path, indexed_path: str) -> Path:
+    """Return an indexed path only when it stays inside its recorded tree.
+
+    Normal indexes contain paths produced by ``os.scandir``, but ``--db`` also
+    accepts hand-built and third-party SQLite files.  Treat those paths as
+    untrusted: an absolute path, ``..`` component, Windows separator/drive, or
+    symlink which resolves outside the source tree must never let ``show`` read
+    an arbitrary file (or make ``path`` advertise one).
+    """
+    if not isinstance(indexed_path, str) or "\0" in indexed_path \
+            or "\\" in indexed_path:
+        _die(f"unsafe path in index: {indexed_path!r}")
+    rel = PurePosixPath(indexed_path)
+    if (rel.is_absolute() or PureWindowsPath(indexed_path).drive
+            or any(part in (".", "..") for part in rel.parts)):
+        _die(f"unsafe path in index: {indexed_path!r}")
+
+    try:
+        root = tree.expanduser().resolve()
+        candidate = tree.joinpath(*rel.parts)
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root)
+    except ValueError:
+        _die(f"indexed path {indexed_path!r} escapes the recorded source tree")
+    except (OSError, RuntimeError) as exc:
+        _die(f"cannot safely resolve indexed path {indexed_path!r}: {exc}")
+    return candidate
 
 
 def _linux(meta: dict) -> str:
@@ -382,6 +483,24 @@ def _positive_int(value: str) -> int:
     return i
 
 
+def _path_inside(path: Path, directory: Path) -> bool:
+    """Whether publishing ``path`` creates an entry inside ``directory``.
+
+    Resolve the parent but deliberately not the leaf.  ``os.replace`` replaces
+    a leaf symlink itself; following that symlink here would misidentify where
+    the SQLite scratch file and final directory entry are actually created.
+    """
+    try:
+        path = path.expanduser()
+        publication = path.parent.resolve() / path.name
+        publication.relative_to(directory.expanduser().resolve())
+    except ValueError:
+        return False
+    except OSError as exc:
+        _die(f"cannot resolve output/source paths: {exc}")
+    return True
+
+
 def _target_spec(t: query.Target) -> str:
     """A spec `ka` will accept again (`.` for the kernel root)."""
     if t.kind == "symbol":
@@ -409,7 +528,7 @@ _SLASH_COUNT = "(LENGTH(path) - LENGTH(REPLACE(path, '/', '')))"
 def cmd_versions(args):
     try:
         releases = kernelsrc.list_releases()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         _die(f"could not reach kernel.org ({exc})")
     color = render.use_color(args.color)
     if args.format == "json":
@@ -427,10 +546,23 @@ def cmd_versions(args):
 def cmd_build(args):
     quiet = args.quiet
     if args.src:
+        if args.keep_tarball or args.no_verify:
+            _die("--keep-tarball and --no-verify only apply to downloaded source")
         tree = Path(args.src).expanduser().resolve()
         if not (tree / "MAINTAINERS").is_file():
             _die(f"{tree} does not look like a kernel tree (no MAINTAINERS file)")
-        version = args.version or kernelsrc.detect_version(tree) or tree.name
+        if args.version and args.version.lower() in {
+                "lts", "longterm", "stable", "mainline", "latest"}:
+            _die(f"version alias {args.version!r} does not apply with --src; "
+                 "omit it to read the tree's Makefile")
+        version = args.version or kernelsrc.detect_version(tree)
+        if version is None:
+            _die(f"could not detect a kernel version from {tree / 'Makefile'}; "
+                 "pass an explicit version before --src")
+        try:
+            version = config.validate_version(version)
+        except ValueError as exc:
+            _die(str(exc))
         source = str(tree)
     else:
         spec = args.version or "lts"
@@ -439,22 +571,39 @@ def cmd_build(args):
         except (OSError, LookupError, ValueError) as exc:
             _die(str(exc))
         version = rel.version
+        try:
+            version = config.validate_version(version)
+        except ValueError as exc:
+            _die(str(exc))
         if not quiet:
             print(f"kernel {version} ({rel.moniker})", file=sys.stderr)
-        out_existing = config.index_path(version)
-        if out_existing.is_file() and not args.force:
-            _die(f"index for {version} already exists at {out_existing} "
-                 f"(use --force to rebuild)")
-        try:
-            tree = kernelsrc.ensure_source(version, keep_tarball=args.keep_tarball,
-                                           quiet=quiet, verify=not args.no_verify)
-        except (OSError, RuntimeError) as exc:
-            _die(f"could not obtain kernel source: {exc}")
-        source = kernelsrc.tarball_url(version)
 
     out = Path(args.output).expanduser() if args.output else config.index_path(version)
-    if out.is_file() and not args.force:
+    if out.is_dir():
+        _die(f"index output {out} is a directory")
+    if out.exists() and not args.force:
         _die(f"index already exists at {out} (use --force to rebuild)")
+    # Fail before a large download when the eventual managed source location
+    # is already enough to prove that the output would be scanned as input.
+    if not args.src and _path_inside(out, config.source_path(version)):
+        _die(f"index output {out} is inside the source tree "
+             f"{config.source_path(version)}; choose a path outside the tree")
+
+    if not args.src:
+        source = rel.source or kernelsrc.tarball_url(version)
+        try:
+            tree = kernelsrc.ensure_source(version, keep_tarball=args.keep_tarball,
+                                           quiet=quiet, verify=not args.no_verify,
+                                           source_url=source)
+        except (OSError, RuntimeError) as exc:
+            _die(f"could not obtain kernel source: {exc}")
+
+    # Also check the actual tree returned by source discovery.  This covers
+    # custom cache layouts and prevents the changing SQLite scratch file from
+    # becoming one of the files being indexed.
+    if _path_inside(out, tree):
+        _die(f"index output {out} is inside the source tree {tree}; "
+             "choose a path outside the tree")
 
     kinds = _split_list(args.kinds) or list(cparse.DEFAULT_KINDS)
     bad = [k for k in kinds if k not in cparse.ALL_KINDS]
@@ -464,13 +613,21 @@ def cmd_build(args):
 
     if not quiet:
         print(f"indexing {tree}", file=sys.stderr)
-    stats = indexer.build(tree, out, version, kinds=kinds, want_calls=args.with_calls,
-                          jobs=args.jobs, quiet=quiet, source=source)
+    try:
+        stats = indexer.build(
+            tree, out, version, kinds=kinds, want_calls=args.with_calls,
+            jobs=args.jobs, quiet=quiet, source=source)
+    except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
+        _die(f"could not build index: {exc}")
     size_mb = out.stat().st_size / (1024 * 1024)
     print(
         f"\nBuilt index for Linux {version}\n"
         f"  {stats.dirs:,} directories, {stats.files:,} files\n"
-        f"  {stats.symbols:,} symbols from {stats.parsed:,} C files\n"
+        f"  {stats.symbols:,} symbols from {stats.parsed:,} C/H files\n"
+        + (f"  {stats.skipped:,} parse inputs skipped, {stats.failed:,} failed"
+           f" ({stats.oversize:,} oversized)\n"
+           if stats.skipped or stats.failed else "")
+        + (f"  {stats.symlinks:,} symlinks recorded\n" if stats.symlinks else "")
         + (f"  {stats.calls:,} call edges\n" if stats.calls else "")
         + f"  {stats.subsystems:,} subsystems from MAINTAINERS\n"
         f"  {out}  ({size_mb:.0f} MB, {stats.seconds:.0f}s)\n"
@@ -486,20 +643,29 @@ def cmd_indexes(args):
         return
     active = default_index() if paths else None
     rows = []
-    for p in sorted(paths, key=_version_key, reverse=True):
+    for p in paths:
+        conn = None
+        error = None
         try:
             conn = db.connect(p, readonly=True)
-            meta = db.get_meta(conn)
-            conn.close()
-        except Exception:
+            meta = db.validate_schema(conn)
+        except (sqlite3.DatabaseError, OSError) as exc:
             meta = {}
+            error = str(exc)
+        finally:
+            if conn is not None:
+                conn.close()
         source_here = find_source_tree({
             "index_stem": p.stem,
             "kernel_version": meta.get("kernel_version", p.stem),
             "tree_path": meta.get("tree_path"),
         }) is not None
+        version = meta.get("kernel_version") or p.stem
         rows.append({
-            "version": p.stem,
+            # The filename is a selection alias; the build metadata is the
+            # identity used by links and every query result.
+            "version": version,
+            "alias": p.stem,
             "files": meta.get("n_files", "?"),
             "symbols": meta.get("n_symbols", "?"),
             "calls": meta.get("has_calls") == "1",
@@ -508,16 +674,25 @@ def cmd_indexes(args):
             "size": f"{p.stat().st_size / 1048576:.0f} MB",
             "default": _same_path(p, active),
             "path": str(p),
+            "error": error,
         })
+    rows.sort(
+        key=lambda row: _version_key(Path(f"{row['version']}.db")),
+        reverse=True,
+    )
     if args.format == "json":
         sys.stdout.write(render.render_json(rows))
         return
     color = render.use_color(args.color)
-    print(f"    {'VERSION':<12} {'FILES':>8} {'SYMBOLS':>10} {'CALLS':<6} "
-          f"{'SOURCE':<7} {'BUILT':<20} {'SIZE':>8}")
+    show_alias = any(r["alias"] != r["version"] for r in rows)
+    alias_head = f" {'INDEX':<12}" if show_alias else ""
+    print(f"    {'VERSION':<12}{alias_head} {'FILES':>8} {'SYMBOLS':>10} "
+          f"{'CALLS':<6} {'SOURCE':<7} {'BUILT':<20} {'SIZE':>8}")
     for r in rows:
         mark = "*" if r["default"] else " "
-        line = (f"  {mark} {r['version']:<12} {r['files']:>8} {r['symbols']:>10} "
+        alias = f" {r['alias']:<12}" if show_alias else ""
+        line = (f"  {mark} {r['version']:<12}{alias} "
+                f"{r['files']:>8} {r['symbols']:>10} "
                 f"{'yes' if r['calls'] else '-':<6} "
                 f"{'yes' if r['source'] else '-':<7} {r['built_at']:<20} "
                 f"{r['size']:>8}")
@@ -576,6 +751,31 @@ def _unlink_index(path: Path) -> int:
     return freed
 
 
+def _managed_source_recorded_by(path: Path) -> Path | None:
+    """The safely removable managed source identified by an index.
+
+    Selection aliases need not equal the indexed kernel version, and a custom
+    ``--src`` tree must never be recursively deleted by ``remove --source``.
+    Only return the conventional managed path when the index recorded that
+    exact path for its validated metadata version.
+    """
+    conn = None
+    try:
+        conn = db.connect(path, readonly=True)
+        meta = db.get_meta(conn)
+        version = config.validate_version(meta.get("kernel_version", ""))
+        recorded = meta.get("tree_path")
+        if not isinstance(recorded, str) or not recorded:
+            return None
+        expected = config.source_path(version)
+        return expected if _same_path(Path(recorded).expanduser(), expected) else None
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def cmd_remove(args):
     # Resolve everything first so 'remove 6.18 6.18.45' (the second is the
     # expansion of the first) does not fail halfway through.
@@ -585,20 +785,38 @@ def cmd_remove(args):
         if path not in unique:
             unique.append(path)
 
+    # Read provenance before unlinking the databases.  In particular, an
+    # alias.db containing Linux 6.x metadata must not target linux-alias/.
+    managed_sources = {
+        path: _managed_source_recorded_by(path) if args.source else None
+        for path in unique
+    }
+
     freed = 0
     for path in unique:
-        version = path.stem
+        alias = path.stem
         size = _unlink_index(path)
         freed += size
         print(f"removed index   {path}  ({size / 1048576:.0f} MB)")
 
-        if config.get_default_version() == version:
+        if config.get_default_version() == alias:
             config.clear_default_version()
             print("  (it was the pinned default; the pin has been cleared)")
 
-        tree = config.source_path(version)
+        tree = managed_sources[path]
         if args.source:
-            if tree.is_dir():
+            if tree is None:
+                print("  source kept (the index does not identify a matching "
+                      "managed source tree)")
+            elif tree.is_symlink():
+                try:
+                    tree.unlink()
+                except OSError as exc:
+                    print(f"  could not remove source {tree}: {exc}",
+                          file=sys.stderr)
+                else:
+                    print(f"removed source link  {tree}")
+            elif tree.is_dir():
                 try:
                     shutil.rmtree(tree)
                 except OSError as exc:
@@ -608,7 +826,14 @@ def cmd_remove(args):
                     print(f"removed source  {tree}")
             else:
                 print(f"no source tree at {tree}")
-        elif tree.is_dir():
+        else:
+            # This message is only a convenience.  It is safe to use the
+            # filename alias here because no deletion follows from it.
+            try:
+                tree = config.source_path(alias)
+            except ValueError:
+                tree = None
+        if not args.source and tree is not None and tree.is_dir():
             print(f"  (source kept at {tree}; remove it too with --source)")
     print(f"\nfreed {freed / 1048576:.0f} MB of index files"
           + (" (source trees not counted)" if args.source else ""))
@@ -629,6 +854,13 @@ def cmd_stats(args):
     print(f"  files        {int(meta.get('n_files', 0)):,}")
     print(f"  subsystems   {int(meta.get('n_subsystems', 0)):,}")
     print(f"  symbols      {int(meta.get('n_symbols', 0)):,}")
+    skipped = int(meta.get("n_parse_skipped", 0))
+    failed = int(meta.get("n_parse_failed", 0))
+    if skipped or failed:
+        print(f"  parse gaps   {skipped:,} skipped, {failed:,} failed"
+              f" ({int(meta.get('n_oversize', 0)):,} oversized)")
+    if int(meta.get("n_symlinks", 0)):
+        print(f"  symlinks     {int(meta['n_symlinks']):,}")
     for r in conn.execute("SELECT kind, COUNT(*) n FROM symbols GROUP BY kind"
                           " ORDER BY n DESC"):
         print(f"      {r['kind']:<12} {r['n']:>9,}")
@@ -658,23 +890,30 @@ def cmd_info(args):
     lnks = _links_for(meta, t)
 
     if args.format == "json":
+        target = {
+            "kind": t.kind, "symbol_kind": t.symbol_kind, "name": t.name,
+            "path": t.path, "line": t.line, "end_line": t.end_line,
+            "signature": t.signature,
+        }
+        if t.kind == "symbol":
+            target.update(is_static=t.is_static, is_inline=t.is_inline,
+                          is_exported=t.is_exported)
         payload = {
-            "target": {
-                "kind": t.kind, "symbol_kind": t.symbol_kind, "name": t.name,
-                "path": t.path, "line": t.line, "end_line": t.end_line,
-                "signature": t.signature, "is_static": t.is_static,
-                "is_exported": t.is_exported,
-            },
+            "target": target,
             "area": {"name": area[0], "description": area[1]} if area else None,
             "subsystems": [
                 dict(name=s["name"], status=s["status"], n_files=s["n_files"],
-                     **query.subsystem_json_fields(s)) for s in subs],
+                     **query.subsystem_json_fields(s))
+                for s in subs[:args.max_subsystems]],
+            "n_subsystems": len(subs),
             "ancestry": [{"path": p, "subsystem": s}
                          for p, s in query.ancestry(conn, t.path)],
             "links": lnks,
             "index": index_version(meta),
             "note": res.note,
-            "other_candidates": [c.display for c in res.candidates[:20]],
+            "other_candidates": [c.display
+                                 for c in res.candidates[:args.max_candidates]],
+            "n_other_candidates": len(res.candidates),
         }
         sys.stdout.write(render.render_json(payload))
         return
@@ -720,7 +959,7 @@ def cmd_info(args):
 
     tree = find_source_tree(meta)
     if tree is not None:
-        field("on disk", str(tree / t.path if t.path else tree))
+        field("on disk", str(source_member(tree, t.path)))
     field("index", _linux(meta))
     field("elixir", lnks.get("elixir"))
     if lnks.get("docs"):
@@ -760,8 +999,8 @@ def cmd_info(args):
 
     if res.candidates:
         print()
-        print(render.paint(f"  {len(res.candidates)} other definition(s) "
-                           f"of this name", "33", color))
+        print(render.paint(f"  {len(res.candidates)} other candidate(s) "
+                           f"for this name", "33", color))
         for c in res.candidates[:args.max_candidates]:
             print(f"    {c.display}  ({c.symbol_kind or c.kind})")
         if len(res.candidates) > args.max_candidates:
@@ -779,35 +1018,45 @@ def cmd_siblings(args):
     if scope.dir_sql is None and scope.file_sql is None and scope.sym_where is None:
         _die(f"cannot build a '{args.level}' scope for {t.display} ({scope.label})")
 
-    kinds = kinds_from_args(args, t)
+    kinds = symbol_filter_kinds(args, kinds_from_args(args, t))
     if (args.level == "tree"
             and any(k in query.SYMBOL_KINDS for k in kinds)
             and not args.limit):
         _die("listing symbols across the whole tree needs -n N "
              "(there are millions; try -n 50, or 'find' for a name search)")
+    sub = query.subsystem_for_target(conn, t)
+    if (args.level == "subsystem" and sub is not None
+            and sub["name"] in query.CATCH_ALL and not args.limit):
+        _die("the target is claimed only by the catch-all THE REST subsystem; "
+             "this scope is almost the whole tree and needs -n N")
     # Fetch one extra row so that dropping the target itself does not eat one
     # of the requested rows; subsystems are looked up only for what survives.
+    grep = _checked_grep(args.grep)
     entries = query.collect(
         conn, scope, kinds, limit=args.limit + 1 if args.limit else 0,
-        grep=_checked_grep(args.grep),
+        grep=grep,
         exported_only=args.exported, static=_static_mode(args),
         with_subsystem=False, sort=args.sort)
 
-    if not args.include_self:
-        entries = [e for e in entries
-                   if not (e.path == t.path and e.name == t.name
-                           and (t.kind != "symbol" or e.line == t.line))]
-    else:
-        for e in entries:
-            if e.path == t.path and e.name == t.name:
-                e.is_target = True
-
+    target_entry = next((e for e in entries if _entry_is_target(e, t)), None)
+    others = [e for e in entries if not _entry_is_target(e, t)]
     if args.limit:
-        entries = entries[:args.limit]
-    if args.with_subsystem:
+        others = others[:args.limit]
+    entries = others
+    if args.include_self:
+        target_entry = target_entry or query.entry_for_target(conn, t)
+        if target_entry is not None:
+            # --include-self means exactly that: filters and --kinds govern the
+            # N *other* rows, while the explicitly requested target is always
+            # present in addition to them.
+            target_entry.is_target = True
+            entries.append(target_entry)
+            query.sort_entries(entries, args.sort)
+    want_subsystem = (args.with_subsystem
+                      or "subsystem" in _split_list(args.columns))
+    if want_subsystem:
         query.annotate_subsystems(conn, entries)
 
-    sub = query.subsystem_for_target(conn, t)
     label = sub["name"] if sub else None
     if label in query.CATCH_ALL:
         area = query.describe_area(t.path)
@@ -816,7 +1065,7 @@ def cmd_siblings(args):
               f"  level: {scope.label}"
               + (f"   subsystem: {label}" if label else "")
               + f"   showing: {', '.join(kinds)}\n")
-    emit(entries, args, set(kinds), args.with_subsystem, header,
+    emit(entries, args, set(kinds), want_subsystem, header,
          index=index_version(meta))
 
 
@@ -841,11 +1090,14 @@ def cmd_ls(args):
         default = query.SYMBOL_KINDS
 
     kinds = kinds_from_args(args, t) if _split_list(args.kinds) else default
+    kinds = symbol_filter_kinds(args, kinds)
+    want_subsystem = (args.with_subsystem
+                      or "subsystem" in _split_list(args.columns))
     entries = query.collect(conn, scope, kinds, limit=args.limit,
                             grep=_checked_grep(args.grep),
                             exported_only=args.exported, static=_static_mode(args),
-                            with_subsystem=args.with_subsystem, sort=args.sort)
-    emit(entries, args, set(kinds), args.with_subsystem,
+                            with_subsystem=want_subsystem, sort=args.sort)
+    emit(entries, args, set(kinds), want_subsystem,
          f"{scope.label}  [{_linux(meta)}]\n", index=index_version(meta))
 
 
@@ -856,9 +1108,15 @@ def _post_filter(entries, args):
         rx = re.compile(pattern, re.IGNORECASE)
         entries = [e for e in entries if rx.search(e.name)]
     if getattr(args, "static_only", False):
-        entries = [e for e in entries if e.is_static]
+        entries = [e for e in entries if e.is_static is True]
     elif getattr(args, "no_static", False):
-        entries = [e for e in entries if not e.is_static]
+        entries = [e for e in entries if e.is_static is not True]
+    if getattr(args, "exported", False):
+        entries = [e for e in entries if e.is_exported]
+    if _split_list(getattr(args, "kinds", None)):
+        allowed = set(k for k in kinds_from_args(args, None)
+                      if k in query.SYMBOL_KINDS)
+        entries = [e for e in entries if e.kind in allowed]
     return entries
 
 
@@ -872,26 +1130,20 @@ def cmd_find(args):
             _die("find only searches symbols; try --kinds function,struct,...")
     else:
         kinds = []
-    # Over-fetch when a Python-side filter will shrink the result set.
-    narrowing = args.grep or args.static_only or args.no_static
-    limit = args.limit  # default 50; 0 = all
-    if limit and narrowing:
-        fetch = limit * 20
-    else:
-        fetch = limit
+    grep = _checked_grep(args.grep)
+    explicit_columns = _split_list(args.columns)
+    want_subsystem = (args.format != "names"
+                      and (args.with_subsystem or not explicit_columns
+                           or "subsystem" in explicit_columns))
     entries = query.search(conn, args.pattern, kinds=kinds, mode=mode,
-                           limit=fetch,
+                           limit=args.limit,
                            exported_only=args.exported,
-                           with_subsystem=False)
-    filtered = _post_filter(entries, args)
-    entries = filtered[:limit] if limit else filtered
-    if args.format != "names":
-        query.annotate_subsystems(conn, entries)
-    cols = _split_list(args.columns) or ["kind", "name", "path", "line", "subsystem"]
-    args.columns = ",".join(cols)
-    emit(entries, args, {"function"}, True,
+                           with_subsystem=want_subsystem, grep=grep,
+                           static=_static_mode(args), sort=args.sort)
+    emit(entries, args, {"function"}, want_subsystem,
          f"Symbols matching {args.pattern!r} ({mode})  [{_linux(meta)}]\n",
-         index=index_version(meta))
+         index=index_version(meta),
+         default_columns=("kind", "name", "path", "line", "subsystem"))
 
 
 def cmd_subsystems(args):
@@ -923,6 +1175,16 @@ def cmd_subsystem(args):
         _die(f"no subsystem matching {args.name!r} "
              f"(try '{PROG} subsystems --grep {args.name}')")
     if len(rows) > 1 and rows[0]["name"].lower() != args.name.lower():
+        if args.format == "json":
+            sys.stdout.write(render.render_json({
+                "query": args.name,
+                "ambiguous": True,
+                "matches": [dict(name=r["name"], status=r["status"],
+                                 n_files=r["n_files"])
+                            for r in rows],
+                "index": index_version(meta),
+            }))
+            return
         color = render.use_color(args.color)
         print(render.paint(f"{len(rows)} subsystems match {args.name!r}:", "1", color))
         for r in rows:
@@ -1005,6 +1267,9 @@ def cmd_tree(args):
                               n_symbols=r["n_symbols"])
                         for r in frows]
     entries = [e for e in entries if e.path != base]
+    # Directory and file queries are separate; merge them by path before the
+    # tree renderer records sibling insertion order.
+    entries.sort(key=lambda e: (e.path, e.kind))
     if args.format == "json":
         payload = [render.entry_dict(e) for e in entries]
         ver = index_version(meta)
@@ -1028,8 +1293,10 @@ def cmd_path(args):
     conn, meta = open_index(args)
     res = resolve_or_die(conn, args.target)
     t = res.target
+    if args.line and t.kind != "symbol":
+        _die("--line only applies to symbols")
     tree = source_tree(meta)
-    full = tree / t.path if t.path else tree
+    full = source_member(tree, t.path)
     if args.line and t.kind == "symbol":
         print(f"{full}:{t.line}")
     else:
@@ -1042,8 +1309,12 @@ def cmd_show(args):
     t = res.target
     if t.kind == "dir":
         _die(f"{t.path} is a directory; try '{PROG} ls {t.path}'")
+    if t.kind == "symbol" and args.lines:
+        _die("--lines applies to files; use --context for a symbol")
+    if t.kind != "symbol" and args.context:
+        _die("--context applies to symbols; use --lines for a file")
     tree = source_tree(meta)
-    full = tree / t.path
+    full = source_member(tree, t.path)
     if not full.is_file():
         _die(f"{full} is missing from the source tree")
     try:
@@ -1061,8 +1332,13 @@ def cmd_show(args):
         m = re.fullmatch(r"(\d+)(?:[:-](\d+))?", args.lines)
         if not m:
             _die(f"--lines wants N or N:M, not {args.lines!r}")
-        start = max(1, int(m.group(1)))
-        end = int(m.group(2)) if m.group(2) else start
+        try:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else start
+        except ValueError:
+            _die("--lines contains a line number that is too large")
+        if start < 1 or end < 1:
+            _die("--lines line numbers must be >= 1")
         if end < start:
             _die(f"--lines {args.lines!r}: end is before start")
     else:
@@ -1099,8 +1375,11 @@ def cmd_show(args):
         _die(f"{t.path} has no line {start}")
 
 
-_FRAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\+\s*0x")
-_IDENT_RE = re.compile(r"\b([a-z_][a-z0-9_]{2,})\b")
+_FRAME_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_0-9]+)*\s*\+\s*0x")
+_CLONE_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_0-9]+)+")
+_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 
 
 def _frames_from_text(text: str) -> list[str]:
@@ -1110,9 +1389,18 @@ def _frames_from_text(text: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
+        # Kernel oops section delimiters are metadata, not frames.  Once bare
+        # uppercase identifiers are accepted, <TASK>/</TASK> must be excluded
+        # explicitly rather than accidentally becoming symbol names.
+        if re.fullmatch(r"</?[A-Za-z_][A-Za-z0-9_]*>", line):
+            continue
         m = _FRAME_RE.findall(line)
         if m:
             frames.extend(m)
+            continue
+        clone = _CLONE_RE.fullmatch(line)
+        if clone:
+            frames.append(clone.group(1))
             continue
         # 'tcp_sendmsg' or '#3  0x... in tcp_sendmsg (...)' or a bare name per line
         if " in " in line:
@@ -1124,10 +1412,7 @@ def _frames_from_text(text: str) -> list[str]:
         cand = _IDENT_RE.findall(line)
         if len(cand) == 1:
             frames.append(cand[0])
-    seen: dict[str, None] = {}
-    for f in frames:
-        seen.setdefault(f, None)
-    return list(seen)
+    return frames
 
 
 def cmd_trace(args):
@@ -1143,12 +1428,14 @@ def cmd_trace(args):
         _die("could not find any symbol names in that input")
 
     results = []
+    version = index_version(meta)
     picked = frames if args.limit == 0 else frames[:args.limit]
     for name in picked:
-        res = query.resolve(conn, name)
+        res = query.resolve_symbol(conn, name)
         t = res.target
-        if t is None or t.kind != "symbol":
-            results.append({"frame": name, "found": False})
+        if (t is None or t.kind != "symbol"
+                or t.symbol_kind not in ("function", "syscall")):
+            results.append({"frame": name, "found": False, "index": version})
             continue
         sub = query.subsystem_for_target(conn, t)
         area = query.describe_area(t.path)
@@ -1163,6 +1450,7 @@ def cmd_trace(args):
             # What to show: a precise subsystem beats the catch-all section.
             "label": specific or (area[0] if area else name_of) or "?",
             "ambiguous": len(res.candidates),
+            "index": version,
         })
 
     if args.format == "json":
@@ -1197,47 +1485,72 @@ def cmd_trace(args):
 
 def cmd_calls(args):
     conn, meta = open_index(args)
-    if db.get_meta(conn).get("has_calls") != "1":
+    if meta.get("has_calls") != "1":
         _die(f"this index ({index_version(meta)}) has no call graph — rebuild with "
              f"'{PROG} build {index_version(meta)} --with-calls'")
-    res = resolve_or_die(conn, args.target)
+    res = (resolve_or_die(conn, args.target) if ":" in args.target
+           else query.resolve_symbol(conn, args.target))
+    if res.target is None:
+        _die(res.note)
     t = res.target
-    if t.kind != "symbol":
-        _die(f"{t.display} is not a symbol")
+    if t.kind != "symbol" or t.symbol_kind not in ("function", "syscall"):
+        _die(f"{t.display} is not a function or syscall")
+    if _split_list(args.kinds):
+        selected_kinds = [k for k in kinds_from_args(args, None)
+                          if k in query.SYMBOL_KINDS]
+        if not selected_kinds:
+            _die("calls only lists symbols; use a symbol kind with --kinds")
 
-    narrowing = bool(args.grep or args.static_only or args.no_static)
-    fetch = args.limit * 20 if args.limit and narrowing else args.limit
+    narrowing = bool(args.grep or args.static_only or args.no_static
+                     or args.exported or _split_list(args.kinds))
+    fetch = 0 if narrowing or args.sort != "name" else args.limit
+    explicit_columns = _split_list(args.columns)
+    want_subsystem = (args.format != "names"
+                      and (args.with_subsystem
+                           or "subsystem" in explicit_columns))
+    default_columns = ("kind", "name", "path", "line") + (
+        ("subsystem",) if want_subsystem else ())
 
     if args.callers:
         entries = _post_filter(query.callers(conn, t.name, limit=fetch), args)
+        query.sort_entries(entries, args.sort)
         if args.limit:
             entries = entries[:args.limit]
-        query.annotate_subsystems(conn, entries)
-        args.columns = args.columns or "kind,name,path,line,subsystem"
-        emit(entries, args, {"function"}, True,
+        if want_subsystem:
+            query.annotate_subsystems(conn, entries)
+        emit(entries, args, {"function"}, want_subsystem,
              f"Functions that call {t.name}  [{_linux(meta)}]\n",
-             index=index_version(meta))
+             index=index_version(meta),
+             default_columns=default_columns)
         return
 
     names = query.callees(conn, t.id, limit=fetch)
     entries: list[Entry] = []
     for n in names:
-        r = query.resolve(conn, n)
+        r = query.resolve_symbol(conn, n)
         if r.target is not None and r.target.kind == "symbol":
             entries.append(Entry(kind=r.target.symbol_kind or "function", name=n,
-                                 path=r.target.path, line=r.target.line))
+                                 path=r.target.path, line=r.target.line,
+                                 end_line=r.target.end_line,
+                                 signature=r.target.signature,
+                                 is_static=r.target.is_static,
+                                 is_inline=r.target.is_inline,
+                                 is_exported=r.target.is_exported,
+                                 ref_id=r.target.id))
         else:
             # A callee with no definition anywhere in the index: usually a
             # compiler builtin or a macro the parser could not attribute.
             entries.append(Entry(kind="?", name=n, path="-"))
     entries = _post_filter(entries, args)
+    query.sort_entries(entries, args.sort)
     if args.limit:
         entries = entries[:args.limit]
-    query.annotate_subsystems(conn, entries)
-    args.columns = args.columns or "kind,name,path,line,subsystem"
-    emit(entries, args, {"function"}, True,
-         f"Called by {t.display}  [{_linux(meta)}]\n",
-         index=index_version(meta))
+    if want_subsystem:
+        query.annotate_subsystems(conn, entries)
+    emit(entries, args, {"function"}, want_subsystem,
+         f"Functions called by {t.display}  [{_linux(meta)}]\n",
+         index=index_version(meta),
+         default_columns=default_columns)
 
 
 def cmd_web(args):
@@ -1328,7 +1641,7 @@ def cmd_locate(args):
         active = selected_index(args)
 
     rest = [p for p in available if not _same_path(p, active)]
-    rest.sort(key=_version_key, reverse=True)
+    rest.sort(key=_index_version_key, reverse=True)
     ordered = ([active] if active is not None and any(_same_path(p, active) for p in available)
                else []) + rest
 
@@ -1340,14 +1653,11 @@ def cmd_locate(args):
         try:
             try:
                 conn = db.connect(path, readonly=True)
-                meta = db.get_meta(conn)
-                version = path.stem
-                if not meta.get("kernel_version"):
-                    rows.append({"version": version, "found": False,
-                                 "active": is_active, "error": "interrupted build"})
-                    continue
+                meta = db.validate_schema(conn)
+                meta["index_stem"] = path.stem
+                version = index_version(meta)
                 res = query.resolve(conn, spec)
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, OSError) as exc:
                 rows.append({"version": path.stem, "found": False,
                              "active": is_active, "error": str(exc)})
                 continue
@@ -1429,8 +1739,11 @@ def _add_filter_opts(p):
                         "functions/types")
     g.add_argument("--exported", action="store_true",
                    help="only EXPORT_SYMBOL'd symbols")
-    g.add_argument("--static-only", action="store_true", help="only static symbols")
-    g.add_argument("--no-static", action="store_true", help="hide static symbols")
+    linkage = g.add_mutually_exclusive_group()
+    linkage.add_argument("--static-only", action="store_true",
+                         help="only static symbols")
+    linkage.add_argument("--no-static", action="store_true",
+                         help="hide static symbols")
 
 
 def _global_opts(parser, suppress: bool):
@@ -1537,12 +1850,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("find", help="search for a symbol by name")
     sp.add_argument("pattern")
-    sp.add_argument("--exact", action="store_true")
-    sp.add_argument("--glob", action="store_true", help="pattern is a glob (tcp_*)")
-    sp.add_argument("--prefix", action="store_true")
+    match = sp.add_mutually_exclusive_group()
+    match.add_argument("--exact", action="store_true")
+    match.add_argument("--glob", action="store_true",
+                       help="pattern is a glob (tcp_*)")
+    match.add_argument("--prefix", action="store_true")
     _add_filter_opts(sp)
-    _add_output_opts(sp, sorts=False, limit_default=50)
-    sp.set_defaults(func=cmd_find, sort="name")
+    _add_output_opts(sp, limit_default=50)
+    sp.set_defaults(func=cmd_find)
 
     sp = add("subsystems", help="list subsystems from MAINTAINERS")
     sp.add_argument("--grep", "-g")
@@ -1566,9 +1881,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("show", help="print the source of a symbol or file")
     sp.add_argument("target")
-    sp.add_argument("--context", "-C", type=_nonneg_int, default=0,
-                    help="extra lines around a symbol")
-    sp.add_argument("--lines", "-L", help="line range for a file, e.g. 100:140")
+    show_range = sp.add_mutually_exclusive_group()
+    show_range.add_argument("--context", "-C", type=_nonneg_int, default=0,
+                            help="extra lines around a symbol")
+    show_range.add_argument("--lines", "-L",
+                            help="line range for a file, e.g. 100:140")
     sp.add_argument("--bare", action="store_true",
                     help="no header and no line numbers")
     sp.set_defaults(func=cmd_show)
@@ -1611,9 +1928,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target")
     sp.add_argument("--callers", action="store_true",
                     help="show callers instead of callees")
-    _add_output_opts(sp, sorts=False, limit_default=200)
-    sp.set_defaults(func=cmd_calls, sort="name", kinds=None, exported=False,
-                    static_only=False, no_static=False)
+    _add_filter_opts(sp)
+    _add_output_opts(sp, limit_default=200)
+    sp.set_defaults(func=cmd_calls)
 
     return p
 
@@ -1621,6 +1938,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    db_arg = getattr(args, "db", None)
+    kernel_arg = getattr(args, "kernel", None)
+    if db_arg and kernel_arg:
+        _die("--db and --kernel are mutually exclusive")
+    if args.command in {"versions", "build", "indexes", "use", "remove", "rm"}:
+        selection = "--db" if db_arg else ("--kernel" if kernel_arg else None)
+        if selection:
+            _die(f"{selection} does not apply to {args.command!r}")
     try:
         args.func(args)
     except BrokenPipeError:

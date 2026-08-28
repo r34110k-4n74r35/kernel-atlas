@@ -39,11 +39,18 @@ class Entry:
     n_files: int | None = None
     n_subdirs: int | None = None
     n_symbols: int | None = None
-    is_static: bool = False
-    is_inline: bool = False
-    is_exported: bool = False
+    # ``None`` means the property is not applicable (directories/files and
+    # unresolved callees).  Symbols always materialize these as real booleans,
+    # which keeps JSON from claiming that a directory is "non-static".
+    is_static: bool | None = None
+    is_inline: bool | None = None
+    is_exported: bool | None = None
     subsystem: str | None = None
     is_target: bool = False
+    # Internal database identity.  It is deliberately not part of the default
+    # machine output, but lets callers distinguish declarations which share a
+    # path, name and line (a common ``typedef struct foo { ... } foo`` shape).
+    ref_id: int | None = None
 
     @property
     def span(self) -> int | None:
@@ -65,6 +72,7 @@ class Target:
     dir_id: int | None = None
     file_id: int | None = None
     is_static: bool = False
+    is_inline: bool = False
     is_exported: bool = False
 
     @property
@@ -126,7 +134,8 @@ def _sym_target(conn: sqlite3.Connection, row: sqlite3.Row) -> Target:
         kind="symbol", id=row["id"], path=row["path"], name=row["name"],
         symbol_kind=row["kind"], line=row["start_line"], end_line=row["end_line"],
         signature=row["signature"], file_id=row["file_id"], dir_id=row["dir_id"],
-        is_static=bool(row["is_static"]), is_exported=bool(row["is_exported"]),
+        is_static=bool(row["is_static"]), is_inline=bool(row["is_inline"]),
+        is_exported=bool(row["is_exported"]),
     )
 
 
@@ -145,6 +154,16 @@ _KIND_RANK = {
 }
 
 
+def _is_copy_path(path: str) -> bool:
+    return (path or "").startswith(_COPY_PREFIXES)
+
+
+def _path_rank(path: str) -> tuple:
+    """Prefer the kernel proper, then shallow and short paths."""
+    path = path or ""
+    return (int(_is_copy_path(path)), path.count("/"), len(path), path)
+
+
 def _def_rank(path: str, symbol_kind: str | None, is_static: bool) -> tuple:
     """Quality of a definition: real code first, then shallower paths.
 
@@ -152,14 +171,28 @@ def _def_rank(path: str, symbol_kind: str | None, is_static: bool) -> tuple:
     (a ``#define GFP_KERNEL 0`` stub) beat ``include/linux/gfp_types.h``.
     """
     path = path or ""
-    copy = 1 if path.startswith(_COPY_PREFIXES) else 0
-    return (_KIND_RANK.get(symbol_kind or "", 5), int(is_static), copy,
-            path.count("/"), len(path))
+    copy = int(_is_copy_path(path))
+    return (_KIND_RANK.get(symbol_kind or "", 5), copy, int(is_static),
+            path.count("/"), len(path), path)
 
 
 def _rank_candidate(t: Target) -> tuple:
     """Prefer real definitions over prototypes, copies, and nested stubs."""
-    return _def_rank(t.path, t.symbol_kind, t.is_static)
+    return (*_def_rank(t.path, t.symbol_kind, t.is_static), t.line or 0, t.id)
+
+
+def resolve_symbol(conn: sqlite3.Connection, name: str) -> Resolution:
+    """Resolve a bare name strictly in the symbol namespace."""
+    raw = (name or "").strip()
+    rows = conn.execute(_SYM_SELECT + " WHERE s.name = ?", (raw,)).fetchall()
+    if not rows:
+        return Resolution(None, note=f"no symbol in the index is named {raw!r}")
+    cands = sorted((_sym_target(conn, r) for r in rows), key=_rank_candidate)
+    note = ""
+    if len(cands) > 1:
+        note = (f"{len(cands)} symbols named {raw!r}; "
+                "showing the most likely definition")
+    return Resolution(cands[0], cands[1:], note)
 
 
 def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
@@ -185,21 +218,24 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
             # 'inode.c:ext4_bmap' — consider every file with that basename and
             # let the symbol pick out the right one.
             frows = conn.execute(
-                "SELECT * FROM files WHERE name = ? ORDER BY LENGTH(path), path"
-                " LIMIT 200", (head_n.rsplit("/", 1)[-1],)).fetchall()
+                "SELECT * FROM files WHERE name = ? ORDER BY LENGTH(path), path",
+                (head_n.rsplit("/", 1)[-1],)).fetchall()
         else:
             frows = []
 
         if frows and tail.isdigit():
-            line = int(tail)
+            try:
+                line = int(tail)
+            except ValueError:
+                return Resolution(None, note=f"line number {tail!r} is too large")
             hits = []
             for fr in frows:
-                row = conn.execute(
+                rows = conn.execute(
                     _SYM_SELECT + " WHERE s.file_id = ? AND s.start_line <= ?"
                     " AND s.end_line >= ? ORDER BY (s.end_line - s.start_line)"
-                    " LIMIT 1", (fr["id"], line, line)).fetchone()
-                if row:
-                    hits.append(_sym_target(conn, row))
+                    ", s.start_line, s.kind, s.id",
+                    (fr["id"], line, line)).fetchall()
+                hits.extend(_sym_target(conn, row) for row in rows)
             if hits:
                 hits.sort(key=_rank_candidate)
                 note = f"line {line} falls inside this symbol"
@@ -250,37 +286,54 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
                                  name=row["name"], dir_id=row["dir_id"],
                                  file_id=row["id"]))
 
-    # Bare symbol name.
-    rows = conn.execute(_SYM_SELECT + " WHERE s.name = ? LIMIT 201", (raw,)).fetchall()
-    if rows:
-        count = "200+" if len(rows) > 200 else str(len(rows))
-        cands = sorted((_sym_target(conn, r) for r in rows[:200]),
-                       key=_rank_candidate)
-        note = ""
-        if len(rows) > 1:
-            note = (f"{count} symbols named {raw!r}; "
-                    f"showing the most likely definition")
-        return Resolution(cands[0], cands[1:], note)
+    # Bare names can collide across namespaces (``sched`` is both a directory
+    # and a small static helper).  Keep the oops-friendly symbol preference for
+    # real global definitions, but do not let a file-local or tools/ copy hide a
+    # kernel area directory.
+    symbol_resolution = resolve_symbol(conn, raw)
+    sym_cands = ([symbol_resolution.target] + symbol_resolution.candidates
+                 if symbol_resolution.target is not None else [])
+
+    file_rows = conn.execute("SELECT * FROM files WHERE name = ?", (raw,)).fetchall()
+    file_cands = [
+        Target(kind="file", id=r["id"], path=r["path"], name=r["name"],
+               dir_id=r["dir_id"], file_id=r["id"])
+        for r in file_rows
+    ]
+    file_cands.sort(key=lambda t: (*_path_rank(t.path), t.id))
+
+    dir_rows = conn.execute("SELECT * FROM dirs WHERE name = ?", (raw,)).fetchall()
+    dir_cands = [
+        Target(kind="dir", id=r["id"], path=r["path"], name=r["name"],
+               dir_id=r["id"])
+        for r in dir_rows
+    ]
+    dir_cands.sort(key=lambda t: (*_path_rank(t.path), t.id))
+
+    if sym_cands:
+        best = sym_cands[0]
+        if dir_cands and (best.is_static or _is_copy_path(best.path)):
+            picked = dir_cands[0]
+            why = "file-local" if best.is_static else "a tools/sample copy"
+            note = (f"bare name {raw!r} also matches {len(sym_cands)} symbol"
+                    f"{'s' if len(sym_cands) != 1 else ''}; using {picked.path}/ "
+                    f"instead of {why} {best.display}")
+            if len(dir_cands) > 1:
+                note += f" ({len(dir_cands)} directories have this name)"
+            return Resolution(picked, dir_cands[1:] + sym_cands, note)
+        return symbol_resolution
 
     # Bare file name, e.g. 'inode.c'.
-    rows = conn.execute("SELECT * FROM files WHERE name = ? LIMIT 200",
-                        (raw,)).fetchall()
-    if rows:
-        cands = [Target(kind="file", id=r["id"], path=r["path"], name=r["name"],
-                        dir_id=r["dir_id"], file_id=r["id"]) for r in rows]
-        cands.sort(key=lambda t: len(t.path))
-        note = f"{len(cands)} files named {raw!r}" if len(cands) > 1 else ""
-        return Resolution(cands[0], cands[1:], note)
+    if file_cands:
+        note = (f"{len(file_cands)} files named {raw!r}"
+                if len(file_cands) > 1 else "")
+        return Resolution(file_cands[0], file_cands[1:], note)
 
     # Bare directory name, e.g. 'ext4'.
-    rows = conn.execute("SELECT * FROM dirs WHERE name = ? LIMIT 200",
-                        (raw,)).fetchall()
-    if rows:
-        cands = [Target(kind="dir", id=r["id"], path=r["path"], name=r["name"],
-                        dir_id=r["id"]) for r in rows]
-        cands.sort(key=lambda t: len(t.path))
-        note = f"{len(cands)} directories named {raw!r}" if len(cands) > 1 else ""
-        return Resolution(cands[0], cands[1:], note)
+    if dir_cands:
+        note = (f"{len(dir_cands)} directories named {raw!r}"
+                if len(dir_cands) > 1 else "")
+        return Resolution(dir_cands[0], dir_cands[1:], note)
 
     return Resolution(None, note=f"nothing in the index matches {raw!r}")
 
@@ -406,6 +459,28 @@ def default_kinds(t: Target) -> tuple[str, ...]:
     return (t.symbol_kind or "function",)
 
 
+def entry_for_target(conn: sqlite3.Connection, t: Target) -> Entry | None:
+    """Materialize a target as an Entry without relying on a bounded listing."""
+    if t.kind == "dir":
+        r = conn.execute("SELECT * FROM dirs WHERE id = ?", (t.id,)).fetchone()
+        return (Entry(kind="dir", name=r["name"], path=r["path"],
+                      n_files=r["n_files"], n_subdirs=r["n_subdirs"], ref_id=r["id"])
+                if r else None)
+    if t.kind == "file":
+        r = conn.execute("SELECT * FROM files WHERE id = ?", (t.id,)).fetchone()
+        return (Entry(kind="file", name=r["name"], path=r["path"], size=r["size"],
+                      lines=r["lines"], n_symbols=r["n_symbols"], ref_id=r["id"])
+                if r else None)
+    r = conn.execute(_SYM_SELECT + " WHERE s.id = ?", (t.id,)).fetchone()
+    if not r:
+        return None
+    return Entry(kind=r["kind"], name=r["name"], path=r["path"],
+                 line=r["start_line"], end_line=r["end_line"],
+                 signature=r["signature"], is_static=bool(r["is_static"]),
+                 is_inline=bool(r["is_inline"]),
+                 is_exported=bool(r["is_exported"]), ref_id=r["id"])
+
+
 def _enable_regexp(conn: sqlite3.Connection) -> None:
     """Install a Python REGEXP so --grep can filter inside SQLite (and LIMIT)."""
 
@@ -460,6 +535,38 @@ _SYM_ORDER = {
     "size": "LOWER(name), path",
     "lines": "(end_line - start_line) DESC, LOWER(name)",
 }
+_SEARCH_SYM_ORDER = {
+    "name": "LOWER(s.name), f.path, s.start_line, s.kind",
+    "path": "f.path, s.start_line, s.kind, LOWER(s.name)",
+    "kind": "s.kind, LOWER(s.name), f.path, s.start_line",
+    "line": "f.path, s.start_line, s.kind, LOWER(s.name)",
+    "size": "LOWER(s.name), f.path, s.start_line",
+    "lines": "(s.end_line - s.start_line) DESC, LOWER(s.name), f.path",
+}
+
+
+def _entry_sort_key(e: Entry, sort: str):
+    keys = {
+        "name": lambda x: (x.name.lower(), x.path, x.line or 0, x.kind),
+        "path": lambda x: (x.path, x.line or 0, x.kind, x.name.lower()),
+        "kind": lambda x: (x.kind, x.name.lower(), x.path, x.line or 0),
+        "line": lambda x: (x.path, x.line or 0, x.kind, x.name.lower()),
+        # Directories do not have byte/line counts.  The SQL pre-order has
+        # historically treated their immediate file count as their useful
+        # notion of size, so preserve that ordering after the rows are merged.
+        "size": lambda x: (-(x.n_files if x.kind == "dir" else (x.size or 0)),
+                            x.name.lower(), x.path),
+        "lines": lambda x: (-(x.n_files if x.kind == "dir" else
+                               (x.lines or x.span or 0)),
+                             x.name.lower(), x.path),
+    }
+    return keys.get(sort, keys["name"])(e)
+
+
+def sort_entries(entries: list[Entry], sort: str = "name") -> list[Entry]:
+    """Sort entries with the same semantics used by :func:`collect`."""
+    entries.sort(key=lambda e: _entry_sort_key(e, sort))
+    return entries
 
 
 def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
@@ -478,7 +585,8 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
             if not r["path"]:
                 continue
             entries.append(Entry(kind="dir", name=r["name"], path=r["path"],
-                                 n_files=r["n_files"], n_subdirs=r["n_subdirs"]))
+                                 n_files=r["n_files"], n_subdirs=r["n_subdirs"],
+                                 ref_id=r["id"]))
 
     if "file" in kinds and scope.file_sql:
         sql, params = _bounded(
@@ -488,7 +596,7 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
         for r in conn.execute(sql, params):
             entries.append(Entry(kind="file", name=r["name"], path=r["path"],
                                  size=r["size"], lines=r["lines"],
-                                 n_symbols=r["n_symbols"]))
+                                 n_symbols=r["n_symbols"], ref_id=r["id"]))
 
     sym_kinds = [k for k in kinds if k in SYMBOL_KINDS]
     if sym_kinds and scope.sym_where:
@@ -510,17 +618,10 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
                 kind=r["kind"], name=r["name"], path=r["path"],
                 line=r["start_line"], end_line=r["end_line"],
                 signature=r["signature"], is_static=bool(r["is_static"]),
-                is_inline=bool(r["is_inline"]), is_exported=bool(r["is_exported"])))
+                is_inline=bool(r["is_inline"]), is_exported=bool(r["is_exported"]),
+                ref_id=r["id"]))
 
-    keys = {
-        "name": lambda e: (e.name.lower(), e.path),
-        "path": lambda e: (e.path, e.line or 0),
-        "kind": lambda e: (e.kind, e.name.lower()),
-        "line": lambda e: (e.path, e.line or 0),
-        "size": lambda e: (-(e.size or 0), e.name.lower()),
-        "lines": lambda e: (-(e.lines or e.span or 0), e.name.lower()),
-    }
-    entries.sort(key=keys.get(sort, keys["name"]))
+    sort_entries(entries, sort)
     if limit and limit > 0:
         entries = entries[:limit]
 
@@ -549,7 +650,8 @@ def annotate_subsystems(conn: sqlite3.Connection, entries: list[Entry]) -> None:
 
 def search(conn: sqlite3.Connection, pattern: str, kinds=(), mode: str = "substring",
            limit: int = 50, exported_only: bool = False,
-           with_subsystem: bool = True) -> list[Entry]:
+           with_subsystem: bool = True, grep: str | None = None,
+           static: str = "any", sort: str | None = None) -> list[Entry]:
     kinds = tuple(k for k in kinds if k in SYMBOL_KINDS) or SYMBOL_KINDS
     placeholders = ",".join("?" * len(kinds))
     sql = _SYM_SELECT + f" WHERE s.kind IN ({placeholders})"
@@ -569,7 +671,16 @@ def search(conn: sqlite3.Connection, pattern: str, kinds=(), mode: str = "substr
         params.append("%" + pattern.replace("%", "\\%").replace("_", "\\_") + "%")
     if exported_only:
         sql += " AND s.is_exported = 1"
-    sql += " ORDER BY LENGTH(s.name), s.name"
+    if static == "only":
+        sql += " AND s.is_static = 1"
+    elif static == "exclude":
+        sql += " AND s.is_static = 0"
+    if grep:
+        _enable_regexp(conn)
+        sql += " AND s.name REGEXP ?"
+        params.append(grep)
+    sql += (f" ORDER BY {_SEARCH_SYM_ORDER.get(sort, _SEARCH_SYM_ORDER['name'])}"
+            if sort else " ORDER BY LENGTH(s.name), s.name, f.path, s.start_line")
     if limit and limit > 0:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -578,7 +689,7 @@ def search(conn: sqlite3.Connection, pattern: str, kinds=(), mode: str = "substr
         Entry(kind=r["kind"], name=r["name"], path=r["path"], line=r["start_line"],
               end_line=r["end_line"], signature=r["signature"],
               is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
-              is_exported=bool(r["is_exported"]))
+              is_exported=bool(r["is_exported"]), ref_id=r["id"])
         for r in conn.execute(sql, params)
     ]
     if with_subsystem:
@@ -609,7 +720,8 @@ def ancestry(conn: sqlite3.Connection, path: str) -> list[tuple[str, str | None]
 
 
 def subsystem_by_name(conn: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
-    exact = conn.execute("SELECT * FROM subsystems WHERE name = ?", (name,)).fetchall()
+    exact = conn.execute("SELECT * FROM subsystems WHERE name = ? COLLATE NOCASE",
+                         (name,)).fetchall()
     if exact:
         return exact
     return conn.execute(
@@ -629,7 +741,8 @@ def subsystem_json_fields(row: sqlite3.Row) -> dict:
 
 
 def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 200) -> list[str]:
-    sql = "SELECT DISTINCT callee FROM calls WHERE caller_id = ? ORDER BY callee"
+    sql = ("SELECT DISTINCT callee FROM calls WHERE caller_id = ? "
+           "ORDER BY LOWER(callee), callee")
     params: list = [symbol_id]
     if limit and limit > 0:
         sql += " LIMIT ?"
@@ -640,7 +753,8 @@ def callees(conn: sqlite3.Connection, symbol_id: int, limit: int = 200) -> list[
 def callers(conn: sqlite3.Connection, name: str, limit: int = 200) -> list[Entry]:
     sql = (_SYM_SELECT.replace("FROM symbols s",
                                "FROM calls c JOIN symbols s ON s.id = c.caller_id")
-           + " WHERE c.callee = ? GROUP BY s.id ORDER BY s.name")
+           + " WHERE c.callee = ? GROUP BY s.id "
+             "ORDER BY LOWER(s.name), f.path, s.start_line")
     params: list = [name]
     if limit and limit > 0:
         sql += " LIMIT ?"
@@ -649,7 +763,7 @@ def callers(conn: sqlite3.Connection, name: str, limit: int = 200) -> list[Entry
     return [Entry(kind=r["kind"], name=r["name"], path=r["path"], line=r["start_line"],
                   end_line=r["end_line"], signature=r["signature"],
                   is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
-                  is_exported=bool(r["is_exported"])) for r in rows]
+                  is_exported=bool(r["is_exported"]), ref_id=r["id"]) for r in rows]
 
 
 def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> list[Entry]:
@@ -664,6 +778,8 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
 
     def add_rows(rows) -> None:
         for r in rows:
+            if len(out) >= cap:
+                break
             if r["path"] in seen:
                 continue
             seen.add(r["path"])
@@ -686,7 +802,10 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
             "SELECT f.path, f.name, f.size, f.lines FROM files f"
             " JOIN path_subsys p ON p.ref_kind='file' AND p.ref_id=f.id"
             " WHERE p.subsystem_id=? AND f.path LIKE 'Documentation/%'"
-            " ORDER BY f.path LIMIT ?", (sub["id"], cap - len(out))))
+            # Fetch up to the overall cap: earlier preferred rows may also be
+            # the first subsystem rows, and de-duplicating *after* a remaining-
+            # count LIMIT would otherwise under-fill the result.
+            " ORDER BY f.path LIMIT ?", (sub["id"], cap)))
 
     needles: list[str] = []
     if parts:
@@ -704,10 +823,12 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
         add_rows(conn.execute(
             "SELECT path, name, size, lines FROM files"
             " WHERE path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'"
+            " OR path LIKE ? ESCAPE '\\'"
             " ORDER BY path LIMIT ?",
             (f"Documentation/%/{esc}/%",
              f"Documentation/%/{esc}.%",
-             remain)))
+             f"Documentation/{esc}.%",
+             cap)))
 
     def sort_key(e: Entry):
         primary = 0 if prefer and e.path.startswith(f"Documentation/{prefer}/") else 1
