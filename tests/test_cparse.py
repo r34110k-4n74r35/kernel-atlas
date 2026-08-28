@@ -263,6 +263,41 @@ def test_calls_are_collected_only_when_asked():
     assert set(calls) == {"inner_one", "inner_two"}
 
 
+def test_calls_through_parameters_and_local_objects_are_marked_indirect():
+    syms = by_name(parse("""
+        int callback(void) { return 1; }
+
+        int through_parameter(int (*callback)(void))
+        {
+            return callback();
+        }
+
+        int through_local(void)
+        {
+            int (*callback)(void) = 0;
+            return callback();
+        }
+
+        int before_local(void)
+        {
+            int value = callback();
+            int (*callback)(void) = 0;
+            return value;
+        }
+
+        int through_prototype(void)
+        {
+            int callback(void);
+            return callback();
+        }
+    """, calls=True))
+
+    assert syms["through_parameter"].indirect_calls == ("callback",)
+    assert syms["through_local"].indirect_calls == ("callback",)
+    assert syms["before_local"].indirect_calls == ()
+    assert syms["through_prototype"].indirect_calls == ()
+
+
 def test_kinds_filter_is_respected():
     syms = parse("int fn(void) {} struct s { int a; };", frozenset({"struct"}))
     assert [s.kind for s in syms] == ["struct"]
@@ -808,3 +843,64 @@ def test_function_local_type_tags_and_typedefs_are_not_file_symbols():
     assert "local_tag" not in syms
     assert "local_enum" not in syms
     assert "local_type" not in syms
+
+
+def test_sysfs_attribute_macro_records_generated_object_not_callback_name():
+    symbols = parse("""\
+static int undock(void) { return 0; }
+static void request(void) { undock(); }
+static DEVICE_ATTR_WO(undock);
+    """, calls=True)
+    undock = [symbol for symbol in symbols if symbol.name == "undock"]
+
+    assert len(undock) == 1
+    assert undock[0].kind == "function"
+    generated = next(symbol for symbol in symbols
+                     if symbol.name == "dev_attr_undock")
+    assert generated.kind == "variable"
+    assert generated.is_static
+    assert "undock" in next(symbol for symbol in symbols
+                            if symbol.name == "request").calls
+
+
+def test_one_shadowed_pointer_call_does_not_hide_direct_calls_of_same_name():
+    syms = by_name(parse("""\
+static void target(void) { }
+static void caller(void)
+{
+        target();
+        {
+                void (*target)(void) = 0;
+                target();
+        }
+        target();
+}
+    """, calls=True))
+
+    assert syms["caller"].calls == ("target",)
+    assert syms["caller"].indirect_calls == ()
+
+
+def test_one_line_macro_span_does_not_extend_past_end_of_file():
+    symbol = by_name(parse("#define ONLY_LINE 1\n"))["ONLY_LINE"]
+    assert (symbol.start_line, symbol.end_line) == (1, 1)
+
+
+def test_custom_attribute_wrappers_do_not_invent_first_argument_objects():
+    symbols = by_name(parse("""\
+DEVICE_ATTR_SEC_REH_RO(bmc);
+IIO_CONST_ATTR_FREQ_SCALE(channel, values);
+    """))
+
+    assert "dev_attr_bmc" not in symbols
+    assert "iio_const_attr_channel" not in symbols
+
+
+def test_fixed_name_iio_attribute_wrappers_record_the_generated_object():
+    symbols = by_name(parse("""\
+IIO_CONST_ATTR_SAMP_FREQ_AVAIL(values);
+IIO_CONST_ATTR_INT_TIME_AVAIL(values);
+    """))
+
+    assert "iio_const_attr_sampling_frequency_available" in symbols
+    assert "iio_const_attr_integration_time_available" in symbols

@@ -4,13 +4,17 @@ MAINTAINERS is the kernel's own authoritative statement of which subsystem owns
 which files, so subsystem answers stay correct per version instead of relying on
 a hand-written table.
 
-Matching semantics follow the rules documented in the file's own header:
+Matching semantics follow Linux's ``scripts/get_maintainer.pl`` rather than a
+generic filesystem glob implementation:
 
     F: drivers/net/    all files in and below drivers/net
     F: drivers/net/*   all files in drivers/net, but not below
-    F: */net/*         all files in "any top level directory"/net
+    F: include/drm/drm same-depth paths beginning with that prefix
 
-so ``*`` never crosses a ``/``.
+Single-star expressions may consume slashes while matching, but a non-directory
+pattern must have the same slash depth as the candidate.  A trailing slash is
+a recursive prefix; ``**`` explicitly disables the depth constraint.  These
+quirks matter because MAINTAINERS intentionally relies on them.
 
 Naively testing every pattern against every path is ~5k x ~85k regex calls.
 Instead patterns are bucketed by their literal prefix directory, and a path only
@@ -66,10 +70,20 @@ class Section:
     reviewers: list[str] = field(default_factory=list)
     lists: list[str] = field(default_factory=list)
     trees: list[str] = field(default_factory=list)
-    web: str = ""
+    websites: list[str] = field(default_factory=list)
+    patchwork: list[str] = field(default_factory=list)
+    bugs: list[str] = field(default_factory=list)
+    chats: list[str] = field(default_factory=list)
+    profiles: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
     excludes: list[str] = field(default_factory=list)
     regexes: list[str] = field(default_factory=list)
+
+    @property
+    def web(self) -> str:
+        """The first website, retained for callers using the old scalar field."""
+        return self.websites[0] if self.websites else ""
 
 
 def _specificity(pattern: str) -> int:
@@ -78,7 +92,18 @@ def _specificity(pattern: str) -> int:
     if pattern.strip() in _CATCH_ALL:
         return -1000
     literal = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
-    return literal.count("/") * 20 + len(literal)
+    suffix = pattern[len(literal):]
+    constrained = len(re.sub(r"[*?\[\]!^/\\]", "", suffix))
+    wildcard_constrained = sum(
+        len(re.sub(r"[*?\[\]!^\\]", "", component))
+        for component in suffix.split("/")
+        if any(char in component for char in "*?[")
+    )
+    # Preserve the strong prefix/depth signal while rewarding constraints
+    # after a wildcard.  Linux uses patterns such as ``clock/*imx*`` precisely
+    # to be more specific than the containing ``clock/`` directory.
+    return (literal.count("/") * 20 + len(literal)
+            + constrained + wildcard_constrained)
 
 
 def _regex_specificity(pattern: str) -> int:
@@ -90,57 +115,55 @@ def _regex_specificity(pattern: str) -> int:
     """
     runs = re.findall(r"[A-Za-z0-9_/-]+", pattern)
     longest = max((len(run) for run in runs), default=0)
-    return 20 + min(60, longest * 2)
+    return 30 + min(50, longest * 2)
 
 
 def _to_regex(pattern: str) -> re.Pattern | None:
+    """Compile the F:/X: matcher used by Linux's get_maintainer.pl.
+
+    The upstream script escapes dots, translates shell wildcards to regex
+    fragments, anchors only at the start, and applies a separate slash-count
+    check to non-directory patterns (except ``**``).  Encoding the depth check
+    as a lookahead keeps exclusions and inclusion patterns consistent.
+    """
     pattern = pattern.strip()
     if not pattern:
         return None
     trailing_dir = pattern.endswith("/")
-    core = pattern[:-1] if trailing_dir else pattern
+    crosses_depth = "**" in pattern
+    slash_depth = pattern.count("/")
     out: list[str] = []
     i = 0
-    while i < len(core):
-        ch = core[i]
-        # The kernel file contains a small number of shell-escaped wildcards
-        # (notably netcons\*).  get_maintainer.pl treats them as prefix
-        # wildcards in practice, so ignore the protective slash here too.
-        if ch == "\\" and i + 1 < len(core):
-            nxt = core[i + 1]
-            if nxt in "*?":
-                ch = nxt
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                out.append("(?:.*)")
                 i += 1
             else:
-                out.append(re.escape(nxt))
-                i += 2
-                continue
-        if ch == "*":
-            out.append("[^/]*")
+                out.append(".*")
         elif ch == "?":
-            out.append("[^/]")
+            out.append(".")
+        elif ch == ".":
+            out.append(r"\.")
         elif ch == "[":
-            end = core.find("]", i + 1)
+            end = pattern.find("]", i + 1)
             if end < 0:
                 out.append(r"\[")
             else:
-                content = core[i + 1:end]
-                if not content:
-                    out.append(r"\[\]")
-                else:
-                    if content[0] in "!^":
-                        content = "^" + content[1:]
-                    content = content.replace("\\", r"\\")
-                    out.append("[" + content + "]")
+                out.append(pattern[i:end + 1])
                 i = end
         else:
-            out.append(re.escape(ch))
+            # get_maintainer.pl otherwise leaves the pattern regex-compatible,
+            # including its rare escaped wildcard and grouping constructs.
+            out.append(ch)
         i += 1
     body = "".join(out)
-    # A trailing slash covers the directory itself and everything beneath it.
-    suffix = "(/.*)?" if trailing_dir else ""
+    depth = ""
+    if not trailing_dir and not crosses_depth:
+        depth = rf"(?=(?:[^/]*/){{{slash_depth}}}[^/]*$)"
     try:
-        return re.compile(f"^{body}{suffix}$")
+        return re.compile(f"^{depth}{body}")
     except re.error:
         return None
 
@@ -190,7 +213,15 @@ def parse_maintainers(text: str) -> list[Section]:
             elif tag == "S":
                 sec.status = value
             elif tag == "W":
-                sec.web = sec.web or value
+                sec.websites.append(value)
+            elif tag == "Q":
+                sec.patchwork.append(value)
+            elif tag == "B":
+                sec.bugs.append(value)
+            elif tag == "C":
+                sec.chats.append(value)
+            elif tag == "P":
+                sec.profiles.append(value)
             elif tag == "T":
                 sec.trees.append(value)
             elif tag == "F":
@@ -199,8 +230,12 @@ def parse_maintainers(text: str) -> list[Section]:
                 sec.excludes.append(value)
             elif tag == "N":
                 sec.regexes.append(value)
-        if sec.files or sec.regexes:
-            sections.append(sec)
+            elif tag == "K":
+                sec.keywords.append(value)
+        # Sections without F:/N: patterns still carry useful contact and
+        # workflow metadata (BCACHEFS and BPF [MISC] are real examples).  They
+        # cannot claim a path, but they remain valid subsystem records.
+        sections.append(sec)
         block.clear()
 
     for raw in text.splitlines():
@@ -236,13 +271,13 @@ class SubsystemMap:
             for pat in sec.files:
                 score = _specificity(pat)
                 has_wild = any(c in pat for c in "*?[")
-                if not has_wild:
-                    if pat.endswith("/") or self._is_existing_dir(pat):
-                        self._dirs.setdefault(pat.rstrip("/"), []).append((sec.id, score))
-                    else:
-                        self._exact.setdefault(pat, []).append((sec.id, score))
+                if not has_wild and (pat.endswith("/")
+                                     or self._is_existing_dir(pat)):
+                    self._dirs.setdefault(pat.rstrip("/"), []).append(
+                        (sec.id, score))
                 else:
-                    rx = _to_regex(pat)
+                    normalized = pat + "/" if self._is_existing_dir(pat) else pat
+                    rx = _to_regex(normalized)
                     if rx is not None:
                         bucket = _literal_prefix_dir(pat)
                         self._wild.setdefault(bucket, []).append((rx, sec.id, score))

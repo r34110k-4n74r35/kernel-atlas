@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import cparse, db, indexer
+from kernel_atlas import cparse, db, indexer, query
 
 
 def _tree(root: Path, maintainers: str | None = None) -> Path:
@@ -88,6 +88,64 @@ def test_all_matching_subsystems_are_persisted(tmp_path):
     assert [tuple(r) for r in rows] == [(f"SECTION {i}", i) for i in range(7)]
 
 
+def test_equal_top_ownership_evidence_is_preserved_as_co_primary(tmp_path):
+    maintainers = """\
+OWNER A
+M: A <a@example.com>
+F: owned.c
+
+OWNER B
+M: B <b@example.com>
+F: owned.c
+"""
+    tree = _tree(tmp_path / "linux-9.9", maintainers)
+    (tree / "owned.c").write_text("int owned(void) { return 0; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = conn.execute(
+        "SELECT s.name,p.rank,p.is_primary FROM path_subsys p"
+        " JOIN subsystems s ON s.id=p.subsystem_id"
+        " JOIN files f ON f.id=p.ref_id WHERE f.path='owned.c'"
+        " ORDER BY p.rank").fetchall()
+    counts = conn.execute(
+        "SELECT name,n_primary_files FROM subsystems ORDER BY name").fetchall()
+    conn.close()
+
+    assert [tuple(row) for row in rows] == [
+        ("OWNER A", 0, 1), ("OWNER B", 1, 1)]
+    assert [tuple(row) for row in counts] == [("OWNER A", 1), ("OWNER B", 1)]
+
+
+def test_directory_ownership_is_composed_from_files_not_globbed_names(tmp_path):
+    tree = _tree(
+        tmp_path / "linux-9.9",
+        "FUTEX SUBSYSTEM\nM: A <a@example.com>\nF: kernel/futex/*\n",
+    )
+    directory = tree / "kernel" / "futex"
+    directory.mkdir(parents=True)
+    (directory / "core.c").write_text("int futex_wait(void) { return 0; }\n")
+    (directory / "syscalls.c").write_text("int futex_wake(void) { return 0; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    direct_dir_claims = conn.execute(
+        "SELECT COUNT(*) FROM path_subsys WHERE ref_kind='dir'").fetchone()[0]
+    row = conn.execute(
+        "SELECT s.name,d.n_claimed,d.n_primary,d.coverage"
+        " FROM dirs directory"
+        " JOIN dir_subsys d ON d.dir_id=directory.id"
+        " JOIN subsystems s ON s.id=d.subsystem_id"
+        " WHERE directory.path='kernel/futex' ORDER BY d.rank LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    assert direct_dir_claims == 0
+    assert tuple(row) == ("FUTEX SUBSYSTEM", 2, 2, 1.0)
+
+
 def test_worker_records_parse_and_read_errors(monkeypatch, tmp_path):
     source = tmp_path / "bad.c"
     source.write_text("int bad(void) { return 0; }\n")
@@ -156,3 +214,850 @@ def test_build_time_includes_database_finalization(monkeypatch, tmp_path):
     assert stats.seconds >= 0.05
     # Metadata is rounded to one decimal place, but must include the sleep.
     assert recorded >= 0.1
+
+
+def test_build_time_includes_publication_validation(monkeypatch, tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "one.c").write_text("int one(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+    original = db.validate_schema
+
+    def slow_validation(conn, *, deep=False):
+        result = original(conn, deep=deep)
+        if deep:
+            time.sleep(0.05)
+        return result
+
+    monkeypatch.setattr(db, "validate_schema", slow_validation)
+    stats = indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    recorded = float(db.get_meta(conn)["build_seconds"])
+    conn.close()
+
+    assert stats.seconds >= 0.05
+    assert recorded >= 0.1
+
+
+def test_call_resolution_is_identity_aware_and_conservative(tmp_path):
+    conn = db.create(tmp_path / "calls.db")
+    conn.executemany(
+        "INSERT INTO dirs(id,path,parent_id,name,depth) VALUES (?,?,?,?,?)",
+        [(1, "", None, "linux", 0), (2, "one", 1, "one", 1),
+         (3, "two", 1, "two", 1), (4, "three", 1, "three", 1)],
+    )
+    conn.executemany(
+        "INSERT INTO files(id,path,dir_id,name,ext) VALUES (?,?,?,?,?)",
+        [(1, "one/a.c", 2, "a.c", ".c"),
+         (2, "two/b.c", 3, "b.c", ".c"),
+         (3, "three/c.c", 4, "c.c", ".c"),
+         (4, "blockers.h", 1, "blockers.h", ".h")],
+    )
+    conn.executemany(
+        "INSERT INTO symbols(id,file_id,name,kind,is_static) VALUES (?,?,?,?,?)",
+        [
+            (1, 1, "caller", "function", 0),
+            (2, 1, "helper", "function", 1),
+            (3, 2, "helper", "function", 1),
+            (4, 2, "unique", "function", 0),
+            (5, 2, "duplicate", "function", 0),
+            (6, 3, "duplicate", "function", 0),
+            (7, 1, "local_duplicate", "function", 1),
+            (8, 1, "local_duplicate", "function", 1),
+            (9, 4, "macro_only", "macro", 0),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO calls(caller_id,callee) VALUES (?,?)",
+        [(1, name) for name in (
+            "helper", "unique", "duplicate", "local_duplicate",
+            "macro_only", "missing")],
+    )
+    db.finalize(conn)
+
+    counts = indexer._resolve_calls(conn)
+    rows = {
+        row["callee"]: (row["callee_id"], row["resolution"])
+        for row in conn.execute(
+            "SELECT callee,callee_id,resolution FROM calls ORDER BY callee")
+    }
+    outbound = query.callee_entries(conn, 1)
+    local_callers = query.callers(conn, 2)
+    unrelated_static_callers = query.callers(conn, 3)
+    conn.close()
+
+    assert rows == {
+        "helper": (2, "same_file"),
+        "unique": (4, "unique_global"),
+        "duplicate": (None, "ambiguous"),
+        "local_duplicate": (None, "ambiguous"),
+        "macro_only": (None, "macro"),
+        "missing": (None, "unresolved"),
+    }
+    assert counts == {
+        "same_file": 1, "included_source": 0, "unique_global": 1,
+        "ambiguous": 2, "macro": 1, "indirect": 0, "unresolved": 1,
+    }
+    assert next(row for row in outbound if row.name == "helper").ref_id == 2
+    assert [row.name for row in local_callers] == ["caller"]
+    assert unrelated_static_callers == []
+
+
+def test_directory_subsystems_are_derived_from_descendant_files(tmp_path):
+    conn = db.create(tmp_path / "directories.db")
+    conn.executemany(
+        "INSERT INTO dirs(id,path,parent_id,name,depth) VALUES (?,?,?,?,?)",
+        [(1, "", None, "linux", 0), (2, "kernel", 1, "kernel", 1),
+         (3, "kernel/futex", 2, "futex", 2),
+         (4, "mixed", 1, "mixed", 1)],
+    )
+    conn.executemany(
+        "INSERT INTO files(id,path,dir_id,name) VALUES (?,?,?,?)",
+        [(1, "kernel/futex/a.c", 3, "a.c"),
+         (2, "kernel/futex/b.c", 3, "b.c"),
+         (3, "mixed/a.c", 4, "a.c"), (4, "mixed/b.c", 4, "b.c")],
+    )
+    conn.executemany(
+        "INSERT INTO subsystems(id,name) VALUES (?,?)",
+        [(1, "FUTEX SUBSYSTEM"), (2, "A"), (3, "B"), (4, "THE REST")],
+    )
+    claims = [
+        ("file", 1, 1, 10, 0, 1), ("file", 1, 4, -1000, 1, 0),
+        ("file", 2, 1, 10, 0, 1), ("file", 2, 4, -1000, 1, 0),
+        ("file", 3, 2, 10, 0, 1), ("file", 3, 3, 5, 1, 0),
+        ("file", 3, 4, -1000, 2, 0),
+        ("file", 4, 3, 10, 0, 1), ("file", 4, 2, 5, 1, 0),
+        ("file", 4, 4, -1000, 2, 0),
+    ]
+    conn.executemany(
+        "INSERT INTO path_subsys(ref_kind,ref_id,subsystem_id,score,rank,is_primary)"
+        " VALUES (?,?,?,?,?,?)", claims)
+
+    indexer._derive_directory_composition(conn)
+    futex = conn.execute(
+        "SELECT s.name,d.n_claimed,d.n_primary,d.coverage FROM dir_subsys d"
+        " JOIN subsystems s ON s.id=d.subsystem_id WHERE d.dir_id=3"
+        " ORDER BY d.rank LIMIT 1"
+    ).fetchone()
+    mixed = conn.execute(
+        "SELECT s.name,d.n_claimed,d.n_primary,d.coverage FROM dir_subsys d"
+        " JOIN subsystems s ON s.id=d.subsystem_id WHERE d.dir_id=4"
+        " ORDER BY d.rank"
+    ).fetchall()
+    root_total = conn.execute(
+        "SELECT n_files_recursive FROM dirs WHERE id=1").fetchone()[0]
+    root_composition = conn.execute(
+        "SELECT COUNT(*) FROM dir_subsys WHERE dir_id=1").fetchone()[0]
+    conn.close()
+
+    assert tuple(futex) == ("FUTEX SUBSYSTEM", 2, 2, 1.0)
+    assert [tuple(row) for row in mixed[:2]] == [
+        ("A", 2, 1, 0.5), ("B", 2, 1, 0.5)]
+    assert root_total == 4
+    assert root_composition == 4
+
+
+def test_call_resolution_respects_domains_and_identity_blockers(tmp_path):
+    conn = db.create(tmp_path / "call-domains.db")
+    conn.executemany(
+        "INSERT INTO dirs(id,path,parent_id,name,depth) VALUES (?,?,?,?,?)",
+        [(1, "", None, "linux", 0)],
+    )
+    conn.executemany(
+        "INSERT INTO files(id,path,dir_id,name,ext) VALUES (?,?,?,?,?)",
+        [
+            (1, "block/a.c", 1, "a.c", ".c"),
+            (2, "tools/testing/helper.c", 1, "helper.c", ".c"),
+            (3, "include/linux/api.h", 1, "api.h", ".h"),
+            (4, "arch/arm/kernel/a.c", 1, "a.c", ".c"),
+            (5, "arch/alpha/kernel/b.c", 1, "b.c", ".c"),
+            (6, "kernel/helper.c", 1, "helper.c", ".c"),
+            (7, "tools/accounting/main.c", 1, "main.c", ".c"),
+            (8, "tools/testing/selftests/arm64/signal.c", 1, "signal.c", ".c"),
+            (9, "tools/accounting/helper.c", 1, "helper.c", ".c"),
+            (10, "tools/testing/selftests/kvm/main.c", 1, "main.c", ".c"),
+            (11, "drivers/misc/blockers.c", 1, "blockers.c", ".c"),
+            (12, "arch/x86/lib/checksum.c", 1, "checksum.c", ".c"),
+            (13, "arch/x86/tools/relocs.c", 1, "relocs.c", ".c"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO symbols(id,file_id,name,kind,is_static) VALUES (?,?,?,?,?)",
+        [
+            (1, 1, "kernel_caller", "function", 0),
+            (2, 4, "arm_caller", "function", 0),
+            (3, 2, "spin_lock", "function", 0),
+            (4, 3, "spin_lock", "macro", 0),
+            (5, 2, "tool_only", "function", 0),
+            (6, 5, "alpha_only", "function", 0),
+            (7, 6, "generic_ok", "function", 0),
+            (8, 3, "inline_only", "function", 1),
+            (9, 3, "callback", "variable", 1),
+            (10, 6, "conflicted", "function", 0),
+            (11, 3, "conflicted", "macro", 0),
+            (12, 7, "accounting_caller", "function", 0),
+            (13, 8, "sigaddset", "function", 0),
+            (14, 9, "accounting_ok", "function", 0),
+            (15, 10, "kvm_caller", "function", 0),
+            (16, 7, "accounting_local", "function", 0),
+            (17, 6, "device_add", "function", 0),
+            (18, 6, "device_remove", "function", 0),
+            (19, 11, "device_add", "macro", 0),
+            (20, 11, "device_remove", "variable", 1),
+            (21, 6, "csum_partial", "function", 0),
+            (22, 12, "csum_partial", "function", 0),
+            (23, 13, "relocs_caller", "function", 0),
+            (24, 6, "fprintf", "function", 0),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO calls(caller_id,callee) VALUES (?,?)",
+        [(1, name) for name in (
+            "spin_lock", "tool_only", "inline_only", "callback", "conflicted",
+            "device_add", "device_remove", "csum_partial")]
+        + [(2, "alpha_only"), (2, "generic_ok")]
+        + [(12, "sigaddset"), (12, "accounting_ok"),
+           (12, "accounting_local"), (15, "sigaddset"), (23, "fprintf")],
+    )
+    db.finalize(conn)
+
+    indexer._resolve_calls(conn)
+    rows = {
+        (row["caller_id"], row["callee"]):
+            (row["callee_id"], row["resolution"])
+        for row in conn.execute(
+            "SELECT caller_id,callee,callee_id,resolution FROM calls")
+    }
+    conn.close()
+
+    assert rows[(1, "spin_lock")] == (None, "macro")
+    assert rows[(1, "tool_only")] == (None, "unresolved")
+    assert rows[(1, "inline_only")] == (None, "ambiguous")
+    assert rows[(1, "callback")] == (None, "ambiguous")
+    assert rows[(1, "conflicted")] == (None, "ambiguous")
+    assert rows[(1, "device_add")] == (17, "unique_global")
+    assert rows[(1, "device_remove")] == (18, "unique_global")
+    assert rows[(1, "csum_partial")] == (None, "ambiguous")
+    assert rows[(2, "alpha_only")] == (None, "unresolved")
+    assert rows[(2, "generic_ok")] == (7, "unique_global")
+    assert rows[(12, "sigaddset")] == (None, "unresolved")
+    assert rows[(12, "accounting_ok")] == (None, "unresolved")
+    assert rows[(12, "accounting_local")] == (16, "same_file")
+    assert rows[(15, "sigaddset")] == (None, "unresolved")
+    assert rows[(23, "fprintf")] == (None, "unresolved")
+
+
+def test_call_build_requires_identity_blocker_kinds(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    out = tmp_path / "index.db"
+
+    with pytest.raises(ValueError, match="requires indexing: macro, variable"):
+        indexer.build(
+            tree, out, "9.9", kinds=("function",), want_calls=True,
+            jobs=1, quiet=True,
+        )
+
+
+def test_call_build_retains_local_function_pointer_calls_as_indirect(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "callbacks.c").write_text("""
+int callback(void) { return 1; }
+int caller(int (*callback)(void)) { return callback(); }
+""")
+    out = tmp_path / "index.db"
+
+    stats = indexer.build(
+        tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee,c.callee_id,c.resolution FROM calls c "
+        "JOIN symbols s ON s.id=c.caller_id WHERE s.name='caller'"
+    ).fetchone()
+    meta = db.validate_schema(conn)
+    conn.close()
+
+    assert tuple(row) == ("callback", None, "indirect")
+    assert stats.calls_indirect == 1
+    assert meta["n_calls_indirect"] == "1"
+
+
+def test_file_scope_function_pointer_blocks_same_named_global(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "fp.c").write_text("""\
+static int (*callback)(void);
+int fp_caller(void) { return callback(); }
+""")
+    (tree / "other.c").write_text(
+        "int callback(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='fp_caller' AND c.callee='callback'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == (None, "indirect")
+
+
+def test_same_file_macro_blocks_same_named_global(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "macro.c").write_text("""\
+#define callback() 1
+int macro_caller(void) { return callback(); }
+""")
+    (tree / "other.c").write_text(
+        "int callback(void) { return 7; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='macro_caller' AND c.callee='callback'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == (None, "macro")
+
+
+def test_call_build_resolves_quoted_c_members_in_the_same_unit(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_text(
+        "static int load_firmware(void) { return 1; }\n")
+    (tree / "aggregate.c").write_text("""\
+#include "member.c"
+int aggregate(void) { return load_firmware(); }
+""")
+    other = tree / "drivers" / "other"
+    other.mkdir(parents=True)
+    (other / "firmware.c").write_text(
+        "int load_firmware(void) { return 2; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT parent.path,member.path,i.line FROM source_includes i"
+        " JOIN files parent ON parent.id=i.includer_id"
+        " JOIN files member ON member.id=i.included_id").fetchone()
+    call = conn.execute(
+        "SELECT c.resolution,target_file.path FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " JOIN files target_file ON target_file.id=target.file_id"
+        " WHERE caller.name='aggregate'").fetchone()
+    conn.close()
+
+    assert tuple(include) == ("aggregate.c", "member.c", 1)
+    assert tuple(call) == ("included_source", "member.c")
+
+
+def test_global_in_quoted_member_is_visible_through_root_domain(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_text(
+        "int member_global(void) { return 1; }\n")
+    (tree / "aggregate.c").write_text('#include "member.c"\n')
+    (tree / "outside.c").write_text(
+        "int outside(void) { return member_global(); }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.resolution,target_file.path FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " JOIN files target_file ON target_file.id=target.file_id"
+        " WHERE caller.name='outside' AND c.callee='member_global'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == ("unique_global", "member.c")
+
+
+def test_call_build_resolves_tree_root_quoted_c_members(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    member = tree / "lib" / "vdso" / "getrandom.c"
+    member.parent.mkdir(parents=True)
+    member.write_text(
+        "static int __cvdso_getrandom(void) { return 1; }\n")
+    wrapper = tree / "arch" / "x86" / "entry" / "vdso" / "vdso64"
+    wrapper.mkdir(parents=True)
+    (wrapper / "vgetrandom.c").write_text("""\
+#include "lib/vdso/getrandom.c"
+int __vdso_getrandom(void) { return __cvdso_getrandom(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT parent.path,member.path FROM source_includes i"
+        " JOIN files parent ON parent.id=i.includer_id"
+        " JOIN files member ON member.id=i.included_id").fetchone()
+    call = conn.execute(
+        "SELECT c.resolution,target_file.path FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " JOIN files target_file ON target_file.id=target.file_id"
+        " WHERE caller.name='__vdso_getrandom'").fetchone()
+    conn.close()
+
+    assert tuple(include) == (
+        "arch/x86/entry/vdso/vdso64/vgetrandom.c",
+        "lib/vdso/getrandom.c",
+    )
+    assert tuple(call) == ("included_source", "lib/vdso/getrandom.c")
+
+
+def test_multi_root_member_requires_every_translation_unit_to_agree(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "common.c").write_text(
+        "static int common_call(void) { return helper(); }\n")
+    (tree / "a.c").write_text("""\
+static int helper(void) { return 1; }
+#include "common.c"
+""")
+    (tree / "b.c").write_text('#include "common.c"\n')
+    (tree / "global.c").write_text(
+        "int helper(void) { return 2; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='common_call' AND c.callee='helper'"
+    ).fetchone()
+    conn.close()
+
+    # a.c binds its static helper; b.c binds the global one.  The source row
+    # represents both instantiations and must not claim either identity.
+    assert tuple(row) == (None, "ambiguous")
+
+
+def test_kbuild_object_remains_a_root_when_also_included(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    with (tree / "Makefile").open("a") as makefile:
+        makefile.write("obj-y += dual.o helper.o caller.o\n")
+    (tree / "dual.c").write_text(
+        "int exported_dual(void) { return helper(); }\n")
+    (tree / "helper.c").write_text(
+        "int helper(void) { return 1; }\n")
+    (tree / "caller.c").write_text(
+        "int outside(void) { return exported_dual(); }\n")
+    wrapper = tree / "tools" / "testing"
+    wrapper.mkdir(parents=True)
+    (wrapper / "wrapper.c").write_text('#include "dual.c"\n')
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = {
+        (row["caller"], row["callee"]):
+            (row["callee_id"], row["resolution"])
+        for row in conn.execute(
+            "SELECT caller.name AS caller,c.callee,c.callee_id,c.resolution"
+            " FROM calls c JOIN symbols caller ON caller.id=c.caller_id")
+    }
+    is_root = conn.execute(
+        "SELECT 1 FROM translation_unit_roots root JOIN files f"
+        " ON f.id=root.file_id WHERE f.path='dual.c'"
+    ).fetchone()
+    conn.close()
+
+    assert is_root is not None
+    # The call written in dual.c has different kernel/tools contexts.
+    assert rows[("exported_dual", "helper")] == (None, "ambiguous")
+    # Other kernel sources may still bind dual.c's standalone global identity.
+    assert rows[("outside", "exported_dual")][1] == "unique_global"
+
+
+def test_non_build_make_object_reference_does_not_create_a_root(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    with (tree / "Makefile").open("a") as makefile:
+        makefile.write("clean-files += member.o\n")
+    (tree / "member.c").write_text(
+        "int image_only(void) { return 1; }\n")
+    image = tree / "arch" / "x86" / "entry" / "vdso" / "vdso64"
+    image.mkdir(parents=True)
+    (image / "wrapper.c").write_text('#include "member.c"\n')
+    kernel = tree / "kernel"
+    kernel.mkdir()
+    (kernel / "caller.c").write_text(
+        "int kernel_call(void) { return image_only(); }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='kernel_call' AND c.callee='image_only'"
+    ).fetchone()
+    false_root = conn.execute(
+        "SELECT 1 FROM translation_unit_roots root JOIN files f"
+        " ON f.id=root.file_id WHERE f.path='member.c'"
+    ).fetchone()
+    conn.close()
+
+    assert false_root is None
+    assert tuple(row) == (None, "unresolved")
+
+
+def test_tools_build_object_list_records_a_translation_unit_root(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    library = tree / "tools" / "lib" / "bpf"
+    library.mkdir(parents=True)
+    (library / "Build").write_text("libbpf-y += member.o\n")
+    (library / "member.c").write_text(
+        "int tools_member(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    root = conn.execute(
+        "SELECT 1 FROM translation_unit_roots root JOIN files f"
+        " ON f.id=root.file_id"
+        " WHERE f.path='tools/lib/bpf/member.c'"
+    ).fetchone()
+    conn.close()
+
+    assert root is not None
+
+
+def test_included_member_uses_its_root_translation_unit_domain(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    member = tree / "lib" / "vdso" / "member.c"
+    member.parent.mkdir(parents=True)
+    member.write_text(
+        "static int member_call(void) { return kernel_only(); }\n")
+    wrapper = tree / "arch" / "x86" / "entry" / "vdso" / "vdso64"
+    wrapper.mkdir(parents=True)
+    (wrapper / "wrapper.c").write_text(
+        '#include "lib/vdso/member.c"\n')
+    kernel = tree / "kernel"
+    kernel.mkdir()
+    (kernel / "helper.c").write_text(
+        "int kernel_only(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='member_call' AND c.callee='kernel_only'"
+    ).fetchone()
+    domain = conn.execute(
+        "SELECT call_domain FROM files"
+        " WHERE path='arch/x86/entry/vdso/vdso64/wrapper.c'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert domain.startswith("image:")
+    assert tuple(row) == (None, "unresolved")
+
+
+def test_header_call_sites_do_not_guess_a_linked_image_domain(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    header = tree / "include" / "linux" / "shared.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("""\
+static inline int header_local(void) { return 1; }
+static inline int header_call(void)
+{
+    return header_local() + kernel_only();
+}
+""")
+    image = tree / "arch" / "x86" / "entry" / "vdso" / "vdso64"
+    image.mkdir(parents=True)
+    (image / "wrapper.c").write_text(
+        '#include "include/linux/shared.h"\n')
+    kernel = tree / "kernel"
+    kernel.mkdir()
+    (kernel / "helper.c").write_text(
+        "int kernel_only(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = {
+        row["callee"]: (row["callee_id"], row["resolution"])
+        for row in conn.execute(
+            "SELECT c.callee,c.callee_id,c.resolution FROM calls c"
+            " JOIN symbols caller ON caller.id=c.caller_id"
+            " WHERE caller.name='header_call'")
+    }
+    conn.close()
+
+    assert rows["header_local"][1] == "same_file"
+    assert rows["kernel_only"] == (None, "ambiguous")
+
+
+def test_image_call_respects_shared_header_identity_blockers(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    header = tree / "include" / "linux" / "api.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("#define shadowed() 0\n")
+    image = tree / "arch" / "x86" / "boot"
+    image.mkdir(parents=True)
+    (image / "main.c").write_text("""\
+#include <linux/api.h>
+int image_call(void) { return shadowed(); }
+""")
+    (image / "helper.c").write_text(
+        "int shadowed(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='image_call' AND c.callee='shadowed'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == (None, "ambiguous")
+
+
+def test_call_build_ignores_unparseable_quoted_c_members(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_bytes(b"\0binary input\n")
+    (tree / "aggregate.c").write_text("""\
+#include "member.c"
+int aggregate(void) { return missing_member(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    includes = conn.execute("SELECT COUNT(*) FROM source_includes").fetchone()[0]
+    call = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='aggregate' AND c.callee='missing_member'"
+    ).fetchone()
+    status = conn.execute(
+        "SELECT index_status FROM files WHERE path='member.c'").fetchone()[0]
+    conn.close()
+
+    assert includes == 0
+    assert tuple(call) == (None, "unresolved")
+    assert status == "skipped_binary"
+
+
+def test_sysfs_attribute_callback_does_not_make_call_ambiguous(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "dock.c").write_text("""\
+static int undock(void) { return 0; }
+static int handle_eject(void) { return undock(); }
+static DEVICE_ATTR_WO(undock);
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    definitions = list(conn.execute(
+        "SELECT name,kind FROM symbols WHERE name IN ('undock','dev_attr_undock')"
+        " ORDER BY name,kind"))
+    call = conn.execute(
+        "SELECT c.resolution,target.name FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " WHERE caller.name='handle_eject' AND c.callee='undock'"
+    ).fetchone()
+    conn.close()
+
+    assert [tuple(row) for row in definitions] == [
+        ("dev_attr_undock", "variable"), ("undock", "function")]
+    assert tuple(call) == ("same_file", "undock")
+
+
+def test_call_domains_follow_independently_linked_kbuild_programs(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    sample = tree / "samples" / "bpf"
+    sample.mkdir(parents=True)
+    (sample / "Makefile").write_text("""\
+tprogs-y := alpha beta
+alpha-objs := alpha_main.o alpha_helper.o shared.o
+beta-objs := beta_main.o shared.o
+""")
+    (sample / "alpha_main.c").write_text("""\
+int alpha_helper(void);
+int fprintf(void);
+int alpha_entry(void) { return alpha_helper() + fprintf(); }
+""")
+    (sample / "alpha_helper.c").write_text(
+        "int alpha_helper(void) { return 1; }\n")
+    (sample / "beta_main.c").write_text(
+        "int beta_entry(void) { return 2; }\n")
+    (sample / "shared.c").write_text(
+        "int shared_helper(void) { return 3; }\n")
+    (sample / "trace_kern.c").write_text(
+        "int bpf_program(void) { return 4; }\n")
+    (sample / "kernel_piece.c").write_text(
+        "int kernel_piece(void) { return 5; }\n")
+    hid = tree / "samples" / "hid"
+    hid.mkdir()
+    (hid / "mouse.bpf.c").write_text(
+        "int hid_bpf_program(void) { return 7; }\n")
+    kernel = tree / "kernel"
+    kernel.mkdir()
+    (kernel / "print.c").write_text(
+        "int fprintf(void) { return 6; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    domains = dict(conn.execute(
+        "SELECT path,call_domain FROM files WHERE path LIKE 'samples/%'"))
+    calls = {row["callee"]: (row["callee_id"], row["resolution"])
+             for row in conn.execute(
+                 "SELECT c.callee,c.callee_id,c.resolution FROM calls c"
+                 " JOIN symbols s ON s.id=c.caller_id"
+                 " WHERE s.name='alpha_entry'")}
+    conn.close()
+
+    assert domains["samples/bpf/alpha_main.c"] == \
+        "program:samples/bpf:alpha"
+    assert domains["samples/bpf/alpha_helper.c"] == \
+        "program:samples/bpf:alpha"
+    assert domains["samples/bpf/shared.c"] == "isolated:samples/bpf/shared.c"
+    assert domains["samples/bpf/trace_kern.c"] == \
+        "isolated:samples/bpf/trace_kern.c"
+    assert domains["samples/bpf/kernel_piece.c"] == \
+        "isolated:samples/bpf/kernel_piece.c"
+    assert domains["samples/hid/mouse.bpf.c"] == \
+        "isolated:samples/hid/mouse.bpf.c"
+    assert calls["alpha_helper"][1] == "unique_global"
+    assert calls["alpha_helper"][0] is not None
+    assert calls["fprintf"] == (None, "unresolved")
+
+
+def test_kbuild_program_header_bindings_block_false_global_targets(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    program = tree / "scripts" / "host-tool"
+    program.mkdir(parents=True)
+    (program / "Makefile").write_text("""\
+hostprogs := analyzer
+analyzer-objs := main.o helpers.o
+""")
+    (program / "bindings.h").write_text("""\
+static int header_helper(void) { return 1; }
+#define header_macro() 2
+static int (*header_pointer)(void);
+""")
+    (program / "main.c").write_text("""\
+#include "bindings.h"
+int analyze(void)
+{
+    return header_helper() + header_macro() + header_pointer();
+}
+""")
+    (program / "helpers.c").write_text("""\
+int header_helper(void) { return 10; }
+int header_macro(void) { return 20; }
+int header_pointer(void) { return 30; }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    domains = dict(conn.execute(
+        "SELECT path,call_domain FROM files WHERE path LIKE 'scripts/host-tool/%'"))
+    calls = {row["callee"]: (row["callee_id"], row["resolution"])
+             for row in conn.execute(
+                 "SELECT c.callee,c.callee_id,c.resolution FROM calls c"
+                 " JOIN symbols caller ON caller.id=c.caller_id"
+                 " WHERE caller.name='analyze'")}
+    conn.close()
+
+    domain = "program:scripts/host-tool:analyzer"
+    assert domains["scripts/host-tool/main.c"] == domain
+    assert domains["scripts/host-tool/helpers.c"] == domain
+    assert calls == {
+        "header_helper": (None, "ambiguous"),
+        "header_macro": (None, "ambiguous"),
+        "header_pointer": (None, "ambiguous"),
+    }
+
+
+def test_boot_image_companions_share_a_domain_separate_from_vmlinux(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    boot = tree / "arch" / "x86" / "boot"
+    boot.mkdir(parents=True)
+    (boot / "main.c").write_text("""\
+int detect_memory(void);
+int main(void) { return detect_memory(); }
+""")
+    (boot / "memory.c").write_text(
+        "int detect_memory(void) { return 1; }\n")
+    kernel = tree / "kernel"
+    kernel.mkdir()
+    (kernel / "memory.c").write_text(
+        "int detect_memory(void) { return 2; }\n")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    domains = dict(conn.execute(
+        "SELECT path,call_domain FROM files WHERE path LIKE 'arch/x86/boot/%'"))
+    call = conn.execute(
+        "SELECT c.resolution,target_file.path FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " JOIN files target_file ON target_file.id=target.file_id"
+        " WHERE caller.name='main' AND c.callee='detect_memory'").fetchone()
+    conn.close()
+
+    assert domains["arch/x86/boot/main.c"] == "image:arch:x86:boot"
+    assert domains["arch/x86/boot/memory.c"] == "image:arch:x86:boot"
+    assert tuple(call) == ("unique_global", "arch/x86/boot/memory.c")
+
+
+@pytest.mark.parametrize("name", [
+    "hostprogs", "host-progs", "userprogs", "hostprogs-always-y",
+    "hostprogs-always-m", "userprogs-always-$(CONFIG_CC_CAN_LINK)",
+])
+def test_kbuild_program_list_names_are_recognized(name):
+    assert indexer._is_program_list(name)
+
+
+@pytest.mark.parametrize("name", [
+    "hostprogs-installed", "userprogs-always-n", "obj-y", "always-y",
+])
+def test_unrelated_kbuild_lists_are_not_programs(name):
+    assert not indexer._is_program_list(name)
+
+
+def test_pure_kbuild_addprefix_object_list_is_expanded():
+    values = {
+        "libfdt-objs": ["fdt.o fdt_ro.o"],
+        "libfdt": ["$(addprefix libfdt/,$(libfdt-objs))"],
+        "fdtoverlay-objs": ["fdtoverlay.o $(libfdt)"],
+    }
+    assert indexer._expand_make_value(
+        " ".join(values["fdtoverlay-objs"]), values
+    ) == "fdtoverlay.o libfdt/fdt.o libfdt/fdt_ro.o"
+
+
+@pytest.mark.parametrize("name", [
+    "obj-y", "obj-$(CONFIG_TEST)", "lib-m", "module-objs", "module-y",
+    "module-$(CONFIG_TEST)", "always-y",
+])
+def test_kbuild_compile_link_object_lists_are_recognized(name):
+    assert indexer._is_kbuild_object_list(name)
+
+
+@pytest.mark.parametrize("name", [
+    "clean-files", "targets", "ccflags-y", "subdir-ccflags-y", "CFLAGS_x.o",
+])
+def test_non_build_object_lists_are_not_compile_evidence(name):
+    assert not indexer._is_kbuild_object_list(name)

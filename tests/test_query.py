@@ -1,5 +1,7 @@
 import sqlite3
 
+import pytest
+
 from kernel_atlas import db, query
 from kernel_atlas.cli import _frames_from_text
 
@@ -78,6 +80,29 @@ def test_resolve_qualified_symbol(conn):
     assert t.path == "fs/ext4/inode.c" and t.is_exported
 
 
+def test_resolve_qualified_duplicate_symbol_reports_line_ambiguity(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "duplicate-qualified.db"
+    shutil.copy(mini_index, copied)
+    writer = db.connect(copied, readonly=False)
+    row = writer.execute(
+        "SELECT file_id,name,kind,start_line,end_line,signature,is_static,"
+        " is_inline,is_exported FROM symbols WHERE name='ext4_bmap'"
+    ).fetchone()
+    writer.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        " is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        (*row[:3], row[3] + 100, row[4] + 100, *row[5:]))
+    writer.commit()
+
+    resolved = query.resolve(writer, "fs/ext4/inode.c:ext4_bmap")
+    writer.close()
+    assert len(resolved.candidates) == 1
+    assert "use path:line" in resolved.note
+
+
 def test_resolve_bare_symbol(conn):
     t = query.resolve(conn, "ext4_get_block").target
     assert t.kind == "symbol" and t.path == "fs/ext4/inode.c"
@@ -113,6 +138,31 @@ def test_exact_file_with_unknown_symbol_gives_a_precise_error(conn):
     res = query.resolve(conn, "fs/ext4/inode.c:not_a_real_fn")
     assert res.target is None
     assert "defines no symbol" in res.note and "fs/ext4/inode.c" in res.note
+
+
+def test_path_qualified_symbol_does_not_discard_wrong_directories(conn):
+    res = query.resolve(conn, "wrong/place/super.c:btrfs_mount")
+    assert res.target is None
+
+    # Basename-only qualification remains an intentional disambiguation form.
+    assert query.resolve(conn, "super.c:btrfs_mount").target.path == \
+        "fs/btrfs/super.c"
+
+
+@pytest.mark.parametrize("spec", [
+    "fs/ext4/inode.c:0", "fs/ext4/inode.c:-1", "missing.c:0",
+    "wrong/place.c:-1", ":0",
+])
+def test_qualified_line_numbers_must_be_positive(conn, spec):
+    res = query.resolve(conn, spec)
+    assert res.target is None
+    assert "at least 1" in res.note
+
+
+def test_qualified_line_number_must_fit_sqlite_integer(conn):
+    res = query.resolve(conn, "fs/ext4/inode.c:" + "9" * 100)
+    assert res.target is None
+    assert "too large" in res.note
 
 
 def test_syscall_definitions_have_call_edges(conn):
@@ -218,6 +268,31 @@ def test_limit(conn):
     assert len(sib(conn, "fs/ext4/inode.c:ext4_bmap", limit=2)) <= 2
 
 
+def test_bounded_symbol_listing_uses_the_final_tie_break_order(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "bounded-order.db"
+    shutil.copy(mini_index, copied)
+    writer = db.connect(copied, readonly=False)
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='fs/ext4/inode.c'").fetchone()[0]
+    writer.executemany(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line)"
+        " VALUES (?,'aaa_conditional','function',?,?)",
+        [(file_id, line, line) for line in range(12, 0, -1)])
+    writer.commit()
+    target = query.resolve(writer, "fs/ext4/inode.c").target
+    scope = query.build_scope(writer, target, "file")
+
+    entries = query.collect(
+        writer, scope, ("function",), limit=3, sort="name")
+    writer.close()
+    conditional = [entry for entry in entries
+                   if entry.name == "aaa_conditional"]
+    assert [entry.line for entry in conditional] == [1, 2, 3]
+
+
 def test_limit_counts_siblings_not_the_target(mini_index, capsys):
     """`-n 3` must return three *other* functions, not two plus the target.
 
@@ -260,6 +335,42 @@ def test_ancestry_walks_the_path(conn):
     assert "fs" in anc
 
 
+def test_mixed_directory_has_no_invented_single_owner(conn):
+    directory = query.resolve(conn, "fs").target
+    assert query.subsystem_for_target(conn, directory) is None
+    assert query.directory_subsystem_label(conn, directory.id, directory.path) == \
+        "Filesystems (mixed; includes unclassified)"
+
+
+def test_directory_label_detects_files_with_no_maintainers_match(tmp_path):
+    conn = db.create(tmp_path / "unclaimed.db")
+    conn.executemany(
+        "INSERT INTO dirs(id,path,parent_id,name,depth,n_files,n_files_recursive)"
+        " VALUES (?,?,?,?,?,?,?)", [
+            (1, "", None, "linux", 0, 0, 2),
+            (2, "drivers", 1, "drivers", 1, 2, 2),
+        ])
+    conn.executemany(
+        "INSERT INTO files(id,path,dir_id,name,index_status) VALUES (?,?,?,?,?)",
+        [(1, "drivers/owned.c", 2, "owned.c", "parsed"),
+         (2, "drivers/unowned.c", 2, "unowned.c", "parsed")])
+    conn.execute(
+        "INSERT INTO subsystems(id,name,n_files,n_primary_files)"
+        " VALUES (0,'OWNER',1,1)")
+    conn.execute(
+        "INSERT INTO path_subsys"
+        " (ref_kind,ref_id,subsystem_id,score,rank,is_primary)"
+        " VALUES ('file',1,0,10,0,1)")
+    conn.execute(
+        "INSERT INTO dir_subsys"
+        " (dir_id,subsystem_id,n_claimed,n_primary,coverage,rank)"
+        " VALUES (2,0,1,1,0.5,0)")
+
+    assert query.directory_subsystem_label(conn, 2, "drivers") == \
+        "Device drivers (mixed; includes unclassified)"
+    conn.close()
+
+
 def test_resolve_missing(conn):
     res = query.resolve(conn, "definitely_not_here_xyz")
     assert res.target is None and "nothing in the index" in res.note
@@ -284,6 +395,32 @@ def test_call_graph(conn):
     t = query.resolve(conn, "fs/ext4/inode.c:ext4_bmap").target
     assert "ext4_get_block" in query.callees(conn, t.id)
     assert "ext4_bmap" in names(query.callers(conn, "ext4_get_block"))
+
+    callee = query.resolve(conn, "fs/ext4/inode.c:ext4_get_block").target
+    inbound = query.callers(conn, callee.id)
+    assert inbound[0].resolution == "same_file"
+
+
+def test_callers_string_api_rejects_ambiguous_callable_identity(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "ambiguous-caller.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    row = conn.execute(
+        "SELECT file_id,name,kind,start_line,end_line,signature,is_static,"
+        " is_inline,is_exported FROM symbols WHERE name='ext4_get_block'"
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        " is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        (*row[:3], row[3] + 100, row[4] + 100, *row[5:]))
+    conn.commit()
+
+    with pytest.raises(ValueError, match="pass a concrete symbol id"):
+        query.callers(conn, "ext4_get_block")
+    conn.close()
 
 
 def test_backtrace_frame_extraction():
@@ -322,6 +459,18 @@ def test_documentation_claimed_by_subsystem_and_by_path(conn):
     mm = query.resolve(conn, "mm").target
     paths = [e.path for e in query.documentation_for(conn, mm)]
     assert paths[0] == "Documentation/mm/page_alloc.rst"
+
+    futex = query.resolve(conn, "kernel/futex").target
+    subsystem = query.subsystem_for_target(conn, futex)
+    assert subsystem["name"] == "FUTEX SUBSYSTEM"
+    paths = [e.path for e in query.documentation_for(conn, futex)]
+    assert "Documentation/locking/futex.rst" in paths
+
+
+def test_documentation_does_not_fall_back_to_generic_top_level_tokens(conn):
+    driver = query.resolve(
+        conn, "drivers/net/ethernet/intel/igb/igb_main.c").target
+    assert query.documentation_for(conn, driver) == []
 
 
 def test_documentation_fallback_includes_a_top_level_named_document(

@@ -33,6 +33,13 @@ L:\tlinux-mm@kvack.org
 S:\tMaintained
 F:\tmm/
 
+FUTEX SUBSYSTEM
+M:\tFutex Maintainer <futex@example.com>
+L:\tlinux-kernel@vger.kernel.org
+S:\tMaintained
+F:\tkernel/futex/*
+F:\tDocumentation/locking/*futex*
+
 NETWORKING [IPv4/IPv6]
 M:\tDavid S. Miller <davem@davemloft.net>
 L:\tnetdev@vger.kernel.org
@@ -212,6 +219,7 @@ FILES: dict[str, str] = {
     "fs/btrfs/super.c": "int btrfs_mount(void) { return 0; }\n",
     "mm/page_alloc.c": MM_PAGE_ALLOC_C,
     "mm/slab.c": "void *kmalloc(size_t n) { return NULL; }\n",
+    "kernel/futex/core.c": "int futex_wait(void) { return 0; }\n",
     "net/ipv4/tcp.c": NET_TCP_C,
     "net/ipv4/udp.c": "int udp_sendmsg(void) { return 0; }\n",
     "net/core/dev.c": "int netif_rx(void) { return 0; }\n",
@@ -222,6 +230,7 @@ FILES: dict[str, str] = {
     "arch/x86/mm/fault.c": "void do_page_fault(void) { }\n",
     "Documentation/filesystems/ext4/about.rst": "ext4 docs\n",
     "Documentation/mm/page_alloc.rst": "page allocator\n",
+    "Documentation/locking/futex.rst": "futex locking documentation\n",
 }
 
 

@@ -12,7 +12,8 @@ from collections import Counter
 from .query import Entry
 
 COLUMNS = ("kind", "name", "path", "dir", "line", "span", "lines", "size",
-           "symbols", "subdirs", "files", "flags", "subsystem", "signature")
+           "symbols", "subdirs", "files", "flags", "subsystem", "signature",
+           "resolution")
 
 DEFAULT_COLUMNS = {
     "dir": ("kind", "name", "subdirs", "files"),
@@ -96,6 +97,8 @@ def cell(e: Entry, col: str) -> str:
         return e.subsystem or "-"
     if col == "signature":
         return e.signature or "-"
+    if col == "resolution":
+        return e.resolution or "-"
     return ""
 
 
@@ -164,6 +167,7 @@ def entry_dict(e: Entry, columns=None) -> dict:
         "n_subdirs": e.n_subdirs, "n_symbols": e.n_symbols,
         "is_static": e.is_static, "is_inline": e.is_inline,
         "is_exported": e.is_exported, "subsystem": e.subsystem,
+        "resolution": e.resolution,
     }
     if e.is_target:
         d["is_target"] = True

@@ -26,6 +26,7 @@ def test_sections_parse_with_tags():
     assert "Theodore Ts'o <tytso@mit.edu>" in ext4.maintainers
     assert "linux-ext4@vger.kernel.org" in ext4.lists
     assert "fs/ext4/" in ext4.files
+    assert ext4.websites == ["https://ext4.wiki.kernel.org"]
     assert ext4.web == "https://ext4.wiki.kernel.org"
 
 
@@ -44,6 +45,30 @@ def test_star_does_not_cross_a_slash():
     smap = build()
     assert "FILESYSTEMS (VFS and infrastructure)" in names(smap, "fs/open.c")
     assert "FILESYSTEMS (VFS and infrastructure)" not in names(smap, "fs/ext4/inode.c")
+
+
+def test_double_star_crosses_any_number_of_nested_components():
+    smap = SubsystemMap(parse_maintainers("""\
+DEEP FILES
+F: fs/**/*foo*.c
+"""))
+    assert names(smap, "fs/a/myfoo.c") == ["DEEP FILES"]
+    assert names(smap, "fs/a/b/c/foo_table.c") == ["DEEP FILES"]
+    assert names(smap, "fs/a/b/c/not-it.c") == []
+
+
+def test_double_star_exclusion_crosses_nested_components():
+    smap = SubsystemMap(parse_maintainers("""\
+DRIVERS EXCEPT GENERATED FILES
+F: drivers/
+X: drivers/**/generated/*
+"""))
+    assert names(smap, "drivers/net/device.c") == [
+        "DRIVERS EXCEPT GENERATED FILES"]
+    assert names(smap, "drivers/net/vendor/generated/table.c") == []
+    # get_maintainer disables the slash-depth check for the whole expression
+    # when it contains **, so the final translated star may cross too.
+    assert names(smap, "drivers/net/vendor/generated/deep/table.c") == []
 
 
 def test_shallow_driver_pattern():
@@ -73,6 +98,19 @@ def test_most_precise_section_ranks_first():
         "INTEL ETHERNET DRIVERS"
 
 
+def test_constraints_after_a_wildcard_increase_specificity():
+    smap = SubsystemMap(parse_maintainers("""\
+COMMON CLK FRAMEWORK
+F: Documentation/devicetree/bindings/clock/
+
+NXP IMX CLOCK DRIVERS
+F: Documentation/devicetree/bindings/clock/*imx*
+"""))
+    assert names(
+        smap, "Documentation/devicetree/bindings/clock/imx1-clock.yaml") == [
+            "NXP IMX CLOCK DRIVERS", "COMMON CLK FRAMEWORK"]
+
+
 def test_catch_all_ranks_last_but_still_matches():
     smap = build()
     got = names(smap, "some/random/path.c")
@@ -84,6 +122,30 @@ def test_exact_file_pattern():
     smap = build()
     assert "FILESYSTEMS (VFS and infrastructure)" in names(smap, "include/linux/fs.h")
     assert "FILESYSTEMS (VFS and infrastructure)" not in names(smap, "include/linux/mm.h")
+
+
+def test_literal_file_pattern_is_a_same_depth_prefix_like_get_maintainer():
+    smap = SubsystemMap(parse_maintainers("""\
+DRM PREFIX FAMILY
+F: include/drm/drm
+"""))
+    assert names(smap, "include/drm/drm_prime.h") == ["DRM PREFIX FAMILY"]
+    assert names(smap, "include/drm/other/drm_prime.h") == []
+
+
+def test_trailing_wildcard_directory_requires_and_may_cross_subdirectories():
+    smap = SubsystemMap(parse_maintainers("""\
+VFIO DEVICE-SPECIFIC
+F: drivers/vfio/pci/*/
+
+QUALCOMM PLATFORMS
+F: drivers/*/*/qcom/
+"""))
+    assert names(smap, "drivers/vfio/pci/vfio_pci.c") == []
+    assert names(smap, "drivers/vfio/pci/hisilicon/hisi_acc_vfio_pci.c") == [
+        "VFIO DEVICE-SPECIFIC"]
+    assert names(smap, "drivers/usb/typec/tcpm/qcom/qcom_pmic_typec.c") == [
+        "QUALCOMM PLATFORMS"]
 
 
 def test_top_level_area_descriptions():
@@ -153,3 +215,57 @@ N: imx
 """))
     assert names(smap, "arch/arm64/boot/dts/imx8mq.dts") == [
         "IMX PLATFORM", "GENERIC DEVICE TREE"]
+
+
+def test_sections_without_path_patterns_are_preserved_but_match_nothing():
+    sections = parse_maintainers("""\
+BCACHEFS
+M: Kent Overstreet <kent.overstreet@linux.dev>
+L: linux-bcachefs@vger.kernel.org
+S: Externally maintained
+
+BPF [MISC]
+L: bpf@vger.kernel.org
+S: Odd Fixes
+K: (?:\\b|_)bpf(?:\\b|_)
+""")
+    assert [section.name for section in sections] == ["BCACHEFS", "BPF [MISC]"]
+    assert [section.id for section in sections] == [0, 1]
+    assert sections[1].keywords == [r"(?:\b|_)bpf(?:\b|_)"]
+    assert names(SubsystemMap(sections), "kernel/bpf/syscall.c") == []
+
+
+def test_all_contact_and_workflow_metadata_values_are_preserved_in_order():
+    section = parse_maintainers("""\
+COMPLETE SUBSYSTEM
+M: Maintainer <maintainer@example.com>
+W: https://example.com/project
+W: https://example.com/source
+Q: https://patchwork.example.com/one
+Q: https://patchwork.example.com/two
+B: https://bugs.example.com/one
+B: mailto:bugs@example.com
+C: irc://irc.example.com/project
+C: https://chat.example.com/project
+P: Documentation/process/project.rst
+P: https://example.com/submitting-patches
+K: project_[a-z]+
+K: \\bPROJECT_FEATURE\\b
+""")[0]
+
+    assert section.websites == [
+        "https://example.com/project", "https://example.com/source"]
+    assert section.web == "https://example.com/project"
+    assert section.patchwork == [
+        "https://patchwork.example.com/one",
+        "https://patchwork.example.com/two",
+    ]
+    assert section.bugs == [
+        "https://bugs.example.com/one", "mailto:bugs@example.com"]
+    assert section.chats == [
+        "irc://irc.example.com/project", "https://chat.example.com/project"]
+    assert section.profiles == [
+        "Documentation/process/project.rst",
+        "https://example.com/submitting-patches",
+    ]
+    assert section.keywords == [r"project_[a-z]+", r"\bPROJECT_FEATURE\b"]

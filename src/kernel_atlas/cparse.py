@@ -75,9 +75,14 @@ _DECL_MACRO_QUERY_RE = (
     r"SIMPLE_DEV_PM_OPS|SOC_ENUM_SINGLE_DECL|"
     r"(?:LIST|HLIST|LLIST)_HEAD|RADIX_TREE)"
 )
+_ATTRIBUTE_MACRO_QUERY_RE = (
+    r"(?:DEVICE|DRIVER|BUS|CLASS|BIN|SENSOR_DEVICE|IIO_DEVICE|IIO_CONST)"
+    r"_[A-Z0-9_]+"
+)
 _INTERESTING_MACRO_QUERY_RE = (
     rf"^(?:EXPORT(?:_PER_CPU)?_SYMBOL(?:_GPL|_NS|_NS_GPL|_FOR_MODULES)?|"
-    rf"(?:COMPAT_)?SYSCALL_DEFINE[0-9]|{_DECL_MACRO_QUERY_RE})$")
+    rf"(?:COMPAT_)?SYSCALL_DEFINE[0-9]|{_DECL_MACRO_QUERY_RE}|"
+    rf"{_ATTRIBUTE_MACRO_QUERY_RE})$")
 _LOOP_MACRO_HEAD = re.compile(
     r"^(?:(?:[A-Za-z_]\w*_)?for_each\w*|endfor_\w*)\s*\(")
 _RECOVERED_DECL_PREFIX = re.compile(
@@ -91,6 +96,32 @@ _DECLARATION_SPECIFIERS = frozenset({
     "register", "inline", "_Bool", "_Atomic",
 })
 _NAME_WRAPPING_DECL_MACROS = frozenset({"__bootdata_preserved"})
+_GENERATED_ATTRIBUTE_MACROS: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(
+        r"^DEVICE_(?:ATTR(?:_(?:RW|RO|WO|ADMIN_RW|ADMIN_RO|RW_NAMED|"
+        r"RO_NAMED|WO_NAMED|IGNORE_LOCKDEP))?|(?:ULONG|INT|BOOL)_ATTR|"
+        r"STRING_ATTR_RO)$"), "dev_attr_"),
+    (re.compile(r"^DRIVER_ATTR_(?:RW|RO|WO|IGNORE_LOCKDEP)$"),
+     "driver_attr_"),
+    (re.compile(r"^BUS_ATTR_(?:RW|RO|WO)$"), "bus_attr_"),
+    (re.compile(r"^CLASS_ATTR_(?:RW|RO|WO|STRING)$"), "class_attr_"),
+    (re.compile(
+        r"^BIN_ATTR(?:_(?:RO|WO|RW|ADMIN_RO|ADMIN_RW|SIMPLE_RO|"
+        r"SIMPLE_ADMIN_RO))?$"), "bin_attr_"),
+    (re.compile(r"^SENSOR_DEVICE_ATTR(?:_2)?(?:_(?:RO|WO|RW))?$"),
+     "sensor_dev_attr_"),
+    (re.compile(r"^IIO_DEVICE_ATTR(?:_(?:RO|WO|RW|NAMED))?$"),
+     "iio_dev_attr_"),
+    (re.compile(r"^IIO_CONST_ATTR(?:_NAMED)?$"), "iio_const_attr_"),
+)
+_FIXED_GENERATED_ATTRIBUTE_MACROS = {
+    "IIO_CONST_ATTR_SAMP_FREQ_AVAIL":
+        "iio_const_attr_sampling_frequency_available",
+    "IIO_CONST_ATTR_INT_TIME_AVAIL":
+        "iio_const_attr_integration_time_available",
+    "IIO_CONST_ATTR_TEMP_OFFSET": "iio_const_attr_in_temp_offset",
+    "IIO_CONST_ATTR_TEMP_SCALE": "iio_const_attr_in_temp_scale",
+}
 
 # Alignment/section attributes written after a declarator. Without the
 # preprocessor these look exactly like the variable's name, e.g.
@@ -178,6 +209,10 @@ class Symbol:
     is_inline: bool = False
     is_exported: bool = False
     calls: tuple[str, ...] = ()
+    # Names invoked through a parameter or block-scope object.  They remain in
+    # ``calls`` so call-site coverage is complete, but must never be promoted
+    # to a same-named file/global function by the indexer.
+    indirect_calls: tuple[str, ...] = ()
 
 
 # Built lazily so each multiprocessing worker gets its own parser.
@@ -263,7 +298,12 @@ def _is_function_prototype(node) -> bool:
 
 
 def _lines(node) -> tuple[int, int]:
-    return node.start_point[0] + 1, node.end_point[0] + 1
+    start = node.start_point[0] + 1
+    # Tree-sitter ranges are half-open.  A node ending immediately after a
+    # newline points at column zero of the following line; reporting that as
+    # part of the symbol creates locations beyond a one-line file.
+    end = node.end_point[0] + (0 if node.end_point[1] == 0 else 1)
+    return start, max(start, end)
 
 
 def _starts_recovered_toplevel(src: bytes, node) -> bool:
@@ -405,6 +445,36 @@ def _macro_decl(src: bytes, node) -> tuple[str, str] | None:
     if name in _C_TYPE_KEYWORDS or name in _ATTRIBUTE_MACROS:
         return None
     return macro, name
+
+
+def _macro_shaped_declaration(text: str) -> tuple[str, list[str]] | None:
+    """A file-scope declaration whose surface syntax is one macro call."""
+    match = re.search(r"\b([A-Z][A-Z0-9_]+)\s*\(", text)
+    if match is None:
+        return None
+    allowed = {"static", "extern", "const", "volatile", "register"} | \
+        set(_ATTRIBUTE_MACROS)
+    if any(word not in allowed for word in text[:match.start()].split()):
+        return None
+    args = _split_macro_args(text, match.end() - 1)
+    return (match.group(1), args) if args is not None else None
+
+
+def _generated_attribute_decl(text: str) -> str | None:
+    """Source identity created by standard sysfs attribute macros."""
+    shaped = _macro_shaped_declaration(text)
+    if shaped is None:
+        return None
+    macro, args = shaped
+    if not args:
+        return None
+    if macro in _FIXED_GENERATED_ATTRIBUTE_MACROS:
+        return _FIXED_GENERATED_ATTRIBUTE_MACROS[macro]
+    for pattern, prefix in _GENERATED_ATTRIBUTE_MACROS:
+        if pattern.fullmatch(macro):
+            name = args[0].strip()
+            return prefix + name if name.isidentifier() else None
+    return None
 
 
 def _source_exports(src: bytes, root) -> set[str]:
@@ -1009,8 +1079,97 @@ def _recovery_gaps(src: bytes, functions: list,
     return unique
 
 
-def _collect_calls(src: bytes, node, end_byte: int | None = None) -> tuple[str, ...]:
-    """Callee names inside a function body.
+def _parameter_names(src: bytes, function) -> set[str]:
+    """Named parameters belonging to a function definition's outer list."""
+    if function.type != "function_definition":
+        return set()
+    declarator = function.child_by_field_name("declarator")
+    name = _declarator_name(declarator)
+    cur = name
+    function_declarator = None
+    for _ in range(64):
+        if cur is None:
+            break
+        if cur.type == "function_declarator":
+            function_declarator = cur
+            break
+        if cur is declarator:
+            break
+        cur = cur.parent
+    if function_declarator is None:
+        return set()
+    parameters = function_declarator.child_by_field_name("parameters")
+    if parameters is None:
+        return set()
+
+    names: set[str] = set()
+    for parameter in parameters.named_children:
+        if parameter.type in _IDENTIFIERS:
+            names.add(_text(src, parameter))
+            continue
+        if parameter.type != "parameter_declaration":
+            continue
+        declarators = parameter.children_by_field_name("declarator")
+        if not declarators:
+            declarator = parameter.child_by_field_name("declarator")
+            declarators = [declarator] if declarator is not None else []
+        for declarator in declarators:
+            name_node = _declarator_name(declarator)
+            if name_node is not None:
+                names.add(_text(src, name_node))
+    return names
+
+
+def _local_object_bindings(src: bytes, function, body,
+                           end_byte: int | None) -> dict[str, list[tuple[int, int]]]:
+    """Byte ranges where parameters or block-scope objects shadow functions.
+
+    A block-scope function prototype is deliberately excluded: it still names
+    a function.  Ordinary objects and function-pointer objects are blockers.
+    The range model also respects nested compounds and ``for`` initializer
+    scope, avoiding the common mistake of treating a later/sibling declaration
+    as if it shadowed the whole function.
+    """
+    limit = min(body.end_byte, end_byte) if end_byte is not None else body.end_byte
+    bindings: dict[str, list[tuple[int, int]]] = {}
+    for name in _parameter_names(src, function):
+        bindings.setdefault(name, []).append((body.start_byte, limit))
+
+    stack = list(reversed(body.named_children))
+    while stack:
+        current = stack.pop()
+        if current.start_byte >= limit:
+            continue
+        # Malformed input can place a recovered top-level function inside the
+        # preceding body.  Its declarations are not locals of this function.
+        if current.type == "function_definition":
+            continue
+        if current.type == "declaration":
+            for declarator in _safe_declarators(src, current):
+                if _is_function_prototype(declarator):
+                    continue
+                name_node = _declarator_name(declarator)
+                if name_node is None:
+                    continue
+                scope = current.parent
+                while scope is not None and scope is not body:
+                    if scope.type in ("for_statement", "compound_statement"):
+                        break
+                    scope = scope.parent
+                if scope is None:
+                    scope = body
+                scope_end = min(scope.end_byte, limit)
+                if name_node.end_byte < scope_end:
+                    bindings.setdefault(_text(src, name_node), []).append(
+                        (name_node.end_byte, scope_end))
+        stack.extend(reversed(current.named_children))
+    return bindings
+
+
+def _collect_call_details(src: bytes, node,
+                          end_byte: int | None = None
+                          ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Callee names and the subset bound to local objects in a function body.
 
     Accepts either a function_definition or a bare compound_statement — the
     latter is what SYSCALL_DEFINEn leaves us with, where the body is a sibling
@@ -1019,15 +1178,32 @@ def _collect_calls(src: bytes, node, end_byte: int | None = None) -> tuple[str, 
     body = node if node.type == "compound_statement" else \
         node.child_by_field_name("body")
     if body is None:
-        return ()
+        return (), ()
     cursor = QueryCursor(_CALL_QUERY)
     caps = cursor.captures(body)
     seen: dict[str, None] = {}
+    indirect: dict[str, None] = {}
+    direct: dict[str, None] = {}
+    bindings = _local_object_bindings(src, node, body, end_byte)
     for n in caps.get("callee", []):
         if end_byte is not None and n.start_byte >= end_byte:
             continue
-        seen.setdefault(_text(src, n), None)
-    return tuple(seen)
+        name = _text(src, n)
+        seen.setdefault(name, None)
+        if any(start <= n.start_byte < end
+               for start, end in bindings.get(name, ())):
+            indirect.setdefault(name, None)
+        else:
+            direct.setdefault(name, None)
+    # The calls table has one edge per caller/name.  If at least one spelling
+    # is a direct function call, preserve that useful edge; mark a name
+    # indirect only when every occurrence is bound to a local object.
+    return tuple(seen), tuple(name for name in indirect if name not in direct)
+
+
+def _collect_calls(src: bytes, node, end_byte: int | None = None) -> tuple[str, ...]:
+    """Compatibility wrapper returning every syntactically visible callee."""
+    return _collect_call_details(src, node, end_byte)[0]
 
 
 def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) -> list[Symbol]:
@@ -1090,11 +1266,12 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
         m = _SYSCALL_MACRO.match(_text(src, type_node)) if type_node is not None else None
         if m:
             if want_sys and name.isidentifier():
+                calls, indirect_calls = _collect_call_details(
+                    src, node, effective_end) if want_calls else ((), ())
                 symbols.append(Symbol(
                     name=_syscall_name(m, name), kind=SYSCALL,
                     start_line=start, end_line=end, signature=_squash(head),
-                    calls=_collect_calls(src, node, effective_end)
-                    if want_calls else (),
+                    calls=calls, indirect_calls=indirect_calls,
                 ))
             continue
 
@@ -1152,7 +1329,8 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
         if not single_named_arg \
                 and re.search(rf"\b{re.escape(name)}\s*\(", head) is None:
             continue
-        calls = ()
+        calls: tuple[str, ...] = ()
+        indirect_calls: tuple[str, ...] = ()
         if want_calls:
             if source_body_end is not None:
                 if range_call_nodes is None:
@@ -1161,8 +1339,14 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
                 calls = tuple(dict.fromkeys(
                     _text(src, call) for call in range_call_nodes
                     if source_body_start < call.start_byte < source_body_end))
+                # The recovered extension may not belong to the function's
+                # AST body, but bindings in the reliable prefix still block
+                # false direct-function promotion.
+                _, indirect_calls = _collect_call_details(
+                    src, node, effective_end)
             else:
-                calls = _collect_calls(src, node, effective_end)
+                calls, indirect_calls = _collect_call_details(
+                    src, node, effective_end)
         symbols.append(Symbol(
             name=name,
             kind=FUNCTION,
@@ -1172,7 +1356,7 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
                 head[signature_start:signature_end]),
             is_static="static" in prefix,
             is_inline=any(w in _INLINE_SPECIFIERS for w in prefix),
-            calls=calls,
+            calls=calls, indirect_calls=indirect_calls,
         ))
 
     for node in caps.get("macrocall", []):
@@ -1182,6 +1366,7 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
         if callee is None or callee.type != "identifier":
             continue
         macro = _text(src, callee)
+        text = _text(src, node)
 
         if _EXPORT_MACRO.match(macro):
             arg = _first_argument(src, node)
@@ -1199,13 +1384,29 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
             start = node.start_point[0] + 1
             end = body.end_point[0] + 1 if body is not None and \
                 body.type == "compound_statement" else node.end_point[0] + 1
+            calls, indirect_calls = _collect_call_details(
+                src, body) if want_calls and body is not None else ((), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, arg),
                 kind=SYSCALL,
                 start_line=start,
                 end_line=end,
                 signature=_squash(_text(src, node)),
-                calls=_collect_calls(src, body) if want_calls and body is not None else (),
+                calls=calls,
+                indirect_calls=indirect_calls,
+            ))
+            continue
+
+        generated_attribute = _generated_attribute_decl(text)
+        if generated_attribute is not None and want_var:
+            start, end = _lines(node)
+            line_start = src.rfind(b"\n", 0, node.start_byte) + 1
+            line_prefix = src[line_start:node.start_byte].decode(
+                "utf-8", "replace").split()
+            symbols.append(Symbol(
+                name=generated_attribute, kind=VARIABLE,
+                start_line=start, end_line=end, signature=_squash(text),
+                is_static="static" in line_prefix,
             ))
             continue
 
@@ -1233,10 +1434,12 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
             body = _following_compound(node)
             start = node.start_point[0] + 1
             end = body.end_point[0] + 1 if body is not None else node.end_point[0] + 1
+            calls, indirect_calls = _collect_call_details(
+                src, body) if want_calls and body is not None else ((), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, args[0]), kind=SYSCALL,
                 start_line=start, end_line=end, signature=_squash(text),
-                calls=_collect_calls(src, body) if want_calls and body is not None else (),
+                calls=calls, indirect_calls=indirect_calls,
             ))
 
     if want_var:
@@ -1356,6 +1559,22 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
                     end_line=end, signature=_squash(head),
                     is_static=is_static))
 
+            generated_attribute = _generated_attribute_decl(head)
+            if generated_attribute and VARIABLE in kinds:
+                symbols.append(Symbol(
+                    name=generated_attribute, kind=VARIABLE,
+                    start_line=start, end_line=end,
+                    signature=_squash(head), is_static=is_static))
+
+            # An unexpanded file-scope macro invocation is not a C variable
+            # declaration.  Tree-sitter recovery often presents its first
+            # argument as a declarator (DEVICE_ATTR_WO(undock) used to create
+            # a fictitious variable named ``undock``).  Standard attribute
+            # macros above retain the object name that the macro really
+            # generates; unknown shapes stay out of the index conservatively.
+            if macro_decl is None and _macro_shaped_declaration(head) is not None:
+                continue
+
             attribute_name = _attribute_declaration_name(head)
             if attribute_name and VARIABLE in kinds:
                 symbols.append(Symbol(
@@ -1457,6 +1676,9 @@ def parse_source(src: bytes, kinds: frozenset[str], want_calls: bool = False) ->
             prior.end_line = max(prior.end_line, sym.end_line)
         if sym.calls:
             prior.calls = tuple(dict.fromkeys((*prior.calls, *sym.calls)))
+        if sym.indirect_calls:
+            prior.indirect_calls = tuple(dict.fromkeys(
+                (*prior.indirect_calls, *sym.indirect_calls)))
 
     return ordered
 

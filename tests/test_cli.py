@@ -6,24 +6,38 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli, config
+from kernel_atlas import cli, config, db
 
 
 def _fake_index(root, version: str) -> None:
     d = root / "indexes"
     d.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(d / f"{version}.db")
-    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn = db.create(d / f"{version}.db")
     conn.executemany("INSERT INTO meta VALUES (?, ?)", [
+        ("schema_version", db.SCHEMA_VERSION),
         ("kernel_version", version),
         ("source", f"https://cdn.kernel.org/linux-{version}.tar.xz"),
         ("tree_path", str(root / "kernels" / f"linux-{version}")),
+        ("built_at", "2026-01-01T00:00:00"),
+        ("kinds", "function"),
+        ("has_calls", "0"),
+        ("n_dirs", "0"),
         ("n_files", "1"),
         ("n_symbols", "0"),
-        ("has_calls", "0"),
-        ("built_at", "2026-01-01T00:00:00"),
+        ("n_subsystems", "0"),
+        ("n_calls", "0"),
+        ("n_calls_resolved", "0"),
+        ("n_calls_ambiguous", "0"),
+        ("n_calls_macro", "0"),
+        ("n_calls_indirect", "0"),
+        ("n_calls_unresolved", "0"),
+        ("n_parse_skipped", "0"),
+        ("n_parse_failed", "0"),
+        ("n_oversize", "0"),
+        ("n_symlinks", "0"),
+        ("build_seconds", "0"),
     ])
-    conn.commit()
+    db.finalize(conn)
     conn.close()
 
 
@@ -58,13 +72,25 @@ def test_use_clear_and_both_args_rejected(home, capsys):
         cli.main(["use", "7.2", "--clear"])
 
 
-def test_index_selection_options_are_unambiguous(capsys):
+@pytest.mark.parametrize("argv", [
+    ["--db", "one.db", "--kernel", "6.12", "stats"],
+    ["--db", "one.db", "stats", "--kernel", "6.12"],
+])
+def test_index_selection_options_are_unambiguous(capsys, argv):
     with pytest.raises(SystemExit):
-        cli.main(["--db", "one.db", "--kernel", "6.12", "stats"])
+        cli.main(argv)
     assert "mutually exclusive" in capsys.readouterr().err
 
+
+@pytest.mark.parametrize("argv", [
+    ["--kernel", "6.12", "indexes"],
+    ["indexes", "--db", "ignored.db"],
+    ["build", "--kernel", "6.12"],
+    ["--db", "ignored.db", "versions"],
+])
+def test_index_selectors_are_rejected_where_they_have_no_effect(capsys, argv):
     with pytest.raises(SystemExit):
-        cli.main(["indexes", "--db", "ignored.db"])
+        cli.main(argv)
     assert "does not apply" in capsys.readouterr().err
 
 
@@ -91,6 +117,31 @@ def test_use_rejects_unknown_and_ambiguous_versions(home, capsys):
     with pytest.raises(SystemExit):
         cli.main(["use", "6"])
     assert "ambiguous" in capsys.readouterr().err
+
+
+def test_use_rejects_an_unusable_index_before_pinning(home, capsys):
+    broken = home / "indexes" / "broken.db"
+    broken.write_bytes(b"")
+
+    with pytest.raises(SystemExit):
+        cli.main(["use", "broken"])
+    assert config.get_default_version() is None
+    assert "not a usable index" in capsys.readouterr().err
+
+
+def test_index_status_surfaces_a_pinned_corrupt_index(home, capsys):
+    broken = home / "indexes" / "broken.db"
+    broken.write_bytes(b"")
+    config.set_default_version("broken")
+
+    assert cli.main(["indexes"]) == 0
+    listing = capsys.readouterr().out
+    assert "broken" in listing and "unusable:" in listing
+
+    with pytest.raises(SystemExit):
+        cli.main(["use"])
+    err = capsys.readouterr().err
+    assert "active index" in err and "not usable" in err
 
 
 def test_version_prefix_is_component_aware():
@@ -194,7 +245,11 @@ def test_remove_source_uses_recorded_version_not_filename_alias(
     unrelated = tmp_path / "kernels" / "linux-alias"
     unrelated.mkdir()
     conn = sqlite3.connect(alias_index)
-    conn.execute("UPDATE meta SET value=? WHERE key='tree_path'", (str(managed),))
+    conn.executemany("UPDATE meta SET value=? WHERE key=?", [
+        (str(managed), "tree_path"),
+        ("https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz",
+         "source"),
+    ])
     conn.commit()
     conn.close()
 
@@ -203,6 +258,48 @@ def test_remove_source_uses_recorded_version_not_filename_alias(
     assert not managed.exists()
     assert unrelated.is_dir()
     assert "removed source" in capsys.readouterr().out
+
+
+def test_invalid_metadata_only_database_cannot_authorize_source_removal(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    managed = tmp_path / "kernels" / "linux-9.9"
+    managed.mkdir(parents=True)
+    forged = tmp_path / "forged.db"
+    conn = sqlite3.connect(forged)
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+    conn.executemany("INSERT INTO meta VALUES (?,?)", [
+        ("schema_version", db.SCHEMA_VERSION),
+        ("kernel_version", "9.9"),
+        ("tree_path", str(managed)),
+    ])
+    conn.commit()
+    conn.close()
+
+    assert cli._managed_source_recorded_by(forged) is None
+    assert managed.is_dir()
+
+
+def test_remove_source_never_deletes_a_custom_tree_at_the_cache_path(
+        mini_index, tmp_path, monkeypatch, capsys):
+    import shutil
+
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    indexes = tmp_path / "indexes"
+    indexes.mkdir()
+    custom_index = indexes / "custom.db"
+    shutil.copy(mini_index, custom_index)
+    custom_tree = tmp_path / "kernels" / "linux-6.12.104"
+    custom_tree.mkdir(parents=True)
+    conn = sqlite3.connect(custom_index)
+    conn.executemany("UPDATE meta SET value=? WHERE key=?", [
+        (str(custom_tree), "tree_path"), (str(custom_tree), "source")])
+    conn.commit()
+    conn.close()
+
+    assert cli.main(["remove", "custom", "--source"]) == 0
+    assert custom_tree.is_dir()
+    assert "source kept" in capsys.readouterr().out
 
 
 def test_remove_rejects_path_shaped_versions_without_deleting(home, capsys):
@@ -252,6 +349,31 @@ def test_negative_limit_is_rejected(capsys):
     assert ">= 0" in err or "invalid" in err.lower()
 
 
+def test_huge_target_line_is_a_clean_error(mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "info",
+                  "fs/ext4/inode.c:" + "9" * 100])
+    assert "too large" in capsys.readouterr().err
+
+
+def test_find_rejects_size_sort_for_symbols(mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "find", "ext4", "--sort", "size"])
+    assert "use --sort lines" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [
+    ["siblings", "ext4_bmap", "--sort", "size"],
+    ["ls", "fs/ext4/inode.c", "--sort", "size"],
+    ["calls", "fs/ext4/inode.c:ext4_bmap", "--sort", "size"],
+])
+def test_every_symbol_only_listing_rejects_size_sort(
+        mini_index, capsys, command):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), *command])
+    assert "use --sort lines" in capsys.readouterr().err
+
+
 def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
     import json
     assert cli.main(["--db", str(mini_index), "info", "mm", "-f", "json"]) == 0
@@ -261,6 +383,54 @@ def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
     assert "MEMORY MANAGEMENT" in names
     assert "elixir.bootlin.com" in data["links"]["elixir"]
     assert "is_static" not in data["target"]
+
+
+def test_co_primary_file_owners_are_explicit_in_info_and_relationships(
+        mini_index, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "co-primary.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='fs/ext4/inode.c'").fetchone()[0]
+    owner_id, score = writer.execute(
+        "SELECT subsystem_id,score FROM path_subsys"
+        " WHERE ref_kind='file' AND ref_id=? AND is_primary=1", (file_id,)
+    ).fetchone()
+    other_id = writer.execute(
+        "SELECT id FROM subsystems WHERE name='FILESYSTEMS (VFS and infrastructure)'"
+    ).fetchone()[0]
+    rank = writer.execute(
+        "SELECT MAX(rank)+1 FROM path_subsys WHERE ref_kind='file' AND ref_id=?",
+        (file_id,),
+    ).fetchone()[0]
+    writer.execute(
+        "INSERT INTO path_subsys(ref_kind,ref_id,subsystem_id,score,rank,is_primary)"
+        " VALUES ('file',?,?,?,?,1)", (file_id, other_id, score, rank))
+    writer.execute(
+        "UPDATE subsystems SET n_files=n_files+1,n_primary_files=n_primary_files+1"
+        " WHERE id=?", (other_id,))
+    writer.commit()
+    writer.close()
+
+    assert cli.main(["--db", str(copied), "info", "fs/ext4/inode.c",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    primary = [row for row in data["subsystems"] if row["is_primary"]]
+    assert {row["name"] for row in primary} == {
+        "EXT4 FILE SYSTEM", "FILESYSTEMS (VFS and infrastructure)"}
+    assert all("match_score" in row and "match_rank" in row for row in primary)
+
+    assert cli.main(["--db", str(copied), "find", "ext4_bmap", "--exact"]) == 0
+    assert "Co-owned (2 subsystems)" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "relationships", "fs/ext4/inode.c"])
+    error = capsys.readouterr().err
+    assert "co-primary" in error
+    assert "EXT4 FILE SYSTEM" in error
     assert "is_inline" not in data["target"]
     assert "is_exported" not in data["target"]
 
@@ -270,6 +440,182 @@ def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
     assert symbol["is_static"] is False
     assert symbol["is_inline"] is False
     assert symbol["is_exported"] is True
+
+
+def test_info_reports_complete_path_facts_and_truthful_linkage(
+        mini_index, mini_tree, tmp_path, capsys):
+    import json
+    import shutil
+
+    assert cli.main(["--db", str(mini_index), "info", "fs/ext4/inode.c",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    target = data["target"]
+    assert target["size"] > 0 and target["lines"] > 0
+    assert target["n_symbols"] > 0
+    assert target["symbols_by_kind"]["function"] > 0
+    assert target["index_status"] == "parsed"
+    assert target["index_error"] is None
+    assert target["is_symlink"] is False and target["link_target"] is None
+    assert data["source_path"] == str(mini_tree / "fs/ext4/inode.c")
+
+    assert cli.main(["--db", str(mini_index), "info", "fs/ext4/inode.c"]) == 0
+    assert "index status parsed" in " ".join(capsys.readouterr().out.split())
+
+    assert cli.main(["--db", str(mini_index), "info", "fs/ext4", "-f",
+                     "json"]) == 0
+    directory = json.loads(capsys.readouterr().out)["target"]
+    assert directory["n_files"] == 3
+    assert directory["n_subdirs"] == 0
+    assert directory["n_files_subtree"] == 3
+
+    assert cli.main(["--db", str(mini_index), "info", "ext4_bmap"]) == 0
+    assert "exported to modules" in capsys.readouterr().out
+
+    assert cli.main(["--db", str(mini_index), "info",
+                     "fs/ext4/super.c:ext4_sb_info"]) == 0
+    assert "linkage" not in capsys.readouterr().out
+
+    assert cli.main(["--db", str(mini_index), "info",
+                     "fs/ext4/super.c:ext4_sb_info", "-f", "json"]) == 0
+    aggregate = json.loads(capsys.readouterr().out)["target"]
+    assert "linkage" not in aggregate and "is_static" not in aggregate
+
+    status_index = tmp_path / "status.db"
+    shutil.copy(mini_index, status_index)
+    writer = sqlite3.connect(status_index)
+    writer.execute(
+        "UPDATE files SET is_symlink=1, link_target='target.h', "
+        "index_status='read_error', index_error='permission denied' "
+        "WHERE path='fs/ext4/inode.c'")
+    writer.commit()
+    writer.close()
+    assert cli.main(["--db", str(status_index), "info", "fs/ext4/inode.c",
+                     "-f", "json"]) == 0
+    status = json.loads(capsys.readouterr().out)["target"]
+    assert status["is_symlink"] is True and status["link_target"] == "target.h"
+    assert status["index_status"] == "read_error"
+    assert status["index_error"] == "permission denied"
+
+
+def test_info_root_and_directory_listings_do_not_invent_plurality_owners(
+        mini_index, capsys):
+    import json
+
+    assert cli.main(["--db", str(mini_index), "info", ".", "-f", "json"]) == 0
+    root = json.loads(capsys.readouterr().out)
+    assert root["target"]["n_files_subtree"] > 0
+    assert root["n_subsystems"] > 1
+
+    assert cli.main(["--db", str(mini_index), "ls", ".", "--kinds", "dir",
+                     "-S", "-f", "json"]) == 0
+    entries = json.loads(capsys.readouterr().out)
+    fs = next(row for row in entries if row["path"] == "fs")
+    assert fs["subsystem"] == "Filesystems (mixed; includes unclassified)"
+
+
+def test_info_reports_a_file_with_no_maintainers_match_even_with_an_area(
+        mini_index, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "unmatched.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='mm/page_alloc.c'").fetchone()[0]
+    writer.execute(
+        "DELETE FROM path_subsys WHERE ref_kind='file' AND ref_id=?",
+        (file_id,))
+    writer.commit()
+    writer.close()
+
+    assert cli.main(["--db", str(copied), "info", "mm/page_alloc.c",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["area"]["name"] == "Memory management"
+    assert data["unclassified_ownership"]["unmatched"] is True
+    assert data["unclassified_ownership"]["maintainers_section"] is None
+
+    assert cli.main(["--db", str(copied), "info", "mm/page_alloc.c"]) == 0
+    assert "no primary MAINTAINERS match" in capsys.readouterr().out
+
+
+def test_info_and_path_distinguish_a_missing_recorded_source_member(
+        mini_index, mini_tree, tmp_path, capsys):
+    import json
+    import shutil
+
+    tree = tmp_path / "linux-copy"
+    shutil.copytree(mini_tree, tree)
+    copied = tmp_path / "missing-member.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute("UPDATE meta SET value=? WHERE key='tree_path'", (str(tree),))
+    writer.commit()
+    writer.close()
+    (tree / "mm/page_alloc.c").unlink()
+
+    assert cli.main(["--db", str(copied), "info", "mm/page_alloc.c",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["source_path"] == str(tree / "mm/page_alloc.c")
+    assert data["source_exists"] is False
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "path", "mm/page_alloc.c"])
+    assert "missing from the source tree" in capsys.readouterr().err
+
+
+def test_cli_normalizes_only_absolute_targets_inside_the_recorded_tree(
+        mini_index, mini_tree, tmp_path, capsys):
+    import json
+
+    source = mini_tree / "fs/ext4/inode.c"
+    assert cli.main(["--db", str(mini_index), "info", str(source),
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["target"]["path"] == "fs/ext4/inode.c"
+
+    assert cli.main(["--db", str(mini_index), "locate", str(source),
+                     "-f", "json"]) == 0
+    located = json.loads(capsys.readouterr().out)
+    assert located[0]["found"] and located[0]["path"] == "fs/ext4/inode.c"
+
+    assert cli.main(["--db", str(mini_index), "info", f"{source}:3",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["target"]["name"] == "ext4_inode_blocks_set"
+
+    outside = tmp_path / "inode.c"
+    outside.write_text("not the indexed file\n")
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "info",
+                  f"{outside}:ext4_bmap"])
+    assert "outside the recorded source tree" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "info",
+                  "wrong/place/inode.c:ext4_bmap"])
+    assert "nothing in the index matches" in capsys.readouterr().err
+
+
+def test_absolute_target_normalization_preserves_an_indexed_symlink_leaf(
+        tmp_path):
+    tree = tmp_path / "linux-9.9"
+    target = tree / "Documentation/process/changes.rst"
+    target.parent.mkdir(parents=True)
+    target.write_text("changes\n")
+    (tree / "MAINTAINERS").write_text("TEST\nF: Documentation/\n")
+    link = tree / "Documentation/Changes"
+    try:
+        link.symlink_to("process/changes.rst")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    normalized = cli._normalize_target_spec(
+        {"tree_path": str(tree), "kernel_version": "9.9"}, str(link))
+    assert normalized == "Documentation/Changes"
 
 
 def test_web_and_docs_commands(mini_index, capsys):
@@ -323,10 +669,84 @@ def test_subsystem_json_omits_files_unless_asked(mini_index, capsys):
                      "-f", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert "files" not in data
+    assert data["index"] == "6.12.104"
+    assert data["directories"]
+    assert data["directories"][0]["primary_files"] > 0
     assert cli.main(["--db", str(mini_index), "subsystem", "EXT4 FILE SYSTEM",
                      "-f", "json", "--files"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert any(p.endswith("inode.c") for p in data["files"])
+
+    assert cli.main(["--db", str(mini_index), "subsystems", "-n", "1",
+                     "-f", "json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed[0]["index"] == "6.12.104"
+
+
+def test_relationships_reports_identity_aware_call_flow(mini_index, capsys):
+    import json
+
+    assert cli.main([
+        "--db", str(mini_index), "relationships", "fs/ext4",
+        "--include-internal", "--direction", "outgoing", "-f", "json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["subsystem"]["name"] == "EXT4 FILE SYSTEM"
+    assert payload["subsystem"]["primary_files"] > 0
+    assert payload["call_graph_available"] is True
+    assert payload["outgoing_call_resolution"]["total"] >= 3
+    assert payload["outgoing_call_resolution"]["resolved"] >= 3
+    assert payload["call_flows"] == [{
+        "direction": "outgoing",
+        "subsystem": "EXT4 FILE SYSTEM",
+        "edges": 3,
+        "callers": 3,
+        "callees": 3,
+        "source_files": 2,
+        "target_files": 2,
+        "internal": True,
+        "unclassified": False,
+    }]
+
+
+def test_relationships_csv_is_a_stable_machine_view(mini_index, capsys):
+    assert cli.main([
+        "--db", str(mini_index), "rels", "EXT4 FILE SYSTEM",
+        "--include-internal", "--direction", "outgoing", "--via", "calls",
+        "-f", "csv",
+    ]) == 0
+    import csv
+    import io
+
+    rows = list(csv.DictReader(io.StringIO(capsys.readouterr().out)))
+    assert rows[0]["relationship"] == "call"
+    assert rows[0]["selected_subsystem"] == "EXT4 FILE SYSTEM"
+    assert rows[0]["source_subsystem"] == "EXT4 FILE SYSTEM"
+    assert rows[0]["target_subsystem"] == "EXT4 FILE SYSTEM"
+    assert rows[0]["edges"] == "3"
+
+
+def test_relationships_rejects_ambiguous_and_mixed_targets(mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "relationships", "super.c"])
+    assert "ambiguous" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "relationships", "fs"])
+    assert "mixed ownership" in capsys.readouterr().err
+
+
+def test_relationships_rejects_options_without_effect(mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "relationships", "fs/ext4",
+                  "--via", "ownership", "--direction", "incoming"])
+    assert "apply only to call" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "relationships", "fs/ext4",
+                  "--via", "calls", "--min-shared", "2"])
+    assert "applies only to ownership" in capsys.readouterr().err
 
 
 def test_locate_lists_every_built_index(mini_index, tmp_path, monkeypatch, capsys):
@@ -488,6 +908,40 @@ def test_subsystem_ambiguity_is_valid_json(mini_index, capsys):
     assert data["index"] == "6.12.104"
 
 
+def test_casefold_colliding_subsystem_names_are_never_chosen_arbitrarily(
+        mini_index, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "casefold.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    next_id = writer.execute("SELECT MAX(id)+1 FROM subsystems").fetchone()[0]
+    writer.executemany("INSERT INTO subsystems(id,name) VALUES (?,?)", [
+        (next_id, "FOO"), (next_id + 1, "foo")])
+    writer.commit()
+    writer.close()
+
+    assert cli.main(["--db", str(copied), "subsystem", "FoO",
+                     "-f", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["ambiguous"] is True
+    assert {row["name"] for row in data["matches"]} == {"FOO", "foo"}
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "relationships", "FoO"])
+    assert "ambiguous under case-insensitive" in capsys.readouterr().err
+
+
+def test_subsystem_no_match_hint_preserves_selector_and_shell_quotes(
+        mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "subsystem", "not here"])
+    error = capsys.readouterr().err
+    assert f"--db {mini_index.resolve()}" in error
+    assert "--grep 'not here'" in error
+
+
 def test_listing_json_columns_shape_each_row(mini_index, capsys):
     import json
 
@@ -525,6 +979,197 @@ def test_calls_rejects_non_function_targets(mini_index, capsys):
     assert "not a function or syscall" in capsys.readouterr().err
 
 
+def test_no_call_graph_rebuild_hints_target_the_selected_custom_database(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "without-calls.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute("DELETE FROM calls")
+    writer.execute(
+        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+    writer.commit()
+    tree = writer.execute(
+        "SELECT value FROM meta WHERE key='tree_path'").fetchone()[0]
+    writer.close()
+
+    for command in (
+            ["calls", "ext4_bmap"],
+            ["relationships", "EXT4 FILE SYSTEM", "--via", "calls"]):
+        with pytest.raises(SystemExit):
+            cli.main(["--db", str(copied), *command])
+        error = capsys.readouterr().err
+        assert "--with-calls --force" in error
+        assert f"--output {copied.resolve()}" in error
+        assert f"--src {tree}" in error
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_no_call_graph_rebuild_hint_preserves_a_selected_filename_alias(
+        mini_index, tmp_path, monkeypatch, capsys, pinned):
+    import shutil
+
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    indexes = tmp_path / "indexes"
+    indexes.mkdir()
+    selected = indexes / "study.db"
+    shutil.copy(mini_index, selected)
+    writer = sqlite3.connect(selected)
+    writer.execute("DELETE FROM calls")
+    writer.execute(
+        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+    tree = writer.execute(
+        "SELECT value FROM meta WHERE key='tree_path'").fetchone()[0]
+    writer.commit()
+    writer.close()
+
+    selector = [] if pinned else ["-K", "study"]
+    if pinned:
+        config.set_default_version("study")
+    with pytest.raises(SystemExit):
+        cli.main([*selector, "calls", "ext4_bmap"])
+    error = capsys.readouterr().err
+    assert f"--output {selected.resolve()}" in error
+    assert f"--src {tree}" in error
+    assert "build 6.12.104" in error
+
+    assert cli.main([*selector, "info", "mm"]) == 0
+    output = capsys.readouterr().out
+    if pinned:
+        assert f"Next:  {cli.PROG} siblings mm" in output
+    else:
+        assert f"Next:  {cli.PROG} -K study siblings mm" in output
+
+
+def test_no_call_graph_advice_does_not_replace_missing_custom_source(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "missing-custom-source.db"
+    shutil.copy(mini_index, copied)
+    missing = tmp_path / "vendor-tree-that-was-removed"
+    writer = sqlite3.connect(copied)
+    writer.execute("DELETE FROM calls")
+    writer.execute(
+        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+    writer.executemany("UPDATE meta SET value=? WHERE key=?", [
+        (str(missing), "tree_path"), (str(missing), "source")])
+    writer.commit()
+    writer.close()
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "calls", "ext4_bmap"])
+    error = capsys.readouterr().err
+    assert "restore the recorded custom source tree" in error
+    assert "--src" not in error
+
+
+def test_no_call_graph_advice_can_refetch_missing_downloaded_source(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "missing-downloaded-source.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute("DELETE FROM calls")
+    writer.execute(
+        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+    writer.execute("UPDATE meta SET value=? WHERE key='tree_path'",
+                   (str(tmp_path / "removed-cache"),))
+    writer.commit()
+    writer.close()
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "calls", "ext4_bmap"])
+    error = capsys.readouterr().err
+    assert "--with-calls --force" in error
+    assert f"--output {copied.resolve()}" in error
+    assert "--src" not in error
+
+
+@pytest.mark.parametrize(
+    "kind", ["struct", "macro", "variable", "file", "function,file"])
+def test_calls_rejects_result_kinds_that_can_never_occur(
+        mini_index, kind, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "calls", "ext4_bmap",
+                  "--kinds", kind])
+    assert "only lists function and syscall" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["show", "path", "web"])
+def test_source_identity_commands_reject_unmatched_line_selector(
+        mini_index, command, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), command,
+                  "fs/ext4/inode.c:9999"])
+    assert "no symbol spans line 9999" in capsys.readouterr().err
+
+
+def test_calls_ambiguity_recommends_line_for_same_file_definitions(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "conditional.db"
+    shutil.copy(mini_index, copied)
+    conn = sqlite3.connect(copied)
+    row = conn.execute(
+        "SELECT file_id,name,kind,start_line,end_line,signature,is_static,"
+        " is_inline,is_exported FROM symbols WHERE name='ext4_bmap'"
+    ).fetchone()
+    second_line = row[3] + 100
+    conn.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        " is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        (*row[:3], second_line, row[4] + 100, *row[5:]))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "calls", "ext4_bmap"])
+    error = capsys.readouterr().err
+    assert "path:line" in error
+    assert "fs/ext4/inode.c:" in error
+
+    for command in ("show", "path", "web"):
+        with pytest.raises(SystemExit):
+            cli.main(["--db", str(copied), command,
+                      "fs/ext4/inode.c:ext4_bmap"])
+        assert "path:line" in capsys.readouterr().err
+
+    assert cli.main(["--db", str(copied), "info",
+                     f"fs/ext4/inode.c:{second_line}"]) == 0
+    output = capsys.readouterr().out
+    assert f"siblings fs/ext4/inode.c:{second_line}" in output
+
+
+def test_relationships_accepts_ambiguous_definitions_with_one_owner(
+        mini_index, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "same-owner.db"
+    shutil.copy(mini_index, copied)
+    conn = sqlite3.connect(copied)
+    row = conn.execute(
+        "SELECT file_id,name,kind,start_line,end_line,signature,is_static,"
+        " is_inline,is_exported FROM symbols WHERE name='ext4_bmap'"
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        " is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        (*row[:3], row[3] + 100, row[4] + 100, *row[5:]))
+    conn.commit()
+    conn.close()
+
+    assert cli.main(["--db", str(copied), "relationships", "ext4_bmap",
+                     "--via", "ownership", "-f", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["subsystem"]["name"] == "EXT4 FILE SYSTEM"
+    assert "all 2 matches" in payload["resolved_from"]
+
+
 def test_trace_does_not_treat_macros_as_stack_frames(mini_index, capsys):
     import json
 
@@ -549,6 +1194,23 @@ def test_path_and_show_reject_target_inapplicable_flags(mini_index, capsys):
     with pytest.raises(SystemExit):
         cli.main(["--db", str(mini_index), "show", "__alloc_pages", "--lines", "1"])
     assert "applies to files" in capsys.readouterr().err
+
+
+def test_correction_hints_preserve_the_explicit_database_selector(
+        mini_index, capsys):
+    selected = str(mini_index.resolve())
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "ls", "ext4_bmap"])
+    error = capsys.readouterr().err
+    assert f"--db {selected}" in error
+    assert "siblings fs/ext4/inode.c:" in error
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "show", "fs/ext4"])
+    error = capsys.readouterr().err
+    assert f"--db {selected}" in error
+    assert " ls fs/ext4" in error
 
 
 @pytest.mark.parametrize("line_range", ["0", "9" * 5000])
@@ -710,6 +1372,26 @@ def test_build_reports_expected_indexer_failures_without_a_traceback(
     assert "Traceback" not in err
 
 
+def test_check_reports_invalid_sqlite_value_types_without_a_traceback(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "blob-call.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute(
+        "UPDATE calls SET callee=? WHERE rowid=(SELECT rowid FROM calls LIMIT 1)",
+        (sqlite3.Binary(b"not-text"),))
+    writer.commit()
+    writer.close()
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "check", "-f", "json"])
+    error = capsys.readouterr().err
+    assert "index table calls contains an invalid value" in error
+    assert "Traceback" not in error
+
+
 def test_output_containment_checks_the_symlink_entry_not_its_target(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -749,9 +1431,11 @@ def test_custom_build_output_is_not_blocked_by_the_managed_index(
     monkeypatch.setattr(cli.indexer, "build", fake_build)
     custom = tmp_path / "custom.db"
     assert cli.main(["build", "lts", "--output", str(custom), "--quiet"]) == 0
-    capsys.readouterr()
+    out = capsys.readouterr().out
     assert custom.read_bytes() == b"index"
     assert seen == {"source_url": source_url, "metadata_source": source_url}
+    assert f"{cli.PROG} --db {custom} info mm" in out
+    assert f"{cli.PROG} --db {custom} siblings mm/page_alloc.c" in out
 
 
 def test_stale_recorded_source_is_not_replaced_by_same_version_tree(
