@@ -873,7 +873,3 @@ they need no network and never touch your real indexes.
 | `links.py` | Elixir / git.kernel.org / GitHub / docs.kernel.org URLs |
 | `render.py` | table / plain / json / csv / tree output |
 | `cli.py` | command line interface |
-
-## Licence
-
-MIT.
