@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
+import shlex
 import shutil
 import sqlite3
 import sys
 from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import config, cparse, db, indexer, kernelsrc, links, maintainers, query, render
+from . import (config, cparse, db, indexer, kernelsrc, links, maintainers,
+               query, relationships, render)
 from .query import Entry
 
 PROG = "kernel-atlas"
@@ -164,6 +167,10 @@ def open_index(args) -> tuple[sqlite3.Connection, dict]:
         _die(f"{path} is not a usable index ({exc}) — rebuild it with "
              f"'{PROG} build <version> --force'")
     meta["index_stem"] = path.stem
+    # Keep the resolved selection identity alongside the persisted metadata.
+    # A filename may be a custom alias for another kernel version, so rebuild
+    # hints must not derive the publication path from ``kernel_version``.
+    meta["index_path"] = str(path.expanduser().resolve())
     _OPEN_INDEXES.append(conn)
     return conn, meta
 
@@ -220,7 +227,9 @@ def _suggestions(conn, spec: str, limit: int = 5) -> list[str]:
     return []
 
 
-def resolve_or_die(conn, spec: str) -> query.Resolution:
+def resolve_or_die(conn, spec: str, meta: dict | None = None) -> query.Resolution:
+    if meta is not None:
+        spec = _normalize_target_spec(meta, spec)
     res = query.resolve(conn, spec)
     if res.target is None:
         near = _suggestions(conn, spec)
@@ -229,13 +238,15 @@ def resolve_or_die(conn, spec: str) -> query.Resolution:
     return res
 
 
-def _resolve_area(conn, spec: str) -> query.Resolution:
+def _resolve_area(conn, spec: str, meta: dict | None = None) -> query.Resolution:
     """Prefer a directory named `spec` over a symbol that happens to share it.
 
     `bpf` is a variable in security/bpf/hooks.c *and* the directory kernel/bpf/.
     For commands about an area (docs), the directory is the useful answer.
     `kernel/bpf` is preferred over deeper homonyms like security/bpf/.
     """
+    if meta is not None:
+        spec = _normalize_target_spec(meta, spec)
     raw = (spec or "").strip().strip("/")
     if raw and "/" not in raw and ":" not in raw and raw not in (".",):
         rows = conn.execute(
@@ -401,6 +412,59 @@ def find_source_tree(meta: dict) -> Path | None:
     return None
 
 
+_TARGET_SUFFIX_RE = re.compile(r":(?:[+-]?\d+|[A-Za-z_][A-Za-z0-9_]*)\Z")
+
+
+def _normalize_target_spec(meta: dict, spec: str) -> str:
+    """Translate an absolute source path into the index's relative namespace.
+
+    Absolute editor/compiler locations are useful inputs, but only the exact
+    tree recorded by the selected index gives them a safe, unambiguous meaning.
+    Preserve an optional ``:line`` or ``:symbol`` suffix after normalizing the
+    filesystem portion.
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return raw
+
+    path_text = raw
+    suffix = ""
+    suffix_match = _TARGET_SUFFIX_RE.search(raw)
+    if suffix_match:
+        possible_path = raw[:suffix_match.start()]
+        if Path(possible_path).expanduser().is_absolute():
+            path_text = possible_path
+            suffix = suffix_match.group(0)
+
+    candidate = Path(path_text).expanduser()
+    if not candidate.is_absolute():
+        return raw
+
+    tree = find_source_tree(meta)
+    if tree is None:
+        _die("cannot use an absolute target because the index's recorded "
+             "source tree is not available")
+    try:
+        root = tree.expanduser().resolve()
+        # Resolve parent components for containment, but preserve the leaf.
+        # The leaf may itself be an indexed symlink (for example
+        # Documentation/Changes); following it would silently change the
+        # requested index identity to its target.
+        if candidate == tree.expanduser():
+            normalized_candidate = root
+        else:
+            normalized_candidate = candidate.parent.resolve() / candidate.name
+        relative = normalized_candidate.relative_to(root)
+    except ValueError:
+        _die(f"absolute target {path_text!r} is outside the recorded source "
+             f"tree {tree}")
+    except (OSError, RuntimeError) as exc:
+        _die(f"cannot safely resolve absolute target {path_text!r}: {exc}")
+
+    normalized = relative.as_posix()
+    return (normalized or ".") + suffix
+
+
 def source_tree(meta: dict) -> Path:
     tree = find_source_tree(meta)
     if tree is None:
@@ -411,8 +475,8 @@ def source_tree(meta: dict) -> Path:
             expected = config.sources_dir() / f"linux-{version!r}"
         _die(f"the source for Linux {version} is not on disk "
              f"(expected {expected})\n"
-             f"  the index still answers queries; to get the source back run:\n"
-             f"    {PROG} build {version} --force")
+             "  the index still answers offline queries; restore its recorded "
+             "tree or rebuild this index from the intended source snapshot")
     return tree
 
 
@@ -504,8 +568,97 @@ def _path_inside(path: Path, directory: Path) -> bool:
 def _target_spec(t: query.Target) -> str:
     """A spec `ka` will accept again (`.` for the kernel root)."""
     if t.kind == "symbol":
-        return t.display
+        return f"{t.path}:{t.line}" if t.line is not None else t.display
     return t.path or "."
+
+
+def _command_prefix(args, meta: dict | None = None) -> str:
+    """A shell-safe query prefix which preserves the selected index."""
+    if getattr(args, "db", None):
+        path = Path(args.db).expanduser().resolve()
+        return f"{PROG} --db {shlex.quote(str(path))}"
+    if getattr(args, "kernel", None):
+        # Preserve the exact resolved filename alias.  Reusing an abbreviated
+        # prefix can become ambiguous after another index is built.
+        selected = ((meta.get("index_stem") or args.kernel)
+                    if meta is not None else args.kernel)
+        return f"{PROG} -K {shlex.quote(selected)}"
+    return PROG
+
+
+def _call_graph_rebuild_hint(args, meta: dict) -> str | None:
+    """An executable rebuild for this exact index, if its inputs exist.
+
+    A missing downloaded tree can be fetched again from its recorded version.
+    A missing custom ``--src`` tree cannot: silently substituting upstream
+    source would publish a different snapshot under the same index identity.
+    """
+    version = index_version(meta)
+    selected = meta.get("index_path")
+    output = (Path(selected) if selected else selected_index(args)).resolve()
+    command = f"{PROG} build {shlex.quote(version)}"
+    tree = find_source_tree(meta)
+    if tree is not None:
+        command += f" --src {shlex.quote(str(tree))}"
+    else:
+        recorded = meta.get("tree_path")
+        source = meta.get("source")
+        if (isinstance(recorded, str) and recorded
+                and isinstance(source, str) and source
+                and _same_path(Path(source).expanduser(),
+                               Path(recorded).expanduser())):
+            return None
+    return (f"{command} --output {shlex.quote(str(output))} "
+            "--with-calls --force")
+
+
+def _call_graph_rebuild_advice(args, meta: dict) -> str:
+    hint = _call_graph_rebuild_hint(args, meta)
+    if hint is not None:
+        return f"rebuild with '{hint}'"
+    recorded = meta.get("tree_path") or "the recorded custom source tree"
+    return (f"restore the recorded custom source tree {recorded!r}, then rebuild "
+            "this same index with --with-calls --force")
+
+
+def _require_unique_symbol_identity(res: query.Resolution, spec: str) -> None:
+    """Reject a guessed definition for commands whose output uses its line.
+
+    ``info`` intentionally ranks and explains alternatives, but ``show``,
+    ``path --line``, and ``web`` act on one concrete source identity.  A
+    ``path:symbol`` qualifier is still ambiguous when conditional definitions
+    repeat a name in the same file; ``path:line`` is the lossless spelling.
+    """
+    tail = (spec or "").strip().rpartition(":")[2]
+    line_qualified = re.fullmatch(r"[+]?[1-9][0-9]*", tail) is not None
+    target = res.target
+    if line_qualified and (target is None or target.kind != "symbol"):
+        # ``resolve`` deliberately falls back to the containing file so that
+        # informational commands can still describe a real path.  Commands
+        # that act on a concrete source identity must not silently reinterpret
+        # a failed ``path:line`` selector as the whole file.
+        _die(res.note or f"no symbol spans line {tail}")
+    if target is None or target.kind != "symbol":
+        return
+    if line_qualified:
+        return
+    callable_kinds = {"function", "syscall"}
+    alternatives = [
+        candidate for candidate in res.candidates
+        if candidate.kind == "symbol"
+        and (candidate.symbol_kind == target.symbol_kind
+             or {candidate.symbol_kind, target.symbol_kind} <= callable_kinds)
+    ]
+    if not alternatives:
+        return
+    candidates = [target, *alternatives]
+    same_file = len({candidate.path for candidate in candidates}) < len(candidates)
+    qualifier = "path:line" if same_file else "path:symbol"
+    examples = ", ".join(
+        f"{candidate.path}:{candidate.line}" if same_file else candidate.display
+        for candidate in candidates[:3])
+    _die(f"{len(candidates)} definitions match {target.name!r}; qualify the "
+         f"target as {qualifier} (for example: {examples})")
 
 
 def _links_for(meta: dict, t: query.Target) -> dict[str, str]:
@@ -513,6 +666,24 @@ def _links_for(meta: dict, t: query.Target) -> dict[str, str]:
         index_version(meta), t.path, t.line,
         is_dir=(t.kind == "dir"),
         ident=(t.name if t.kind == "symbol" else None))
+
+
+def _subsystem_payload(row) -> dict:
+    payload = dict(
+        name=row["name"], status=row["status"],
+        n_files=row["n_files"], claimed_files=row["n_files"],
+        primary_files=row["n_primary_files"],
+        **query.subsystem_json_fields(row),
+    )
+    if "n_claimed" in row.keys():
+        payload["directory_claimed_files"] = row["n_claimed"]
+        payload["directory_primary_files"] = row["n_primary"]
+        payload["directory_coverage"] = row["coverage"]
+    if "is_primary" in row.keys():
+        payload["match_score"] = row["score"]
+        payload["match_rank"] = row["rank"]
+        payload["is_primary"] = bool(row["is_primary"])
+    return payload
 
 
 # How many bytes of a file `show` will dump without --lines. Matches the
@@ -545,6 +716,18 @@ def cmd_versions(args):
 
 def cmd_build(args):
     quiet = args.quiet
+    kinds = _split_list(args.kinds) or list(cparse.DEFAULT_KINDS)
+    bad = [kind for kind in kinds if kind not in cparse.ALL_KINDS]
+    if bad:
+        _die(f"unknown symbol kind(s): {', '.join(bad)} "
+             f"(valid: {', '.join(cparse.ALL_KINDS)})")
+    if args.with_calls and not ({"function", "syscall"} & set(kinds)):
+        _die("--with-calls requires indexing function and/or syscall symbols")
+    missing_call_kinds = {"macro", "variable"} - set(kinds)
+    if args.with_calls and missing_call_kinds:
+        _die("--with-calls requires macro and variable symbols so indirect or "
+             "macro calls are not falsely linked to unrelated functions")
+
     if args.src:
         if args.keep_tarball or args.no_verify:
             _die("--keep-tarball and --no-verify only apply to downloaded source")
@@ -605,12 +788,6 @@ def cmd_build(args):
         _die(f"index output {out} is inside the source tree {tree}; "
              "choose a path outside the tree")
 
-    kinds = _split_list(args.kinds) or list(cparse.DEFAULT_KINDS)
-    bad = [k for k in kinds if k not in cparse.ALL_KINDS]
-    if bad:
-        _die(f"unknown symbol kind(s): {', '.join(bad)} "
-             f"(valid: {', '.join(cparse.ALL_KINDS)})")
-
     if not quiet:
         print(f"indexing {tree}", file=sys.stderr)
     try:
@@ -620,6 +797,14 @@ def cmd_build(args):
     except (OSError, RuntimeError, sqlite3.DatabaseError, ValueError) as exc:
         _die(f"could not build index: {exc}")
     size_mb = out.stat().st_size / (1024 * 1024)
+    try:
+        selectable_by_kernel = out.resolve() == config.index_path(version).resolve()
+    except OSError:
+        selectable_by_kernel = False
+    if selectable_by_kernel:
+        query_cmd = f"{PROG} -K {shlex.quote(out.stem)}"
+    else:
+        query_cmd = f"{PROG} --db {shlex.quote(str(out.resolve()))}"
     print(
         f"\nBuilt index for Linux {version}\n"
         f"  {stats.dirs:,} directories, {stats.files:,} files\n"
@@ -628,11 +813,14 @@ def cmd_build(args):
            f" ({stats.oversize:,} oversized)\n"
            if stats.skipped or stats.failed else "")
         + (f"  {stats.symlinks:,} symlinks recorded\n" if stats.symlinks else "")
-        + (f"  {stats.calls:,} call edges\n" if stats.calls else "")
+        + (f"  {stats.calls:,} call edges: {stats.calls_resolved:,} resolved, "
+           f"{stats.calls_ambiguous:,} ambiguous, {stats.calls_macro:,} macro, "
+           f"{stats.calls_indirect:,} indirect, "
+           f"{stats.calls_unresolved:,} unresolved\n" if stats.calls else "")
         + f"  {stats.subsystems:,} subsystems from MAINTAINERS\n"
         f"  {out}  ({size_mb:.0f} MB, {stats.seconds:.0f}s)\n"
-        f"\nTry:  {PROG} info mm\n"
-        f"      {PROG} siblings mm/page_alloc.c"
+        f"\nTry:  {query_cmd} info mm\n"
+        f"      {query_cmd} siblings mm/page_alloc.c"
     )
 
 
@@ -686,17 +874,22 @@ def cmd_indexes(args):
     color = render.use_color(args.color)
     show_alias = any(r["alias"] != r["version"] for r in rows)
     alias_head = f" {'INDEX':<12}" if show_alias else ""
-    print(f"    {'VERSION':<12}{alias_head} {'FILES':>8} {'SYMBOLS':>10} "
-          f"{'CALLS':<6} {'SOURCE':<7} {'BUILT':<20} {'SIZE':>8}")
+    print(f"    {'VERSION':<12}{alias_head} {'STATE':<7} {'FILES':>8} "
+          f"{'SYMBOLS':>10} {'CALLS':<6} {'SOURCE':<7} {'BUILT':<20} "
+          f"{'SIZE':>8}")
     for r in rows:
         mark = "*" if r["default"] else " "
         alias = f" {r['alias']:<12}" if show_alias else ""
-        line = (f"  {mark} {r['version']:<12}{alias} "
+        state = "broken" if r["error"] else "ok"
+        line = (f"  {mark} {r['version']:<12}{alias} {state:<7} "
                 f"{r['files']:>8} {r['symbols']:>10} "
                 f"{'yes' if r['calls'] else '-':<6} "
                 f"{'yes' if r['source'] else '-':<7} {r['built_at']:<20} "
                 f"{r['size']:>8}")
         print(render.paint(line, "1", color) if r["default"] else line)
+        if r["error"]:
+            print(render.paint(f"      unusable: {r['error']} (rebuild this index)",
+                               "31", color))
     pinned = config.get_default_version()
     note = (f"pinned with '{PROG} use {pinned}'" if pinned
             else f"highest version (pin one with '{PROG} use <version>')")
@@ -731,9 +924,28 @@ def cmd_use(args):
         else:
             print("nothing pinned; defaulting to the highest built version")
         active = default_index(warn=False)
+        conn = None
+        try:
+            conn = db.connect(active, readonly=True)
+            db.validate_schema(conn)
+        except (OSError, sqlite3.DatabaseError) as exc:
+            _die(f"active index {active} is not usable ({exc}); rebuild it or "
+                 f"select another with '{PROG} use <version>'")
+        finally:
+            if conn is not None:
+                conn.close()
         print(f"active index: {active.stem}  ({active})")
         return
     path = resolve_index_spec(args.version)
+    conn = None
+    try:
+        conn = db.connect(path, readonly=True)
+        db.validate_schema(conn)
+    except (OSError, sqlite3.DatabaseError) as exc:
+        _die(f"cannot use {path.stem!r}: {path} is not a usable index ({exc})")
+    finally:
+        if conn is not None:
+            conn.close()
     config.set_default_version(path.stem)
     print(f"default index is now {path.stem}\n"
           f"  every command without -K/--db will use it; "
@@ -762,13 +974,21 @@ def _managed_source_recorded_by(path: Path) -> Path | None:
     conn = None
     try:
         conn = db.connect(path, readonly=True)
-        meta = db.get_meta(conn)
+        meta = db.validate_schema(conn)
         version = config.validate_version(meta.get("kernel_version", ""))
         recorded = meta.get("tree_path")
         if not isinstance(recorded, str) or not recorded:
             return None
+        source = meta.get("source")
+        recorded_path = Path(recorded).expanduser()
+        if isinstance(source, str) and source \
+                and _same_path(Path(source).expanduser(), recorded_path):
+            # ``build --src`` records the local input tree as its source.  A
+            # coincidental conventional cache name does not make that
+            # user-owned tree disposable.
+            return None
         expected = config.source_path(version)
-        return expected if _same_path(Path(recorded).expanduser(), expected) else None
+        return expected if _same_path(recorded_path, expected) else None
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return None
     finally:
@@ -854,6 +1074,14 @@ def cmd_stats(args):
     print(f"  files        {int(meta.get('n_files', 0)):,}")
     print(f"  subsystems   {int(meta.get('n_subsystems', 0)):,}")
     print(f"  symbols      {int(meta.get('n_symbols', 0)):,}")
+    if meta.get("has_calls") == "1":
+        total_calls = int(meta.get("n_calls", 0))
+        resolved_calls = int(meta.get("n_calls_resolved", 0))
+        print(f"  call edges   {total_calls:,} ({resolved_calls:,} resolved identities)")
+        print(f"  call gaps    {int(meta.get('n_calls_ambiguous', 0)):,} ambiguous, "
+              f"{int(meta.get('n_calls_macro', 0)):,} macro-only, "
+              f"{int(meta.get('n_calls_indirect', 0)):,} indirect, "
+              f"{int(meta.get('n_calls_unresolved', 0)):,} unresolved")
     skipped = int(meta.get("n_parse_skipped", 0))
     failed = int(meta.get("n_parse_failed", 0))
     if skipped or failed:
@@ -876,39 +1104,158 @@ def cmd_stats(args):
         print(f"      {r['name']:<14} {r['n']:>7,} files   {label}")
 
 
+def cmd_check(args):
+    """Run the full row-level integrity audit on an index."""
+    conn, meta = open_index(args)
+    try:
+        db.validate_schema(conn, deep=True)
+    except (db.SchemaError, sqlite3.DatabaseError) as exc:
+        _die(f"index integrity check failed: {exc}")
+    payload = {
+        "ok": True,
+        "index": index_version(meta),
+        "files": int(meta["n_files"]),
+        "symbols": int(meta["n_symbols"]),
+        "calls": int(meta["n_calls"]),
+    }
+    if args.format == "json":
+        sys.stdout.write(render.render_json(payload))
+        return
+    print(f"{_linux(meta)} index is structurally and semantically consistent")
+    print(f"  {payload['files']:,} files, {payload['symbols']:,} symbols, "
+          f"{payload['calls']:,} call edges checked")
+
+
 def cmd_info(args):
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target)
+    res = resolve_or_die(conn, args.target, meta)
     t = res.target
     color = render.use_color(args.color)
 
-    subs = [s for s in query.all_subsystems(
+    composition = query.all_subsystems(
         conn, "dir" if t.kind == "dir" else "file",
         t.id if t.kind == "dir" else (t.file_id or t.id))
-        if s["name"] not in query.CATCH_ALL]
+    unclassified = next((s for s in composition
+                         if s["name"] in query.CATCH_ALL
+                         and ((t.kind == "dir" and s["n_primary"] > 0)
+                              or (t.kind != "dir" and s["is_primary"]))), None)
+    subs = [s for s in composition if s["name"] not in query.CATCH_ALL]
     area = query.describe_area(t.path)
     lnks = _links_for(meta, t)
 
+    path_row = None
+    subtree_files = None
+    symbols_by_kind: dict[str, int] = {}
+    if t.kind in {"dir", "file"}:
+        table = "dirs" if t.kind == "dir" else "files"
+        path_row = conn.execute(
+            f"SELECT * FROM {table} WHERE id = ?", (t.id,)).fetchone()
+        if t.kind == "dir" and path_row is not None:
+            subtree_files = path_row["n_files_recursive"]
+        elif t.kind == "file" and path_row is not None:
+            symbols_by_kind = {
+                r["kind"]: r["n"] for r in conn.execute(
+                    "SELECT kind, COUNT(*) n FROM symbols WHERE file_id = ?"
+                    " GROUP BY kind ORDER BY n DESC", (t.id,))
+            }
+
+    if t.kind == "dir":
+        unmatched_files = query.directory_unclaimed_files(conn, t.path)
+    else:
+        unmatched_files = int(not any(
+            bool(row["is_primary"]) for row in composition))
+
+    tree = find_source_tree(meta)
+    source_entry = source_member(tree, t.path) if tree is not None else None
+    on_disk = str(source_entry) if source_entry is not None else None
+    source_exists = ((source_entry.exists() or source_entry.is_symlink())
+                     if source_entry is not None else None)
+    linkage = None
+    if t.kind == "symbol" and t.symbol_kind in {
+            "function", "syscall", "variable", "prototype"}:
+        if t.is_exported:
+            linkage = "exported to modules"
+        elif t.is_static:
+            linkage = "static (file-local)"
+        elif t.symbol_kind == "prototype":
+            linkage = "declaration"
+        else:
+            linkage = "global"
+
     if args.format == "json":
+        unclassified_payload = None
+        if unclassified is not None or unmatched_files:
+            if t.kind == "dir":
+                catch_all_primary = (int(unclassified["n_primary"])
+                                     if unclassified is not None else 0)
+                total = int(subtree_files or 0)
+                unclassified_payload = {
+                    "primary_files": catch_all_primary,
+                    "claimed_files": (int(unclassified["n_claimed"])
+                                      if unclassified is not None else 0),
+                    "unmatched_files": unmatched_files,
+                    "coverage": ((catch_all_primary + unmatched_files) / total
+                                 if total else 0.0),
+                    "maintainers_section": (unclassified["name"]
+                                            if unclassified is not None
+                                            else None),
+                }
+            else:
+                unclassified_payload = {
+                    "is_primary": (bool(unclassified["is_primary"])
+                                   if unclassified is not None else False),
+                    "unmatched": bool(unmatched_files),
+                    "match_score": (unclassified["score"]
+                                    if unclassified is not None else None),
+                    "match_rank": (unclassified["rank"]
+                                   if unclassified is not None else None),
+                    "maintainers_section": (unclassified["name"]
+                                            if unclassified is not None
+                                            else None),
+                }
         target = {
             "kind": t.kind, "symbol_kind": t.symbol_kind, "name": t.name,
             "path": t.path, "line": t.line, "end_line": t.end_line,
             "signature": t.signature,
         }
-        if t.kind == "symbol":
+        if t.symbol_kind in {"function", "syscall"}:
             target.update(is_static=t.is_static, is_inline=t.is_inline,
-                          is_exported=t.is_exported)
+                          is_exported=t.is_exported, linkage=linkage)
+        elif t.symbol_kind == "variable":
+            target.update(is_static=t.is_static, is_exported=t.is_exported,
+                          linkage=linkage)
+        elif t.symbol_kind == "prototype":
+            target.update(is_static=t.is_static, is_inline=t.is_inline,
+                          linkage=linkage)
+        elif t.kind == "dir" and path_row is not None:
+            target.update(
+                n_subdirs=path_row["n_subdirs"],
+                n_files=path_row["n_files"],
+                n_files_subtree=subtree_files,
+            )
+        elif t.kind == "file" and path_row is not None:
+            target.update(
+                extension=path_row["ext"], size=path_row["size"],
+                lines=path_row["lines"], n_symbols=path_row["n_symbols"],
+                symbols_by_kind=symbols_by_kind,
+                is_symlink=bool(path_row["is_symlink"]),
+                link_target=path_row["link_target"],
+                index_status=path_row["index_status"],
+                index_error=path_row["index_error"],
+            )
         payload = {
             "target": target,
             "area": {"name": area[0], "description": area[1]} if area else None,
             "subsystems": [
-                dict(name=s["name"], status=s["status"], n_files=s["n_files"],
-                     **query.subsystem_json_fields(s))
+                _subsystem_payload(s)
                 for s in subs[:args.max_subsystems]],
             "n_subsystems": len(subs),
+            "unclassified_ownership": unclassified_payload,
             "ancestry": [{"path": p, "subsystem": s}
                          for p, s in query.ancestry(conn, t.path)],
             "links": lnks,
+            "source_path": on_disk,
+            "source_exists": source_exists,
             "index": index_version(meta),
             "note": res.note,
             "other_candidates": [c.display
@@ -929,37 +1276,36 @@ def cmd_info(args):
 
     if t.kind == "symbol":
         field("kind", t.symbol_kind)
-        field("defined in", f"{t.path}:{t.line}"
+        location_label = "declared in" if t.symbol_kind == "prototype" \
+            else "defined in"
+        field(location_label, f"{t.path}:{t.line}"
               + (f"-{t.end_line} ({t.end_line - t.line + 1} lines)"
                  if t.end_line and t.line else ""))
         field("signature", t.signature)
-        field("linkage", "EXPORT_SYMBOL (available to modules)" if t.is_exported
-              else ("static (file-local)" if t.is_static else "global"))
+        field("linkage", linkage)
     else:
-        row = conn.execute(
-            f"SELECT * FROM {'dirs' if t.kind == 'dir' else 'files'} WHERE id = ?",
-            (t.id,)).fetchone()
         field("kind", "directory" if t.kind == "dir" else "file")
         field("path", t.path or "<kernel root>")
-        if t.kind == "dir":
-            field("contains", f"{row['n_subdirs']} subdirectories, "
-                              f"{row['n_files']} files")
-            total = conn.execute(
-                "SELECT COUNT(*) n FROM files WHERE path LIKE ? ESCAPE '\\'",
-                (query.like_under(t.path),)).fetchone()["n"]
-            if total != row["n_files"]:
-                field("subtree", f"{total:,} files in total")
-        else:
-            field("size", f"{row['size']:,} bytes, {row['lines']:,} lines")
-            by_kind = conn.execute(
-                "SELECT kind, COUNT(*) n FROM symbols WHERE file_id = ?"
-                " GROUP BY kind ORDER BY n DESC", (t.id,)).fetchall()
-            if by_kind:
-                field("defines", ", ".join(f"{r['n']} {r['kind']}" for r in by_kind))
+        if t.kind == "dir" and path_row is not None:
+            field("contains", f"{path_row['n_subdirs']} subdirectories, "
+                              f"{path_row['n_files']} files")
+            if subtree_files != path_row["n_files"]:
+                field("subtree", f"{subtree_files:,} files in total")
+        elif path_row is not None:
+            field("size", f"{path_row['size']:,} bytes, "
+                          f"{path_row['lines']:,} lines")
+            field("index status", path_row["index_status"])
+            if path_row["is_symlink"]:
+                field("symlink to", path_row["link_target"] or "unknown")
+            field("index error", path_row["index_error"])
+            if symbols_by_kind:
+                field("defines", ", ".join(
+                    f"{count} {kind}" for kind, count in symbols_by_kind.items()))
 
-    tree = find_source_tree(meta)
-    if tree is not None:
-        field("on disk", str(source_member(tree, t.path)))
+    if source_exists:
+        field("on disk", on_disk)
+    elif on_disk is not None:
+        field("source path", f"{on_disk} (missing)")
     field("index", _linux(meta))
     field("elixir", lnks.get("elixir"))
     if lnks.get("docs"):
@@ -972,18 +1318,43 @@ def cmd_info(args):
         print(render.paint(f"  Area: {area[0]}", "1;32", color))
         print(f"    {area[1]}")
 
-    if subs:
+    if subs or unclassified is not None or unmatched_files:
         print()
-        print(render.paint("  Subsystem (from MAINTAINERS)", "1;35", color))
+        heading = ("  Subsystem composition (from descendant files)"
+                   if t.kind == "dir" else "  Subsystem (from MAINTAINERS)")
+        print(render.paint(heading, "1;35", color))
         for i, s in enumerate(subs[:args.max_subsystems]):
-            marker = "*" if i == 0 else " "
+            marker = "*" if (i == 0 if t.kind == "dir"
+                               else bool(s["is_primary"])) else " "
+            if t.kind == "dir":
+                detail = (f"{s['n_primary']:,} primary / {s['n_claimed']:,} "
+                          f"claimed descendant files ({s['coverage']:.0%})")
+            else:
+                detail = f"{s['n_files']:,} claimed files"
             print(f"   {marker} {render.paint(s['name'], '1', color)}"
-                  f"   [{s['status'] or 'unknown'}]  {s['n_files']:,} files")
+                  f"   [{s['status'] or 'unknown'}]  {detail}")
             f = query.subsystem_json_fields(s)
             for who in f["maintainers"][:3]:
                 print(f"       maintainer  {who}")
             for lst in f["lists"][:2]:
                 print(f"       list        {lst}")
+        if unclassified is not None:
+            if t.kind == "dir":
+                detail = (f"{unclassified['n_primary']:,} primary descendant "
+                          f"files ({unclassified['coverage']:.0%})")
+            else:
+                detail = "the only primary ownership match for this file"
+            print("     " + render.paint("Unclassified", "1", color)
+                  + f"   {detail}; represented only by the "
+                    f"{unclassified['name']} catch-all")
+        if unmatched_files:
+            if t.kind == "dir":
+                detail = (f"{unmatched_files:,} descendant file"
+                          f"{'s have' if unmatched_files != 1 else ' has'}")
+            else:
+                detail = "the containing file has"
+            print("     " + render.paint("Unclassified", "1", color)
+                  + f"   {detail} no primary MAINTAINERS match")
         if len(subs) > args.max_subsystems:
             print(f"     ... and {len(subs) - args.max_subsystems} more "
                   f"(--max-subsystems to show)")
@@ -1006,19 +1377,22 @@ def cmd_info(args):
         if len(res.candidates) > args.max_candidates:
             print(f"    ... and {len(res.candidates) - args.max_candidates} more")
 
-    print(f"\n  Next:  {PROG} siblings {_target_spec(t)}"
-          f"\n         {PROG} web {_target_spec(t)}")
+    prefix = _command_prefix(args, meta)
+    target_arg = shlex.quote(_target_spec(t))
+    print(f"\n  Next:  {prefix} siblings {target_arg}"
+          f"\n         {prefix} web {target_arg}")
 
 
 def cmd_siblings(args):
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target)
+    res = resolve_or_die(conn, args.target, meta)
     t = res.target
     scope = query.build_scope(conn, t, args.level)
     if scope.dir_sql is None and scope.file_sql is None and scope.sym_where is None:
         _die(f"cannot build a '{args.level}' scope for {t.display} ({scope.label})")
 
     kinds = symbol_filter_kinds(args, kinds_from_args(args, t))
+    _reject_symbol_size_sort(args, kinds)
     if (args.level == "tree"
             and any(k in query.SYMBOL_KINDS for k in kinds)
             and not args.limit):
@@ -1071,10 +1445,12 @@ def cmd_siblings(args):
 
 def cmd_ls(args):
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target or "")
+    res = resolve_or_die(conn, args.target or "", meta)
     t = res.target
     if t.kind == "symbol":
-        _die(f"{t.display} is a symbol; try '{PROG} siblings {t.display}'")
+        prefix = _command_prefix(args, meta)
+        target = shlex.quote(_target_spec(t))
+        _die(f"{t.display} is a symbol; try '{prefix} siblings {target}'")
 
     if t.kind == "dir":
         scope = query.Scope(
@@ -1091,6 +1467,7 @@ def cmd_ls(args):
 
     kinds = kinds_from_args(args, t) if _split_list(args.kinds) else default
     kinds = symbol_filter_kinds(args, kinds)
+    _reject_symbol_size_sort(args, kinds)
     want_subsystem = (args.with_subsystem
                       or "subsystem" in _split_list(args.columns))
     entries = query.collect(conn, scope, kinds, limit=args.limit,
@@ -1120,6 +1497,13 @@ def _post_filter(entries, args):
     return entries
 
 
+def _reject_symbol_size_sort(args, kinds) -> None:
+    if (args.sort == "size" and kinds
+            and all(kind in query.SYMBOL_KINDS for kind in kinds)):
+        _die("--sort size does not apply to symbols; use --sort lines for "
+             "definition span")
+
+
 def cmd_find(args):
     conn, meta = open_index(args)
     mode = "exact" if args.exact else ("glob" if args.glob else
@@ -1130,6 +1514,7 @@ def cmd_find(args):
             _die("find only searches symbols; try --kinds function,struct,...")
     else:
         kinds = []
+    _reject_symbol_size_sort(args, kinds or query.SYMBOL_KINDS)
     grep = _checked_grep(args.grep)
     explicit_columns = _split_list(args.columns)
     want_subsystem = (args.format != "names"
@@ -1148,9 +1533,14 @@ def cmd_find(args):
 
 def cmd_subsystems(args):
     conn, meta = open_index(args)
+    order = {
+        "size": "n_files DESC, name",
+        "claimed": "n_files DESC, name",
+        "primary": "n_primary_files DESC, name",
+        "name": "name",
+    }[args.sort]
     rows = conn.execute(
-        "SELECT * FROM subsystems "
-        f"ORDER BY {'n_files DESC' if args.sort == 'size' else 'name'}").fetchall()
+        f"SELECT * FROM subsystems ORDER BY {order}").fetchall()
     pattern = _checked_grep(args.grep)
     if pattern:
         rx = re.compile(pattern, re.IGNORECASE)
@@ -1158,29 +1548,36 @@ def cmd_subsystems(args):
     if args.limit:
         rows = rows[:args.limit]
     if args.format == "json":
-        sys.stdout.write(render.render_json(
-            [dict(name=r["name"], status=r["status"], n_files=r["n_files"],
-                  **query.subsystem_json_fields(r)) for r in rows]))
+        payload = []
+        for row in rows:
+            item = _subsystem_payload(row)
+            item["index"] = index_version(meta)
+            payload.append(item)
+        sys.stdout.write(render.render_json(payload))
         return
     color = render.use_color(args.color)
     print(render.paint(f"{len(rows)} subsystems  [{_linux(meta)}]", "1", color))
+    print(f"  {'CLAIMED':>7} {'PRIMARY':>7}  {'STATUS':<16} NAME")
     for r in rows:
-        print(f"  {r['n_files']:>6,}  {r['status'] or '?':<16} {r['name']}")
+        print(f"  {r['n_files']:>7,} {r['n_primary_files']:>7,}  "
+              f"{r['status'] or '?':<16} {r['name']}")
 
 
 def cmd_subsystem(args):
     conn, meta = open_index(args)
     rows = query.subsystem_by_name(conn, args.name)
     if not rows:
+        prefix = _command_prefix(args, meta)
         _die(f"no subsystem matching {args.name!r} "
-             f"(try '{PROG} subsystems --grep {args.name}')")
-    if len(rows) > 1 and rows[0]["name"].lower() != args.name.lower():
+             f"(try '{prefix} subsystems --grep {shlex.quote(args.name)}')")
+    if len(rows) > 1:
         if args.format == "json":
             sys.stdout.write(render.render_json({
                 "query": args.name,
                 "ambiguous": True,
                 "matches": [dict(name=r["name"], status=r["status"],
-                                 n_files=r["n_files"])
+                                 n_files=r["n_files"],
+                                 primary_files=r["n_primary_files"])
                             for r in rows],
                 "index": index_version(meta),
             }))
@@ -1188,13 +1585,31 @@ def cmd_subsystem(args):
         color = render.use_color(args.color)
         print(render.paint(f"{len(rows)} subsystems match {args.name!r}:", "1", color))
         for r in rows:
-            print(f"  {r['n_files']:>6,}  {r['name']}")
+            print(f"  {r['n_files']:>6,} claimed  "
+                  f"{r['n_primary_files']:>6,} primary  {r['name']}")
         return
     s = rows[0]
     f = query.subsystem_json_fields(s)
+    directory_limit = args.limit if args.limit else 10**9
+    directory_rows = conn.execute(
+        "SELECT d.path, p.n_claimed, p.n_primary, p.coverage FROM dirs d"
+        " JOIN dir_subsys p ON p.dir_id=d.id WHERE p.subsystem_id=?"
+        " AND d.path != ''"
+        " ORDER BY p.n_primary DESC, p.coverage DESC, d.depth DESC, d.path"
+        " LIMIT ?", (s["id"], directory_limit)
+    ).fetchall()
     if args.format == "json":
-        payload = dict(name=s["name"], status=s["status"], n_files=s["n_files"],
-                       web=s["web"], index=index_version(meta), **f)
+        payload = _subsystem_payload(s)
+        payload["index"] = index_version(meta)
+        payload["directories"] = [
+            {
+                "path": row["path"],
+                "primary_files": row["n_primary"],
+                "claimed_files": row["n_claimed"],
+                "coverage": row["coverage"],
+            }
+            for row in directory_rows
+        ]
         if args.files:
             payload["files"] = [r["path"] for r in conn.execute(
                 "SELECT f.path FROM files f JOIN path_subsys p ON p.ref_kind='file'"
@@ -1214,18 +1629,25 @@ def cmd_subsystem(args):
         print(f"  list         {lst}")
     for tree in f["trees"][:3]:
         print(f"  git          {tree}")
-    if s["web"]:
-        print(f"  web          {s['web']}")
-    print(f"  files        {s['n_files']:,}")
+    for website in f["websites"]:
+        print(f"  web          {website}")
+    for url in f["patchwork"]:
+        print(f"  patchwork    {url}")
+    for url in f["bugs"]:
+        print(f"  bugs         {url}")
+    for chat in f["chats"]:
+        print(f"  chat         {chat}")
+    for profile in f["profiles"]:
+        print(f"  profile      {profile}")
+    if f["keywords"]:
+        print(f"  keywords     {', '.join(f['keywords'])}")
+    print(f"  files        {s['n_files']:,} claimed, "
+          f"{s['n_primary_files']:,} primary")
 
-    print(render.paint("\n  Top directories", "1", color))
-    n = args.limit if args.limit else 10**9
-    for r in conn.execute(
-        "SELECT d.path, d.n_files FROM dirs d JOIN path_subsys p"
-        " ON p.ref_kind='dir' AND p.ref_id=d.id WHERE p.subsystem_id=?"
-        " ORDER BY d.n_files DESC, d.path LIMIT ?", (s["id"], n)
-    ):
-        print(f"    {r['path'] + '/':<50} {r['n_files']:>5} files")
+    print(render.paint("\n  Directory composition", "1", color))
+    for r in directory_rows:
+        print(f"    {r['path'] + '/':<48} {r['n_primary']:>5} primary  "
+              f"{r['n_claimed']:>5} claimed  {r['coverage']:>6.1%}")
 
     if args.files:
         print(render.paint("\n  Files", "1", color))
@@ -1238,7 +1660,7 @@ def cmd_subsystem(args):
 
 def cmd_tree(args):
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target or "")
+    res = resolve_or_die(conn, args.target or "", meta)
     t = res.target
     base = t.path if t.kind == "dir" else query.parent_path(t.path)
     color = render.use_color(args.color)
@@ -1291,12 +1713,15 @@ def cmd_tree(args):
 def cmd_path(args):
     """Print the on-disk path, so `$EDITOR $(ka path tcp_sendmsg)` just works."""
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target)
+    res = resolve_or_die(conn, args.target, meta)
+    _require_unique_symbol_identity(res, args.target)
     t = res.target
     if args.line and t.kind != "symbol":
         _die("--line only applies to symbols")
     tree = source_tree(meta)
     full = source_member(tree, t.path)
+    if not full.exists() and not full.is_symlink():
+        _die(f"{full} is missing from the source tree")
     if args.line and t.kind == "symbol":
         print(f"{full}:{t.line}")
     else:
@@ -1305,10 +1730,13 @@ def cmd_path(args):
 
 def cmd_show(args):
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target)
+    res = resolve_or_die(conn, args.target, meta)
+    _require_unique_symbol_identity(res, args.target)
     t = res.target
     if t.kind == "dir":
-        _die(f"{t.path} is a directory; try '{PROG} ls {t.path}'")
+        prefix = _command_prefix(args, meta)
+        target = shlex.quote(_target_spec(t))
+        _die(f"{t.path} is a directory; try '{prefix} ls {target}'")
     if t.kind == "symbol" and args.lines:
         _die("--lines applies to files; use --context for a symbol")
     if t.kind != "symbol" and args.context:
@@ -1344,8 +1772,9 @@ def cmd_show(args):
     else:
         size = full.stat().st_size
         if size > _MAX_SHOW:
+            prefix = _command_prefix(args, meta)
             _die(f"{t.path} is {size:,} bytes; pass --lines N:M or open it with "
-                 f"$EDITOR $({PROG} path {t.path})")
+                 f"$EDITOR $({prefix} path {shlex.quote(t.path)})")
         start, end = 1, None
 
     color = render.use_color(args.color)
@@ -1449,7 +1878,9 @@ def cmd_trace(args):
             "area": area[0] if area else None,
             # What to show: a precise subsystem beats the catch-all section.
             "label": specific or (area[0] if area else name_of) or "?",
-            "ambiguous": len(res.candidates),
+            "ambiguous": sum(
+                candidate.symbol_kind in ("function", "syscall")
+                for candidate in res.candidates),
             "index": version,
         })
 
@@ -1485,21 +1916,41 @@ def cmd_trace(args):
 
 def cmd_calls(args):
     conn, meta = open_index(args)
+    _reject_symbol_size_sort(args, query.SYMBOL_KINDS)
     if meta.get("has_calls") != "1":
-        _die(f"this index ({index_version(meta)}) has no call graph — rebuild with "
-             f"'{PROG} build {index_version(meta)} --with-calls'")
-    res = (resolve_or_die(conn, args.target) if ":" in args.target
-           else query.resolve_symbol(conn, args.target))
+        advice = _call_graph_rebuild_advice(args, meta)
+        _die(f"this index ({index_version(meta)}) has no call graph — {advice}")
+    target_spec = _normalize_target_spec(meta, args.target)
+    res = (resolve_or_die(conn, target_spec) if ":" in target_spec
+           else query.resolve_symbol(conn, target_spec))
     if res.target is None:
         _die(res.note)
     t = res.target
     if t.kind != "symbol" or t.symbol_kind not in ("function", "syscall"):
         _die(f"{t.display} is not a function or syscall")
+    callable_alternatives = [
+        candidate for candidate in res.candidates
+        if candidate.symbol_kind in ("function", "syscall")
+    ]
+    if callable_alternatives:
+        candidates = [t, *callable_alternatives]
+        same_file = len({candidate.path for candidate in candidates}) \
+            < len(candidates)
+        qualifier = "path:line" if same_file else "path:symbol"
+        examples = ", ".join(
+            f"{candidate.path}:{candidate.line}" if same_file
+            else candidate.display
+            for candidate in candidates[:3])
+        _die(f"{len(callable_alternatives) + 1} callable definitions are named "
+             f"{t.name!r}; qualify the target as {qualifier}"
+             + (f" (for example: {examples})" if examples else ""))
     if _split_list(args.kinds):
-        selected_kinds = [k for k in kinds_from_args(args, None)
-                          if k in query.SYMBOL_KINDS]
-        if not selected_kinds:
-            _die("calls only lists symbols; use a symbol kind with --kinds")
+        selected_kinds = kinds_from_args(args, None)
+        invalid = [kind for kind in selected_kinds
+                   if kind not in ("function", "syscall")]
+        if not selected_kinds or invalid:
+            _die("calls only lists function and syscall identities; use "
+                 "--kinds function,syscall")
 
     narrowing = bool(args.grep or args.static_only or args.no_static
                      or args.exported or _split_list(args.kinds))
@@ -1508,39 +1959,23 @@ def cmd_calls(args):
     want_subsystem = (args.format != "names"
                       and (args.with_subsystem
                            or "subsystem" in explicit_columns))
-    default_columns = ("kind", "name", "path", "line") + (
+    default_columns = ("kind", "name", "path", "line", "resolution") + (
         ("subsystem",) if want_subsystem else ())
 
     if args.callers:
-        entries = _post_filter(query.callers(conn, t.name, limit=fetch), args)
+        entries = _post_filter(query.callers(conn, t.id, limit=fetch), args)
         query.sort_entries(entries, args.sort)
         if args.limit:
             entries = entries[:args.limit]
         if want_subsystem:
             query.annotate_subsystems(conn, entries)
         emit(entries, args, {"function"}, want_subsystem,
-             f"Functions that call {t.name}  [{_linux(meta)}]\n",
+             f"Functions that call {t.display}  [{_linux(meta)}]\n",
              index=index_version(meta),
              default_columns=default_columns)
         return
 
-    names = query.callees(conn, t.id, limit=fetch)
-    entries: list[Entry] = []
-    for n in names:
-        r = query.resolve_symbol(conn, n)
-        if r.target is not None and r.target.kind == "symbol":
-            entries.append(Entry(kind=r.target.symbol_kind or "function", name=n,
-                                 path=r.target.path, line=r.target.line,
-                                 end_line=r.target.end_line,
-                                 signature=r.target.signature,
-                                 is_static=r.target.is_static,
-                                 is_inline=r.target.is_inline,
-                                 is_exported=r.target.is_exported,
-                                 ref_id=r.target.id))
-        else:
-            # A callee with no definition anywhere in the index: usually a
-            # compiler builtin or a macro the parser could not attribute.
-            entries.append(Entry(kind="?", name=n, path="-"))
+    entries = query.callee_entries(conn, t.id, limit=fetch)
     entries = _post_filter(entries, args)
     query.sort_entries(entries, args.sort)
     if args.limit:
@@ -1553,10 +1988,244 @@ def cmd_calls(args):
          default_columns=default_columns)
 
 
+def _relationship_subsystem(conn, meta: dict, spec: str):
+    exact = conn.execute(
+        "SELECT * FROM subsystems WHERE name = ?", (spec,)).fetchall()
+    if exact:
+        return exact[0], None
+    folded = conn.execute(
+        "SELECT * FROM subsystems WHERE name = ? COLLATE NOCASE ORDER BY name",
+        (spec,)).fetchall()
+    if len(folded) == 1:
+        return folded[0], None
+    if len(folded) > 1:
+        names = ", ".join(row["name"] for row in folded[:8])
+        _die(f"{spec!r} is ambiguous under case-insensitive matching: {names}")
+
+    normalized = _normalize_target_spec(meta, spec)
+    resolved = query.resolve(conn, normalized)
+    if resolved.target is not None:
+        if resolved.candidates:
+            candidates = [resolved.target, *resolved.candidates]
+            owners = [query.subsystem_for_target(conn, candidate)
+                      for candidate in candidates]
+            owner_ids = {owner["id"] for owner in owners if owner is not None}
+            if len(owner_ids) == 1 and all(
+                    owner is not None and owner["name"] not in query.CATCH_ALL
+                    for owner in owners):
+                subsystem = next(owner for owner in owners
+                                 if owner["id"] in owner_ids)
+                note = (f"all {len(candidates)} matches for {spec!r} belong to "
+                        f"{subsystem['name']}")
+                return subsystem, note
+            same_file = len({candidate.path for candidate in candidates}) \
+                < len(candidates)
+            qualifier = "path:line" if same_file else "path:symbol"
+            examples = ", ".join(
+                f"{candidate.path}:{candidate.line}" if same_file
+                else candidate.display
+                for candidate in candidates[:4])
+            _die(f"target {spec!r} is ambiguous; qualify it as {qualifier}"
+                 + (f" (for example: {examples})" if examples else ""))
+        subsystem = query.subsystem_for_target(conn, resolved.target)
+        if subsystem is None and resolved.target.kind == "dir":
+            owners = query.directory_primary_subsystems(
+                conn, resolved.target.id)
+            specific = [row for row in owners
+                        if row["name"] not in query.CATCH_ALL]
+            if len(owners) > 1:
+                examples = ", ".join(
+                    f"{row['name']} ({row['coverage']:.0%})"
+                    for row in specific[:5])
+                _die(f"{resolved.target.display} has mixed ownership across "
+                     f"{len(owners)} primary owners; name a subsystem explicitly"
+                     + (f" ({examples})" if examples else ""))
+        if subsystem is None and resolved.target.kind != "dir":
+            file_id = resolved.target.file_id or resolved.target.id
+            owners = query.file_primary_subsystems(conn, file_id)
+            specific = [row for row in owners
+                        if row["name"] not in query.CATCH_ALL]
+            if len(specific) > 1:
+                examples = ", ".join(row["name"] for row in specific[:5])
+                _die(f"{resolved.target.display} has {len(specific)} "
+                     "co-primary subsystem owners; name a subsystem explicitly"
+                     + (f" ({examples})" if examples else ""))
+        if subsystem is None or subsystem["name"] in query.CATCH_ALL:
+            _die(f"{resolved.target.display} has no specific subsystem owner")
+        note = f"resolved {spec!r} to {subsystem['name']}"
+        return subsystem, note
+
+    matches = query.subsystem_by_name(conn, spec)
+    if not matches:
+        _die(f"no target or subsystem matching {spec!r}")
+    if len(matches) > 1:
+        names = ", ".join(row["name"] for row in matches[:8])
+        _die(f"{spec!r} matches {len(matches)} subsystems; use a more specific "
+             f"name ({names})")
+    return matches[0], None
+
+
+def cmd_relationships(args):
+    """Show ownership overlap and conservative direct-call flow."""
+    if args.via == "ownership":
+        if args.direction != "both" or args.include_internal or args.min_calls != 1:
+            _die("--direction, --include-internal and --min-calls apply only to "
+                 "call relationships")
+    elif args.via == "calls" and args.min_shared != 1:
+        _die("--min-shared applies only to ownership relationships")
+    conn, meta = open_index(args)
+    subsystem, note = _relationship_subsystem(conn, meta, args.target)
+    version = index_version(meta)
+
+    overlaps = []
+    if args.via in {"all", "ownership"}:
+        overlaps = relationships.ownership_overlaps(
+            conn, subsystem["id"], min_files=args.min_shared, limit=args.limit)
+
+    has_calls = meta.get("has_calls") == "1"
+    if args.via == "calls" and not has_calls:
+        advice = _call_graph_rebuild_advice(args, meta)
+        _die(f"this index ({version}) has no call graph — {advice}")
+    flows = []
+    coverage = None
+    if args.via in {"all", "calls"} and has_calls:
+        flows = relationships.call_flows(
+            conn, subsystem["id"], direction=args.direction,
+            include_internal=args.include_internal,
+            min_edges=args.min_calls, limit=args.limit)
+        coverage = relationships.call_resolution_coverage(conn, subsystem["id"])
+
+    summary = {
+        "name": subsystem["name"],
+        "status": subsystem["status"],
+        "claimed_files": subsystem["n_files"],
+        "primary_files": subsystem["n_primary_files"],
+    }
+    payload = {
+        "subsystem": summary,
+        "resolved_from": note,
+        "index": version,
+        "call_graph_available": has_calls,
+        "ownership_overlaps": [row.as_dict() for row in overlaps],
+        "call_flows": [row.as_dict() for row in flows],
+        "outgoing_call_resolution": coverage,
+    }
+    if args.format == "json":
+        sys.stdout.write(render.render_json(payload))
+        return
+
+    if args.format == "csv":
+        fields = (
+            "relationship", "direction", "selected_subsystem", "subsystem",
+            "source_subsystem", "target_subsystem", "unclassified", "edges",
+            "shared_files", "selected_files", "other_files",
+            "selected_coverage", "other_coverage", "jaccard",
+            "callers", "callees", "source_files", "target_files", "internal",
+            "total_calls", "resolved_calls", "same_file", "included_source",
+            "unique_global", "ambiguous", "macro", "indirect", "unresolved",
+            "index",
+        )
+        writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+        writer.writeheader()
+        for row in overlaps:
+            writer.writerow({
+                "relationship": "ownership", "direction": "overlap",
+                "selected_subsystem": subsystem["name"],
+                "subsystem": row.subsystem, "shared_files": row.shared_files,
+                "selected_files": row.selected_files,
+                "other_files": row.other_files,
+                "selected_coverage": row.selected_coverage,
+                "other_coverage": row.other_coverage, "jaccard": row.jaccard,
+                "index": version,
+            })
+        for row in flows:
+            other = row.subsystem or ""
+            source_subsystem = (subsystem["name"]
+                                if row.direction == "outgoing" else other)
+            target_subsystem = (other if row.direction == "outgoing"
+                                else subsystem["name"])
+            writer.writerow({
+                "relationship": "call", "direction": row.direction,
+                "selected_subsystem": subsystem["name"],
+                "subsystem": other, "source_subsystem": source_subsystem,
+                "target_subsystem": target_subsystem,
+                "unclassified": row.unclassified, "edges": row.edges,
+                "callers": row.callers, "callees": row.callees,
+                "source_files": row.source_files,
+                "target_files": row.target_files, "internal": row.internal,
+                "index": version,
+            })
+        if coverage is not None:
+            writer.writerow({
+                "relationship": "call_resolution", "direction": "outgoing",
+                "selected_subsystem": subsystem["name"],
+                "total_calls": coverage["total"],
+                "resolved_calls": coverage["resolved"],
+                "same_file": coverage["same_file"],
+                "included_source": coverage["included_source"],
+                "unique_global": coverage["unique_global"],
+                "ambiguous": coverage["ambiguous"],
+                "macro": coverage["macro"],
+                "indirect": coverage["indirect"],
+                "unresolved": coverage["unresolved"],
+                "index": version,
+            })
+        return
+
+    color = render.use_color(args.color)
+    print(render.paint(f"{subsystem['name']} relationships  [{_linux(meta)}]",
+                       "1;35", color))
+    if note:
+        print(render.paint(f"  ({note})", "33", color))
+    print(f"  files  {subsystem['n_files']:,} claimed, "
+          f"{subsystem['n_primary_files']:,} primary")
+
+    if args.via in {"all", "ownership"}:
+        print(render.paint("\n  Ownership overlap", "1", color))
+        if overlaps:
+            print(f"    {'SHARED':>6} {'THIS':>7} {'OTHER':>7} {'JACCARD':>8}  "
+                  "SUBSYSTEM")
+            for row in overlaps:
+                print(f"    {row.shared_files:>6,} "
+                      f"{row.selected_coverage:>7.1%} "
+                      f"{row.other_coverage:>7.1%} {row.jaccard:>8.1%}  "
+                      f"{row.subsystem}")
+        else:
+            print("    no overlap at this threshold")
+
+    if args.via in {"all", "calls"}:
+        print(render.paint("\n  Direct C invocation flow", "1", color))
+        if not has_calls:
+            advice = _call_graph_rebuild_advice(args, meta)
+            print(f"    unavailable — {advice}")
+        elif flows:
+            print(f"    {'DIRECTION':<9} {'EDGES':>7} {'CALLERS':>7} "
+                  f"{'CALLEES':>7}  SUBSYSTEM")
+            for row in flows:
+                label = ("unclassified (MAINTAINERS catch-all)"
+                         if row.unclassified else (row.subsystem or "?"))
+                if row.internal:
+                    label += " (internal)"
+                print(f"    {row.direction:<9} {row.edges:>7,} "
+                      f"{row.callers:>7,} {row.callees:>7,}  {label}")
+        else:
+            print("    no resolved cross-subsystem calls at this threshold")
+        if coverage is not None:
+            excluded = (coverage["ambiguous"] + coverage["macro"]
+                        + coverage["indirect"]
+                        + coverage["unresolved"])
+            print(render.paint(
+                f"\n    outgoing resolution: {coverage['resolved']:,}/"
+                f"{coverage['total']:,} edges resolved; {excluded:,} retained "
+                "only as ambiguity/macro/indirect/unresolved coverage",
+                "90", color))
+
+
 def cmd_web(args):
     """Print Elixir / git.kernel.org / GitHub / docs.kernel.org URLs."""
     conn, meta = open_index(args)
-    res = resolve_or_die(conn, args.target)
+    res = resolve_or_die(conn, args.target, meta)
+    _require_unique_symbol_identity(res, args.target)
     t = res.target
     lnks = _links_for(meta, t)
     version = index_version(meta)
@@ -1595,7 +2264,7 @@ def cmd_web(args):
 
 def cmd_docs(args):
     conn, meta = open_index(args)
-    res = _resolve_area(conn, args.target)
+    res = _resolve_area(conn, args.target, meta)
     t = res.target
     entries = query.documentation_for(conn, t, limit=args.limit)
     if not entries:
@@ -1622,8 +2291,10 @@ def cmd_docs(args):
         print(render.paint(f"  ({res.note})", "33", color))
     for e in entries:
         print(f"  {e.path}")
+    prefix = _command_prefix(args, meta)
+    first = shlex.quote(entries[0].path)
     print(render.paint(f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
-                       f"   Next: {PROG} web {entries[0].path}", "90", color))
+                       f"   Next: {prefix} web {first}", "90", color))
 
 
 def cmd_locate(args):
@@ -1646,6 +2317,7 @@ def cmd_locate(args):
                else []) + rest
 
     spec = args.target
+    resolved_spec = spec
     rows = []
     for path in ordered:
         conn = None
@@ -1656,7 +2328,12 @@ def cmd_locate(args):
                 meta = db.validate_schema(conn)
                 meta["index_stem"] = path.stem
                 version = index_version(meta)
-                res = query.resolve(conn, spec)
+                # An absolute path belongs to the active index's recorded
+                # source tree.  Normalize it once there, then reuse the
+                # repository-relative target when comparing other versions.
+                if is_active:
+                    resolved_spec = _normalize_target_spec(meta, spec)
+                res = query.resolve(conn, resolved_spec)
             except (sqlite3.Error, OSError) as exc:
                 rows.append({"version": path.stem, "found": False,
                              "active": is_active, "error": str(exc)})
@@ -1823,6 +2500,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_stats)
 
+    sp = add("check", aliases=["doctor"],
+             help="deep-check index counts and call identities")
+    sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.set_defaults(func=cmd_check)
+
     sp = add("info", help="explain one folder, file or symbol")
     sp.add_argument("target", help="mm | mm/page_alloc.c | tcp_sendmsg | "
                                    "tcp.c:tcp_sendmsg | mm/page_alloc.c:5268")
@@ -1861,7 +2543,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("subsystems", help="list subsystems from MAINTAINERS")
     sp.add_argument("--grep", "-g")
-    sp.add_argument("--sort", default="size", choices=("size", "name"))
+    sp.add_argument("--sort", default="size",
+                    choices=("size", "claimed", "primary", "name"))
     sp.add_argument("--limit", "-n", type=_nonneg_int, default=0)
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystems)
@@ -1931,6 +2614,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_filter_opts(sp)
     _add_output_opts(sp, limit_default=200)
     sp.set_defaults(func=cmd_calls)
+
+    sp = add(
+        "relationships", aliases=["rels"],
+        help="ownership overlap and call flow between subsystems")
+    sp.add_argument(
+        "target",
+        help="a subsystem name or any folder, file, or symbol in that subsystem")
+    sp.add_argument("--via", choices=("all", "ownership", "calls"), default="all",
+                    help="relationship evidence to show (default: all)")
+    sp.add_argument("--direction", choices=("both", "outgoing", "incoming"),
+                    default="both", help="call-flow direction (default: both)")
+    sp.add_argument("--include-internal", action="store_true",
+                    help="include calls which stay inside the selected subsystem")
+    sp.add_argument("--min-shared", type=_positive_int, default=1,
+                    help="minimum shared files for an ownership row")
+    sp.add_argument("--min-calls", type=_positive_int, default=1,
+                    help="minimum resolved edges for a call-flow row")
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=20,
+                    help="max rows per ownership/direction group "
+                         "(default: 20; 0 = all)")
+    sp.add_argument("--format", "-f", default="table",
+                    choices=("table", "json", "csv"))
+    sp.set_defaults(func=cmd_relationships)
 
     return p
 

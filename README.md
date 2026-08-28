@@ -8,6 +8,7 @@ file map, extracts the C symbols it can parse, and maps each path to a
 
 - What else lives next to this folder, file, or function?
 - Which subsystem owns this symbol, and who maintains it?
+- Which subsystems overlap, and which ones call into one another?
 - I have a name from an oops. Where is it defined?
 - Show me the source, an editor path, or the Elixir / docs.kernel.org page.
 - Did this symbol move between the LTS I am running and another release?
@@ -102,7 +103,9 @@ ka find tcp_sendmsg --exact   # where is this symbol?
 ka show tcp_sendmsg           # print its source
 ka web tcp_sendmsg            # Elixir / git.kernel.org / GitHub URLs
 ka docs mm                    # Documentation/ files for this area
+ka relationships SCHEDULER    # overlap and resolved flow across subsystems
 ka locate tcp_sendmsg         # same symbol in every built index
+ka check                      # deep-check the active index
 dmesg | ka trace              # map a backtrace to subsystems
 ```
 
@@ -206,7 +209,7 @@ cannot publish one another's partial work.
 | --- | --- |
 | `--src PATH` | index a kernel tree you already have (version from its `Makefile`, unless an explicit positional version is supplied) |
 | `--kinds LIST` | symbol kinds to index (default: `function,syscall,struct,union,enum,typedef,macro,variable`; add `prototype` if wanted) |
-| `--with-calls` | also record the call graph (enables `ka calls`; a few hundred MB extra) |
+| `--with-calls` | also record the call graph (enables `ka calls`; a few hundred MB extra; requires the `macro` and `variable` kinds used to prevent false identities) |
 | `--jobs N` | parser processes (default: one per CPU, max 16) |
 | `--output PATH` | write the index somewhere specific |
 | `--keep-tarball` | keep the `.tar.xz` after extraction |
@@ -222,7 +225,9 @@ Linux 6.18.46 on a laptop is about 6,000 directories, 91,000 files, 4.05
 million symbols, 3,100 subsystems, a minute to index. Most of the size is the
 kernel's ~2.9 million macros; `--kinds function,syscall,struct,enum,typedef`
 is much smaller if you do not need them. The build summary and `ka stats`
-separately report files that were parsed, skipped, or failed.
+separately report files that were parsed, skipped, or failed. Before a completed
+index becomes active, the same deep structural and semantic audit exposed by
+`ka check` is run against it.
 
 ## Naming a target
 
@@ -238,6 +243,7 @@ ka info mm/page_alloc.c:5268               # whichever symbol spans that line
 ka info page_alloc.c                       # a bare filename (reports if ambiguous)
 ka info sched                              # a bare directory name
 ka info .                                  # the kernel root
+ka info /absolute/path/to/linux/mm/page_alloc.c:5268
 ```
 
 When a name is ambiguous (a definition per architecture, a stub in
@@ -247,6 +253,16 @@ lose to the real tree, shallower paths beat nested stubs — and the
 alternatives are listed. Typos get "did you mean" suggestions.
 `net/ipv4/tcp.c:no_such_fn` tells you the file exists but that symbol does
 not, instead of guessing what the whole string might mean.
+
+Commands which act on one concrete source identity (`calls`, `show`, `path`,
+and `web`) do not accept that ranking as proof. Use `path:symbol` when
+same-named definitions are in different files, or `path:line` when more than
+one definition occurs in the same file. An absolute target is accepted only
+when it is inside the exact
+recorded source tree for the selected index and that tree is still available;
+it is normalized to the indexed relative path and may retain a `:line` or
+`:symbol` suffix. An absolute path never switches the active index or silently
+substitutes a different source snapshot.
 
 `ka docs bpf` is the exception: a bare name prefers the *area directory*
 (`kernel/bpf/`) over a symbol that happens to share it. `ka info bpf` still
@@ -277,6 +293,13 @@ next to a function.
 | `subtree` | that directory and everything beneath it |
 | `subsystem` | every file the target's subsystem claims |
 | `tree` | the entire kernel |
+
+`--level subsystem` needs a single defensible owner: a file (and therefore a
+symbol) must have exactly one primary owner, while every descendant file of a
+directory must be covered by the same non-catch-all owner. A co-primary file or
+mixed/partially unclassified directory is rejected instead of arbitrarily
+choosing one section; name the section with `ka subsystem NAME --files` when
+you want its claimed-file view explicitly.
 
 ```bash
 ka siblings kernel/sched                              # other core-kernel dirs
@@ -311,20 +334,38 @@ Totals for the active index, symbols by kind, and the largest top-level
 directories with a one-line description (`mm` → Memory management, `net` →
 Networking). Useful as a first orientation.
 
+### `check` / `doctor`
+
+Runs the full row-level audit used before a completed build becomes active. It
+checks metadata and roll-up counts, value types and ranges, safe path topology,
+symbol/file compatibility, ownership ranks and co-primary ties, source-include
+records, call identities, and every reconstructible non-indirect resolution
+classification.
+Normal queries perform a faster schema/metadata check; use `ka check` after
+copying an index, receiving a custom `--db`, or when corruption is suspected.
+`-f json` provides a small machine-readable success result; a failed audit exits
+with an error instead of treating the index as sound.
+
 ### `info`
 
 The "what is this?" command. For a directory: how many files sit in it, the
-top-level *area* (plain English for `mm/`, `net/`, `kernel/`, …), every
-*interesting* `MAINTAINERS` section (most precise first, with maintainers
-and lists — the catch-all `THE REST` is omitted), a walk of parent
-directories, the on-disk path, and an Elixir URL.
+top-level *area* (plain English for `mm/`, `net/`, `kernel/`, …), its subsystem
+composition derived from descendant files, a walk of parent directories, the
+recorded on-disk path, and an Elixir URL. Composition rows are ranked by primary
+and claimed descendants and show both counts plus coverage; they do not pretend
+a mixed directory has one owner.
 
-For a file: size, line count, and how many symbols of each kind it defines.
+For a file: size, line count, parse status, how many symbols of each kind it
+defines, and every non-catch-all `MAINTAINERS` match ordered by specificity.
+Every section tied for the strongest evidence is marked primary, so equal
+claims remain visible as co-primary rather than being broken by name order.
+Catch-all-only and genuinely unmatched files are shown as **Unclassified**.
 
 For a symbol: kind, line span, signature, linkage (`EXPORT_SYMBOL` /
 `static` / global), plus Elixir's *ident* page (every use of that name).
 
-`-f json` dumps the same facts, including a `links` object.
+`-f json` dumps the same facts, including `links`, `source_path`,
+`source_exists`, and structured unclassified-ownership information.
 `--max-subsystems` and `--max-candidates` trim the two lists that can get
 long.
 
@@ -400,7 +441,9 @@ grep -rn lock_sock $(ka path net/ipv4)
 
 `--line` appends `:LINE` for symbols. This needs the exact source tree recorded
 in the index (the managed tree under `kernels/` or the original `--src` tree);
-`info`, `siblings`, `find`, `web`, `docs` and `locate` do not.
+the requested indexed member must still exist there. `info`, `siblings`,
+`find`, `web`, `docs` and `locate` still work from the snapshot when source is
+missing (and `info` reports the recorded path as missing).
 
 `show` prints source without leaving the terminal. Given a symbol, it prints
 exactly that symbol:
@@ -453,9 +496,12 @@ open $(ka web tcp_sendmsg --url elixir)
 open $(ka web Documentation/mm/index.rst --url docs)
 ```
 
-`docs` lists `Documentation/` files that belong with a target.
-`Documentation/<name>/` is listed first. Bare names like `bpf` mean the
-*area* (`kernel/bpf/`), not the LSM hook variable of the same name.
+`docs` lists `Documentation/` files that belong with a target. Ranking combines
+several independent signals before applying `--limit`: an exact/contained
+Documentation path, primary-owner claims, semantic names from the target and
+its declarations, path terms, and known code-to-doc area aliases. This keeps a
+specific guide ahead of an incidental broad-owner match. Bare names like `bpf`
+mean the *area* (`kernel/bpf/`), not the LSM hook variable of the same name.
 
 ```bash
 ka docs mm
@@ -506,9 +552,11 @@ number of frames (`0` = all; default 100).
 
 ### `subsystems` / `subsystem`
 
-`subsystems` lists every section parsed out of `MAINTAINERS`, with file count
-and status. `--grep` is a regex on the name; `--sort size|name`; `-n` limits
-the list (`0` = all).
+`subsystems` lists every section parsed out of `MAINTAINERS`, including
+metadata-only sections which currently claim no files. It distinguishes files
+the section **claims** from files for which it is the most specific
+(`primary`) match. `--grep` is a regex on the name;
+`--sort size|claimed|primary|name`; `-n` limits the list (`0` = all).
 
 ```bash
 ka subsystems --grep '^SCHED'
@@ -517,10 +565,12 @@ ka subsystems --grep '^SCHED'
 ka subsystems --sort size -n 10
 ```
 
-`subsystem NAME` is the detail view: maintainers, reviewers, lists, git tree,
-website, file count, and the top directories that section claims. A unique
-substring is enough (`ka subsystem SCHEDULER`). `--files` lists every claimed
-file (can be thousands). `-n 0` shows every top directory.
+`subsystem NAME` is the detail view: all recorded contact and project metadata,
+claimed/primary file counts, and the directories where its descendant files
+are concentrated. Directory rows report primary files, claimed files, and
+coverage of that directory rather than pretending that a mixed directory has
+one owner. A unique substring is enough (`ka subsystem SCHEDULER`). `--files`
+lists every claimed file (can be thousands). `-n 0` shows every directory.
 
 ### `calls`
 
@@ -535,10 +585,83 @@ ka calls tcp_sendmsg --callers
 # tcp_bpf_sendmsg  (the BPF sockmap hook)
 ```
 
-It matches on **name only**, so it cannot see calls through function pointers
-— which the kernel uses everywhere (ops structs, `.read()`, `.bmap`). A
-callee with no definition anywhere in the index (compiler builtin, unexpanded
-macro) is listed with kind `?`.
+Invocation names are resolved conservatively. A unique callable in the same
+translation unit wins: `same_file` means the definition is in the caller's
+file, while `included_source` means it came from a transitively quoted
+`#include "member.c"`. If one member is included by several top-level sources,
+every translation-unit instance must reach the same identity; the effective
+build domain comes from each root, not from the member's pathname. Otherwise,
+only one non-static callable in every compatible root context can become
+`unique_global`. Indexed macros, function-pointer
+objects/variables, static header alternatives, architecture alternatives, and
+duplicate definitions block a guessed identity. Every row retains one of these
+outcomes in the `resolution` column:
+
+| Resolution | Meaning |
+| --- | --- |
+| `same_file` | one callable identity in the caller's source file |
+| `included_source` | one callable identity in a quoted `.c` member of the translation unit |
+| `unique_global` | one compatible non-static identity across files |
+| `ambiguous` | relevant definitions or blockers exist, but do not prove one identity |
+| `macro` | the invocation name is provided only by an indexed macro |
+| `indirect` | a local, parameter, or file-scope function-pointer/object binding is invoked |
+| `unresolved` | no indexed identity or blocker establishes what the name denotes |
+
+Reverse lookup uses only the selected symbol's resolved identity, so unrelated
+static functions with the same name are not mixed together. If a target itself
+has several callable definitions, use `path:symbol` across files or `path:line`
+for duplicates within one file rather than accepting a guessed definition.
+
+Cross-file compatibility follows available build evidence. Kbuild
+`hostprogs`/`userprogs`/`tprogs-y` and their multi-object declarations form
+independently linked program domains; boot/compressed images, vDSO-style
+images, EFI stub code, and `.bpf.c` programs are kept out of the vmlinux
+namespace. Unmodelled auxiliary sources (notably `tools/`, `scripts/`, and
+Documentation helpers) are isolated rather than linked by spelling, and one
+architecture is never bound to another. Architecture code may use its own
+domain and generic kernel identities, subject to architecture alternatives
+blocking an unsafe choice. Common and architecture-header identities also
+block unsafe promotion inside separate images without making vmlinux globals
+linkable there. Literal or locally expanded Kbuild compile/link object lists
+preserve a standalone context for dual-use sources that are also included as
+`.c` members, and member definitions inherit each root object's domain.
+
+This is intentionally a lower-bound graph, not a whole-program C analysis.
+Bare calls through local/parameter/file-scope pointer objects are retained as
+`indirect`, but the runtime target is not inferred; member/ops-table dispatch
+and code generated entirely by macros do not become concrete edges. A source
+object explicitly linked into several independent Kbuild programs is isolated,
+so some valid cross-file program edges can remain unresolved. These gaps stay
+visible in `ka stats` and `ka relationships` coverage instead of being promoted
+to plausible-looking targets.
+
+### `relationships` (`rels`)
+
+Shows how a subsystem relates to others using two separate forms of evidence:
+
+- **ownership overlap**: MAINTAINERS sections which claim the same files,
+  including coverage and Jaccard similarity;
+- **direct C invocation flow**: identity-resolved calls crossing disjoint sets
+  of primary file owners, with caller/callee counts and resolution coverage.
+
+```bash
+ka relationships SCHEDULER
+ka rels kernel/futex --via ownership
+ka relationships 'MEMORY MANAGEMENT - CORE' --direction outgoing --min-calls 5
+```
+
+The target can be a subsystem name or a directory, file, or symbol that
+resolves to one. Use `--via ownership|calls|all`,
+`--direction incoming|outgoing|both`, `--include-internal`, `--min-shared`,
+`--min-calls`, and `-n` (per ownership/direction group). JSON and CSV retain
+the two evidence types as distinct records. Calls whose other endpoint has only
+the catch-all `THE REST` owner—or no primary owner at all—are labelled
+unclassified rather than presented as a subsystem. If source and target files
+share even one co-primary owner, the call is internal to that shared boundary
+and does not manufacture a cross-subsystem relationship between their other
+owners. Only `same_file`, `included_source`, and `unique_global` identities
+contribute flow edges; the other outcomes remain explicit coverage counts. Call
+flow requires an index built with `--with-calls`.
 
 ## A tour across subsystems
 
@@ -577,10 +700,13 @@ ka ls kernel/sched --kinds file --sort lines -n 5
 # fair.c 14196   core.c 10906   ext.c 6994   sched.h 3929   deadline.c 3740
 ka info schedule              # kernel/sched/core.c:7027, subsystem SCHEDULER
 ka subsystem SCHEDULER        # who to mail, which git tree
+ka relationships SCHEDULER    # ownership overlap + cross-subsystem calls
 ```
 
-`kernel/futex` has no dedicated `MAINTAINERS` section. `info` then shows the
-Area (Core kernel) and skips dumping `THE REST` and its 90k files.
+`kernel/futex` is a useful test of directory ownership: its `F:` rule names
+the files immediately below it, and `info` correctly rolls those file matches
+up to the dedicated FUTEX SUBSYSTEM instead of glob-matching the directory
+string itself.
 
 ### Networking
 
@@ -706,7 +832,7 @@ Listing commands (`siblings`, `ls`, `find`, `calls`) share these controls:
 | Option | Values / meaning |
 | --- | --- |
 | `--format`, `-f` | `table` (default), `plain`, `names`, `json`, `csv`, `tree` |
-| `--columns`, `-c` | comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature` |
+| `--columns`, `-c` | comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature,resolution` |
 | `--limit`, `-n` | max rows; `0` = all (`find` defaults to 50, `calls` to 200) |
 | `--sort` | `name`, `path`, `kind`, `line`, `size`, `lines` (size/lines sort descending) |
 | `--grep`, `-g` | keep only names matching a regex (case-insensitive) |
@@ -748,7 +874,8 @@ ka ls mm/page_alloc.c --kinds function --grep 'alloc' -f plain
 
 Unknown `--columns` or `--kinds` values are rejected with the valid list,
 rather than silently ignored. A bad `--grep` regex is a one-line error, not a
-traceback.
+traceback. `resolution` is populated by `calls`; that command only lists
+function/syscall identities, so other requested result kinds are rejected.
 
 ## How subsystems are determined
 
@@ -756,26 +883,48 @@ The kernel ships `MAINTAINERS`, the authoritative statement of who owns what.
 `kernel-atlas` parses its ~3,100 sections rather than hardcoding a table, so
 the mapping is correct for the version you indexed.
 
-Pattern matching follows the rules in that file's own header. `*` never
-crosses a `/`:
+Pattern matching follows Linux's `scripts/get_maintainer.pl` semantics rather
+than a generic filesystem glob. `F:` supplies positive path evidence, `N:` is
+a regex searched against the whole repository-relative path, and an `X:` match
+cancels that section's claim even if one of its `F:`/`N:` rules matched.
 
 ```
-F: drivers/net/     all files in and below drivers/net
-F: drivers/net/*    all files in drivers/net, but not below
-F: */net/*          all files in "any top level directory"/net
-X: path             excluded, even if an F: line above matched
-N: regex            matched against the whole path
+F: drivers/net/       every file below that directory
+F: drivers/net/*      same-depth files immediately inside drivers/net
+F: include/drm/drm    same-depth paths beginning with include/drm/drm
+F: fs/**/*.c          ** explicitly permits additional path components
+X: drivers/net/foo/   remove this section from that subtree
+N: (?:^|/)imx[^/]*    regex evidence searched against the full path
 ```
 
-When several sections match, the most precise one wins, while every matching
-section is retained for `info` and `subsystem --files`. Existing directories
-named by `F:` or `X:` are recursive even when the line omits its trailing
-slash; `?`, `*`, and bracket classes such as `[ch]` follow the kernel matcher.
-The catch-all `THE REST` section claims every path in the tree, so it is never
-*shown* as the answer: a more specific section wins when one exists, and
-otherwise the plain-English *Area* of the top-level directory is used (`mm/`
-→ Memory management, `kernel/` → Core kernel). `find` follows the same rule,
-so a hit in `tools/` is labelled `Tools` rather than `THE REST`.
+The upstream matcher translates a single `*` broadly, then enforces equal slash
+depth for non-directory expressions; that combination is why
+`drivers/net/*` does not reach `drivers/net/ethernet/vendor.c`. A trailing
+slash is recursive, as is a literal path which names an existing directory even
+when the rule omitted the slash. `**` disables the depth restriction. `?` and
+bracket classes such as `[ch]` follow the same matcher, and literal file rules
+are start-anchored prefixes at the same depth rather than exact-string matches.
+
+Matches receive deterministic specificity scores. Every section tied for the
+highest score is a **primary** owner; no arbitrary single winner is invented.
+All lower-ranked claims are retained too, for `info`, ownership-overlap
+analysis, and `subsystem --files`.
+
+`F:` and `N:` rules describe files, not ownership of a directory object.
+Directory views therefore aggregate the actual claims and primary owners of
+all descendant files, including each section's claimed count, primary count,
+and coverage. A directory has a singular subsystem only when exactly one
+non-catch-all section is represented among its primary owners and it covers
+every descendant file; otherwise it is mixed or includes unclassified content.
+That makes a specific directory such as `kernel/futex/` discoverable while a
+mixed boundary such as `drivers/net/wireless/ath/` honestly shows its several
+owners and their coverage.
+
+The catch-all `THE REST` section claims every file in the tree, so it is never
+*shown* as the answer when a specific section exists. Otherwise the
+plain-English *Area* of the top-level directory is used (`mm/` → Memory
+management, `kernel/` → Core kernel). `find` follows the same rule, so a hit in
+`tools/` is labelled `Tools` rather than `THE REST`.
 
 ## How parsing works, and its limits
 
@@ -791,6 +940,11 @@ idioms are handled explicitly:
   per-CPU variants—marks a symbol as available to modules.
 - `DECLARE_WORK(name, fn)`, `DEFINE_MUTEX(name)`, `LIST_HEAD(name)`,
   `DECLARE_BITMAP(name, n)`, `DEFINE_PER_CPU(type, name)` declare `name`.
+- Canonical sysfs attribute families such as `DEVICE_ATTR_*`, `DRIVER_ATTR_*`,
+  `BUS_ATTR_*`, `CLASS_ATTR_*`, `BIN_ATTR_*`, and the supported sensor/IIO
+  forms are recorded under the backing object name they actually generate.
+  Unknown wrapper macros are skipped rather than turning an argument into a
+  fictitious variable.
 - Trailing attribute macros (`____cacheline_aligned_in_smp`) are not mistaken
   for variable names.
 - Declarations inside `#ifdef` *in a function body* are locals, not file-scope.
@@ -800,12 +954,32 @@ idioms are handled explicitly:
 Known limits:
 
 - Code inside `#if` branches is indexed regardless of `.config`.
-- A name defined per-architecture resolves to one likely definition;
-  `ka find --exact <name> -n 0` shows all of them.
+- Interactive target lookup may rank one likely definition of a name that is
+  defined per architecture; `ka find --exact <name> -n 0` shows all of them.
+  Call-identity resolution is stricter and never guesses one architecture.
 - Functions generated entirely by macros other than the ones above are missed.
 - Conditional/configuration-specific export wrappers are not marked exported;
   the index marks literal uses of the canonical `EXPORT*_SYMBOL*` family.
-- The call graph resolves names, not function pointers.
+- Quoted `.c` includes are recognized as translation-unit membership for call
+  identity, including source-tree-root spellings used by vDSO code. Computed
+  includes and build-generated source aggregation are not. A member used by
+  several roots yields a concrete edge only when all roots agree.
+- Standalone evidence for a source that is also included comes from recognized
+  Kbuild object-list families (`obj-*`, `lib-*`, and composite `*-y`/`*-m`/
+  `*-objs` lists) in `Makefile`, `Kbuild`, and tools `Build` files. Local
+  variables and pure `addprefix` object expansion are followed; arbitrary make
+  functions and custom compilation recipes are not, so unmodelled contexts
+  remain a lower-bound limitation.
+- Header inclusion contexts are not modelled. Calls may resolve to identities
+  in the same header, but cross-file candidates for a header-origin call remain
+  ambiguous or unresolved rather than borrowing the header pathname's build
+  domain.
+- The call graph resolves direct identifiers by translation-unit or compatible
+  domain-local unique-global identity. Macro, variable/function-pointer,
+  static-header, cross-tools, and cross-architecture alternatives prevent a
+  guessed identity. Bare calls through local, parameter, or file-scope objects
+  are retained as `indirect`, without inventing their runtime target; ops/member
+  dispatch remains outside the concrete graph.
 - Only C is parsed. Assembly and Rust files appear as files, without symbols.
 - C/H files over 2 MiB are line-counted but not sent to tree-sitter, because
   generated headers can contain millions of definitions. Their status is
@@ -825,12 +999,19 @@ unique *and* land on a version-component boundary (`-K 6` is ambiguous if you
 have both 6.12 and 6.18; `-K 6.1` does not select `6.18.46`).
 
 **"this index has no call graph"** — rebuild that version with
-`--with-calls --force`. `ka trace` does not need it.
+`ka build X --with-calls --force`. If the query selected an explicit custom
+`--db`, use the exact command printed by the error: when its recorded source is
+available, the hint preserves that `--src` tree and `--output` database instead
+of rebuilding an unrelated managed index. `ka trace` does not need a call graph.
 
 **"the source for Linux X is not on disk"** — `path` and `show` need the exact
 tree recorded when the index was built. Other commands do not. `ka build X
 --force` uses the valid managed tree at `kernels/linux-X`, downloading it when
 absent; a removed custom `--src` tree must be restored or re-indexed.
+
+**"is this index internally consistent?"** — `ka check` (or the identical
+`ka doctor`) runs the deep count, topology, ownership, and call-identity audit.
+This is especially useful for a copied or custom `--db`.
 
 **"is N bytes; pass --lines"** — `show` will not dump a file bigger than 2 MB
 whole. Use `--lines N:M`, or open it with `$EDITOR $(ka path …)`.
@@ -843,7 +1024,7 @@ was pointing at (or the pin is stale). `ka use --clear` or `ka use <other>`.
 
 **"not a usable index" / "unsupported index schema"** — the file is partial,
 corrupt, or was built with an incompatible schema. Rebuild that version with
-`--force`. Completed builds are published atomically.
+`--force`. Completed builds are validated and moved into place atomically.
 
 **The index disagrees with the file I just edited** — the index is a snapshot.
 Rebuild with `--force` after editing its managed or custom source tree.
@@ -868,8 +1049,9 @@ they need no network and never touch your real indexes.
 | `cparse.py` | tree-sitter C extraction and kernel macro idioms |
 | `maintainers.py` | `MAINTAINERS` parsing and path → subsystem matching |
 | `indexer.py` | tree walk, parallel parsing, subsystem attachment, atomic build |
-| `db.py` | SQLite schema |
+| `db.py` | SQLite schema plus structural and semantic integrity validation |
 | `query.py` | target resolution, container/level model, search |
+| `relationships.py` | ownership overlap and resolved cross-subsystem call flow |
 | `links.py` | Elixir / git.kernel.org / GitHub / docs.kernel.org URLs |
 | `render.py` | table / plain / json / csv / tree output |
 | `cli.py` | command line interface |
