@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import config
 
 RELEASES_URL = "https://www.kernel.org/releases.json"
 CDN = "https://cdn.kernel.org/pub/linux/kernel"
 USER_AGENT = "kernel-atlas/0.1 (+https://kernel.org)"
+
+_ARCHIVE_SUFFIXES = (".tar.xz", ".tar.gz", ".tar.bz2")
 
 # Monikers that make sense as a `build` target, best-first for a learner.
 PREFERRED_MONIKERS = ("longterm", "stable", "mainline")
@@ -37,6 +46,50 @@ class Release:
         return self.moniker == "longterm"
 
 
+class UnverifiedRCWarning(UserWarning):
+    """A kernel.org-generated RC snapshot has no published checksum."""
+
+
+@contextmanager
+def _source_lock(version: str):
+    """Serialize download/extraction of one version across processes."""
+    lock = config.sources_dir() / f".linux-{version}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+b") as fh:
+        if os.name == "nt":
+            import msvcrt
+
+            if fh.seek(0, os.SEEK_END) == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            # LK_LOCK gives up after ten one-second retries.  Kernel downloads
+            # routinely take longer, so use the non-blocking operation in an
+            # interruptible loop and wait for the other publisher for as long
+            # as necessary.
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def _get(url: str, timeout: int = 30) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -46,14 +99,38 @@ def _get(url: str, timeout: int = 30) -> bytes:
 def list_releases(timeout: int = 30) -> list[Release]:
     """Live release list from kernel.org, so no version is ever hardcoded."""
     data = json.loads(_get(RELEASES_URL, timeout=timeout))
+    if not isinstance(data, dict):
+        raise ValueError("kernel.org release feed is not a JSON object")
+    records = data.get("releases")
+    if not isinstance(records, list):
+        raise ValueError("kernel.org release feed has no releases list")
     out: list[Release] = []
-    for r in data.get("releases", []):
-        released = (r.get("released") or {}).get("isodate")
+    for position, r in enumerate(records):
+        if not isinstance(r, dict):
+            raise ValueError(
+                f"kernel.org release feed entry {position} is not an object")
+        moniker = r.get("moniker")
+        version = r.get("version")
+        source = r.get("source")
+        released_record = r.get("released")
+        if not isinstance(moniker, str) or not isinstance(version, str):
+            raise ValueError(
+                f"kernel.org release feed entry {position} has invalid identity")
+        if source is not None and not isinstance(source, str):
+            raise ValueError(
+                f"kernel.org release feed entry {position} has an invalid source")
+        if released_record is not None and not isinstance(released_record, dict):
+            raise ValueError(
+                f"kernel.org release feed entry {position} has invalid release data")
+        released = (released_record or {}).get("isodate")
+        if released is not None and not isinstance(released, str):
+            raise ValueError(
+                f"kernel.org release feed entry {position} has an invalid date")
         out.append(
             Release(
-                moniker=r.get("moniker", "?"),
-                version=r.get("version", "?"),
-                source=r.get("source"),
+                moniker=moniker,
+                version=version,
+                source=source,
                 released=released,
             )
         )
@@ -85,7 +162,7 @@ def resolve_version(spec: str, timeout: int = 30) -> Release:
         for rel in list_releases(timeout):
             if rel.version == spec and rel.source:
                 return rel
-    except OSError:
+    except (OSError, ValueError):
         pass
     if "-rc" in spec:
         # Release candidates are only published as git snapshots, not on the
@@ -97,9 +174,29 @@ def resolve_version(spec: str, timeout: int = 30) -> Release:
 
 
 def tarball_url(version: str) -> str:
-    major = version.split(".", 1)[0]
-    series = "v2.6" if version.startswith("2.6.") else f"v{major}.x"
+    version = config.validate_version(version)
+    match = re.match(r"^(\d+)\.(\d+)", version, flags=re.ASCII)
+    if match is None:  # Kept defensive in case the version grammar changes.
+        raise ValueError(f"kernel version must include a major and minor: {version!r}")
+    major, minor = match.groups()
+    # kernel.org split the 1.x and 2.x archives by minor series.  The vN.x
+    # directories used by modern releases only begin with Linux 3.x.
+    series = f"v{major}.{minor}" if major in {"1", "2"} else f"v{major}.x"
     return f"{CDN}/{series}/linux-{version}.tar.xz"
+
+
+def _archive_name(url: str) -> str:
+    name = Path(urllib.parse.urlsplit(url).path).name
+    if not name or not any(name.endswith(suffix) for suffix in _ARCHIVE_SUFFIXES):
+        raise ValueError(f"unsupported kernel source archive URL: {url}")
+    return name
+
+
+def _archive_stem(name: str) -> str:
+    for suffix in _ARCHIVE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    raise ValueError(f"unsupported kernel source archive: {name}")
 
 
 def _human(n: float) -> str:
@@ -128,7 +225,17 @@ def download(url: str, dest: Path, quiet: bool = False, retries: int = 5) -> Pat
                 if have and not resuming:
                     have = 0
                     tmp.unlink(missing_ok=True)
-                total = int(resp.headers.get("Content-Length") or 0) + have
+                length = resp.headers.get("Content-Length")
+                try:
+                    remaining = int(length) if length else 0
+                except (TypeError, ValueError) as exc:
+                    raise OSError(
+                        f"server returned an invalid Content-Length: {length!r}"
+                    ) from exc
+                if remaining < 0:
+                    raise OSError(
+                        f"server returned an invalid Content-Length: {length!r}")
+                total = remaining + have
                 got = have
                 tty = sys.stderr.isatty()
                 step = 0
@@ -154,28 +261,44 @@ def download(url: str, dest: Path, quiet: bool = False, retries: int = 5) -> Pat
             tmp.replace(dest)
             return dest
         except (OSError, http.client.HTTPException) as exc:
+            # A complete or oversized stale part elicits 416 forever unless it
+            # is discarded.  Restart cleanly on the next attempt.
+            reset_range = (isinstance(exc, urllib.error.HTTPError)
+                           and exc.code == 416 and have > 0)
+            if reset_range:
+                tmp.unlink(missing_ok=True)
             if attempt == retries:
                 raise OSError(f"download failed after {retries} attempts: {exc}")
             if not quiet:
-                print(f"\n  {exc} — resuming (attempt {attempt + 1}/{retries})",
+                action = "restarting" if reset_range else "resuming"
+                print(f"\n  {exc} — {action} (attempt {attempt + 1}/{retries})",
                       file=sys.stderr)
-            time.sleep(min(2 ** attempt, 15))
+            if not reset_range:
+                time.sleep(min(2 ** attempt, 15))
     raise OSError("unreachable")
 
 
-def _expected_sha256(version: str, timeout: int = 30) -> str | None:
-    """sha256sums.asc lives beside the tarballs; missing/unreadable is not fatal."""
-    major = version.split(".", 1)[0]
-    url = f"{CDN}/v{major}.x/sha256sums.asc"
+def _expected_sha256(version: str, timeout: int = 30, *,
+                     source_url: str | None = None) -> str | None:
+    """Return the published hash for an archive, or ``None`` if unavailable."""
+    version = config.validate_version(version)
+    source_url = source_url or tarball_url(version)
+    parsed = urllib.parse.urlsplit(source_url)
+    # cgit-generated RC snapshots have no published checksum file.  Do not
+    # probe a made-up URL on git.kernel.org.
+    if parsed.hostname not in {"cdn.kernel.org", "www.kernel.org"}:
+        return None
+    url = urllib.parse.urljoin(source_url, "sha256sums.asc")
     try:
         text = _get(url, timeout=timeout).decode("utf-8", "replace")
     except OSError:
         return None
-    target = f"linux-{version}.tar.xz"
+    target = _archive_name(source_url)
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1] == target:
-            return parts[0]
+        if (len(parts) == 2 and parts[1] == target
+                and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0])):
+            return parts[0].lower()
     return None
 
 
@@ -187,8 +310,51 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _checked_archive(tarball: Path) -> None:
+    """Reject archive members that could escape the extraction directory.
+
+    The system ``tar`` fast path does not provide Python's extraction filters,
+    so validate names, links, and special files before invoking it.  This also
+    gives Python 3.10 the same protection without relying on the newer
+    ``filter='data'`` argument.
+    """
+
+    def parts_within(value: str, base=(), *, allow_parent: bool) -> tuple[str, ...]:
+        if "\\" in value or re.match(r"^[A-Za-z]:", value):
+            raise RuntimeError(f"archive contains a non-portable path: {value!r}")
+        path = PurePosixPath(value)
+        if path.is_absolute():
+            raise RuntimeError(f"archive contains an absolute path: {value!r}")
+        parts = list(base)
+        for part in path.parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not allow_parent or not parts:
+                    raise RuntimeError(f"archive path escapes extraction root: {value!r}")
+                parts.pop()
+            else:
+                parts.append(part)
+        return tuple(parts)
+
+    try:
+        with tarfile.open(tarball, "r:*") as tf:
+            for member in tf.getmembers():
+                member_parts = parts_within(member.name, allow_parent=False)
+                if member.isdev():
+                    raise RuntimeError(
+                        f"archive contains a special device: {member.name!r}")
+                if member.issym():
+                    parts_within(
+                        member.linkname, member_parts[:-1], allow_parent=True)
+                elif member.islnk():
+                    parts_within(member.linkname, allow_parent=True)
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(f"could not validate {tarball.name}: {exc}") from exc
+
+
 def extract(tarball: Path, into: Path, quiet: bool = False) -> Path:
-    """Unpack linux-X.Y.tar.xz. Uses system tar when present (far faster).
+    """Unpack a kernel tar archive. Uses system tar when present (far faster).
 
     Extraction happens in a scratch directory that is renamed into place only
     when complete, so an interrupted run can never be mistaken for a full tree.
@@ -197,11 +363,10 @@ def extract(tarball: Path, into: Path, quiet: bool = False) -> Path:
     if not quiet:
         print(f"  extracting {tarball.name} ...", file=sys.stderr, flush=True)
 
-    stem = tarball.name.removesuffix(".tar.xz")
-    scratch = into / f".extracting-{stem}"
-    shutil.rmtree(scratch, ignore_errors=True)
-    scratch.mkdir()
+    stem = _archive_stem(tarball.name)
+    scratch = Path(tempfile.mkdtemp(prefix=f".extracting-{stem}-", dir=into))
     try:
+        _checked_archive(tarball)
         if shutil.which("tar"):
             try:
                 subprocess.run(["tar", "-xf", str(tarball), "-C", str(scratch)],
@@ -210,33 +375,94 @@ def extract(tarball: Path, into: Path, quiet: bool = False) -> Path:
                 raise RuntimeError(
                     f"tar failed: {exc.stderr.decode('utf-8', 'replace')[:400]}")
         else:
-            with tarfile.open(tarball, "r:xz") as tf:
-                tf.extractall(scratch, filter="data")
+            with tarfile.open(tarball, "r:*") as tf:
+                tf.extractall(scratch)
 
         extracted = scratch / stem
-        if not extracted.is_dir():
-            raise RuntimeError(f"expected {stem}/ inside {tarball}")
+        if extracted.is_symlink() or not extracted.is_dir():
+            raise RuntimeError(
+                f"expected a real {stem}/ directory inside {tarball}")
         final = into / stem
         if final.exists():
-            shutil.rmtree(final)
-        extracted.rename(final)
+            # Another concurrent extraction may already have published the
+            # same complete tree.  Never delete a destination here.
+            return final
+        try:
+            extracted.rename(final)
+        except OSError:
+            # Concurrent directory publication is reported as EEXIST on some
+            # platforms and ENOTEMPTY on others.
+            if final.is_dir():
+                return final
+            raise
         return final
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _is_kernel_org_rc_snapshot(version: str, source_url: str) -> bool:
+    parsed = urllib.parse.urlsplit(source_url)
+    return (
+        "-rc" in version
+        and parsed.scheme == "https"
+        and parsed.hostname == "git.kernel.org"
+        and Path(parsed.path).name == f"linux-{version}.tar.gz"
+    )
+
+
 def ensure_source(version: str, keep_tarball: bool = False, quiet: bool = False,
-                  verify: bool = True) -> Path:
-    """Return a local kernel tree for `version`, downloading it if needed."""
+                  verify: bool = True, source_url: str | None = None) -> Path:
+    """Return a local kernel tree, serializing same-version acquisition."""
+    version = config.validate_version(version)
+    with _source_lock(version):
+        return _ensure_source_locked(
+            version, keep_tarball=keep_tarball, quiet=quiet, verify=verify,
+            source_url=source_url)
+
+
+def _ensure_source_locked(version: str, keep_tarball: bool = False,
+                          quiet: bool = False, verify: bool = True,
+                          source_url: str | None = None) -> Path:
+    """Implementation of :func:`ensure_source` while its version lock is held."""
     tree = config.source_path(version)
     if (tree / "MAINTAINERS").is_file() and (tree / "Makefile").is_file():
+        actual_version = detect_version(tree)
+        if actual_version != version:
+            raise RuntimeError(
+                f"cached source at {tree} reports Linux "
+                f"{actual_version or 'unknown'}, not {version}; move or remove it"
+            )
         if not quiet:
             print(f"  source cached at {tree}", file=sys.stderr)
         return tree
 
-    url = tarball_url(version)
-    tarball = config.sources_dir() / f"linux-{version}.tar.xz"
-    expect = _expected_sha256(version) if verify else None
+    url = source_url or tarball_url(version)
+    if verify and urllib.parse.urlsplit(url).scheme.lower() != "https":
+        raise RuntimeError(
+            f"refusing to verify kernel source over a non-HTTPS URL: {url}")
+    try:
+        archive_name = _archive_name(url)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if _archive_stem(archive_name) != f"linux-{version}":
+        raise RuntimeError(
+            f"source archive {archive_name!r} does not match Linux {version}"
+        )
+    tarball = config.sources_dir() / archive_name
+    expect = (_expected_sha256(version, source_url=url) if verify else None)
+    if verify and expect is None:
+        if _is_kernel_org_rc_snapshot(version, url):
+            warnings.warn(
+                f"Linux {version} is a kernel.org-generated RC snapshot with no "
+                "published checksum; proceeding with its HTTPS source archive",
+                UnverifiedRCWarning,
+                stacklevel=2,
+            )
+        else:
+            raise RuntimeError(
+                f"no published sha256 checksum is available for {archive_name}; "
+                "refusing an unverified download (pass --no-verify to override)"
+            )
 
     for attempt in (1, 2):
         if not tarball.is_file():
@@ -254,18 +480,26 @@ def ensure_source(version: str, keep_tarball: bool = False, quiet: bool = False,
         tarball.with_name(tarball.name + ".part").unlink(missing_ok=True)
         if attempt == 2:
             raise RuntimeError(
-                f"sha256 mismatch for linux-{version}.tar.xz "
+                f"sha256 mismatch for {archive_name} "
                 f"(expected {expect[:16]}…, got {actual[:16]}…)"
             )
         if not quiet:
             print("  checksum mismatch — discarding and downloading again",
                   file=sys.stderr)
 
-    if tree.exists():
-        shutil.rmtree(tree, ignore_errors=True)
+    if tree.is_symlink() or tree.is_file():
+        tree.unlink()
+    elif tree.exists():
+        shutil.rmtree(tree)
     out = extract(tarball, config.sources_dir(), quiet=quiet)
     if out != tree:
-        out.rename(tree)
+        raise RuntimeError(f"archive extracted to unexpected directory {out}")
+    actual_version = detect_version(tree)
+    if actual_version != version:
+        raise RuntimeError(
+            f"downloaded source reports Linux {actual_version or 'unknown'}, "
+            f"not {version}"
+        )
     if not keep_tarball:
         tarball.unlink(missing_ok=True)
     return tree
@@ -286,7 +520,23 @@ def detect_version(tree: Path) -> str | None:
                 break
     if "VERSION" not in fields or "PATCHLEVEL" not in fields:
         return None
+    if (re.fullmatch(r"[0-9]+", fields["VERSION"]) is None
+            or re.fullmatch(r"[0-9]+", fields["PATCHLEVEL"]) is None):
+        return None
+    sublevel = fields.get("SUBLEVEL", "")
+    if sublevel and re.fullmatch(r"[0-9]+", sublevel) is None:
+        return None
+    try:
+        major = int(fields["VERSION"])
+    except ValueError:
+        return None
     v = f"{fields['VERSION']}.{fields['PATCHLEVEL']}"
-    if fields.get("SUBLEVEL"):
-        v += f".{fields['SUBLEVEL']}"
-    return v + fields.get("EXTRAVERSION", "")
+    # Modern release/tag names omit the Makefile's conventional .0 (3.0,
+    # 7.2), while historical 2.x archives include it (notably 2.6.0).
+    if sublevel and (sublevel != "0" or major <= 2):
+        v += f".{sublevel}"
+    v += fields.get("EXTRAVERSION", "")
+    try:
+        return config.validate_version(v)
+    except ValueError:
+        return None

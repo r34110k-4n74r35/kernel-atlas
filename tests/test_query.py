@@ -1,3 +1,5 @@
+import sqlite3
+
 from kernel_atlas import db, query
 from kernel_atlas.cli import _frames_from_text
 
@@ -322,6 +324,32 @@ def test_documentation_claimed_by_subsystem_and_by_path(conn):
     assert paths[0] == "Documentation/mm/page_alloc.rst"
 
 
+def test_documentation_fallback_includes_a_top_level_named_document(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "top-level-doc.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    dir_id = writer.execute(
+        "SELECT id FROM dirs WHERE path='Documentation'").fetchone()[0]
+    writer.execute(
+        "INSERT INTO files(path,dir_id,name,ext,size,lines,n_symbols,"
+        "index_status) VALUES (?,?,?,?,?,?,?,?)",
+        ("Documentation/mm.rst", dir_id, "mm.rst", ".rst", 10, 1, 0,
+         "indexed"),
+    )
+    writer.commit()
+    writer.close()
+
+    reader = db.connect(copied, readonly=True)
+    target = query.resolve(reader, "mm").target
+    assert target is not None
+    paths = {e.path for e in query.documentation_for(reader, target, limit=30)}
+    reader.close()
+    assert "Documentation/mm.rst" in paths
+
+
 def test_annotate_hides_the_rest_in_favour_of_the_area(conn):
     t = query.resolve(conn, "Makefile").target
     e = query.Entry(kind="file", name=t.name, path=t.path)
@@ -360,3 +388,100 @@ def test_rank_prefers_shallow_headers_over_nested_stubs_and_tools():
     )
     assert ranked[0].path == "include/linux/gfp_types.h"
     assert ranked[-1].path.startswith("tools/")
+
+
+def test_resolve_returns_the_complete_candidate_set(mini_index, tmp_path):
+    import shutil
+    import sqlite3
+
+    copied = tmp_path / "fanout.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='mm/page_alloc.c'").fetchone()[0]
+    writer.executemany(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        "is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        [(file_id, "many_defs", "function", 1000 + i, 1000 + i,
+          None, 0, 0, 0) for i in range(205)],
+    )
+    writer.commit()
+    writer.close()
+
+    conn = db.connect(copied, readonly=True)
+    try:
+        res = query.resolve_symbol(conn, "many_defs")
+        assert res.target is not None
+        assert len(res.candidates) == 204
+        assert "205 symbols" in res.note
+    finally:
+        conn.close()
+
+
+def test_bare_static_symbol_does_not_hide_an_area_directory(
+        mini_index, tmp_path):
+    import shutil
+    import sqlite3
+
+    copied = tmp_path / "namespaces.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    root_id = writer.execute("SELECT id FROM dirs WHERE path='' ").fetchone()[0]
+    writer.execute(
+        "INSERT INTO dirs(path,parent_id,name,depth) VALUES (?,?,?,?)",
+        ("kernel/collision", root_id, "collision", 2),
+    )
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='mm/page_alloc.c'").fetchone()[0]
+    writer.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,"
+        "is_static,is_inline,is_exported) VALUES (?,?,?,?,?,?,?,?,?)",
+        (file_id, "collision", "function", 300, 300, None, 1, 0, 0),
+    )
+    writer.commit()
+    writer.close()
+
+    conn = db.connect(copied, readonly=True)
+    try:
+        generic = query.resolve(conn, "collision")
+        assert generic.target.kind == "dir"
+        assert generic.target.path == "kernel/collision"
+        assert any(c.kind == "symbol" for c in generic.candidates)
+        assert query.resolve_symbol(conn, "collision").target.kind == "symbol"
+    finally:
+        conn.close()
+
+
+def test_ranking_prefers_kernel_paths_to_tools_copies_even_if_static():
+    kernel = query.Target(kind="symbol", id=1, path="drivers/x/deep.c",
+                          name="pick", symbol_kind="function", is_static=True)
+    tools = query.Target(kind="symbol", id=2, path="tools/x.c",
+                         name="pick", symbol_kind="function", is_static=False)
+    assert min((tools, kernel), key=query._rank_candidate) is kernel
+
+
+def test_search_applies_static_and_regex_filters_before_limit(conn):
+    got = query.search(conn, "ext4", limit=1, grep="helper$", static="only",
+                       with_subsystem=False)
+    assert [e.name for e in got] == ["ext4_helper"]
+
+
+def test_search_sort_columns_are_unambiguous(conn):
+    for sort in ("name", "path", "kind", "line", "size", "lines"):
+        assert query.search(conn, "ext4", limit=2, sort=sort,
+                            with_subsystem=False)
+
+
+def test_backtrace_preserves_repeated_short_and_optimized_frames():
+    text = """
+    x+0x1/0x2
+    work.isra.0+0x10/0x20
+    x+0x3/0x4
+    helper.constprop.17
+    """
+    assert _frames_from_text(text) == ["x", "work", "x", "helper"]
+
+
+def test_backtrace_accepts_mixed_case_gdb_and_bare_frames():
+    text = "#3  0xffffffff81 in Proc_2 (x=0)\nBDEV_I\n"
+    assert _frames_from_text(text) == ["Proc_2", "BDEV_I"]

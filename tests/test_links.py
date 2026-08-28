@@ -31,3 +31,26 @@ def test_docs_and_ident_urls():
     ln = links.links("7.2", "Documentation/mm/page_alloc.rst", ident="__alloc_pages")
     assert ln["docs"].endswith("/v7.2/mm/page_alloc.html")
     assert ln["ident"].endswith("/ident/__alloc_pages")
+
+
+def test_linux_next_emits_only_its_authoritative_dated_git_link():
+    ln = links.links("next-20260827", "mm/page_alloc.c", 42,
+                     ident="__alloc_pages")
+    assert set(ln) == {"git"}
+    assert "git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git" in ln["git"]
+    assert "h=next-20260827" in ln["git"]
+    assert ln["git"].endswith("#n42")
+
+
+def test_repo_paths_are_url_quoted_without_quoting_slashes():
+    path = "Documentation/dev-tools/a file, notes.rst"
+    ln = links.links("7.2", path)
+    for key in ("elixir", "git", "github", "docs"):
+        assert "a%20file%2C%20notes" in ln[key]
+        assert "Documentation/dev-tools" in ln[key] or key == "docs"
+
+
+def test_git_ref_query_quotes_vendor_plus_suffix():
+    ln = links.links("6.6.12-acme+debug", "mm/page_alloc.c")
+    assert "stable/linux.git" in ln["git"]
+    assert "?h=v6.6.12-acme%2Bdebug" in ln["git"]

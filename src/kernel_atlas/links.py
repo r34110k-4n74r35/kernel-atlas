@@ -24,13 +24,8 @@ def docs_series(version: str) -> str:
 
 
 def _numeric_parts(version: str) -> list[int]:
-    parts = []
-    for p in (version or "").lstrip("v").split("."):
-        if p.isdigit():
-            parts.append(int(p))
-        else:
-            break
-    return parts
+    match = re.match(r"v?(\d+(?:\.\d+)*)", version or "")
+    return [int(part) for part in match.group(1).split(".")] if match else []
 
 
 def is_stable_patch(version: str) -> bool:
@@ -46,16 +41,35 @@ def links(version: str, path: str, line: int | None = None, *,
     cross-reference page for a symbol name.
     """
     path = (path or "").lstrip("/")
+    encoded_path = quote(path, safe="/")
     tag = elixir_tag(version)
-    elixir = (f"https://elixir.bootlin.com/linux/{tag}/source/{path}" if path
+    is_next = (version or "").strip().startswith("next-")
+    if is_next:
+        # Bootlin's ``latest`` and docs.kernel.org's ``latest`` are mainline,
+        # not linux-next, and there is no authoritative GitHub mirror.  Emit
+        # only the dated ref in the canonical linux-next repository.
+        source_ref = (version or "").strip()
+        git = ("https://git.kernel.org/pub/scm/linux/kernel/git/next/"
+               f"linux-next.git/tree/{encoded_path}?h="
+               f"{quote(source_ref, safe='')}")
+        if line and not is_dir:
+            git += f"#n{line}"
+        return {"git": git}
+
+    elixir = (f"https://elixir.bootlin.com/linux/{tag}/source/{encoded_path}" if path
               else f"https://elixir.bootlin.com/linux/{tag}/source")
-    repo = "gregkh/linux" if is_stable_patch(version) else "torvalds/linux"
+    if is_stable_patch(version):
+        repo = "gregkh/linux"
+        git_repo = "stable/linux.git"
+        source_ref = tag
+    else:
+        repo = "torvalds/linux"
+        git_repo = "torvalds/linux.git"
+        source_ref = tag
     kind = "tree" if is_dir or not path else "blob"
-    github = f"https://github.com/{repo}/{kind}/{tag}/{path}".rstrip("/")
-    git_repo = ("stable/linux.git" if is_stable_patch(version)
-                else "torvalds/linux.git")
+    github = f"https://github.com/{repo}/{kind}/{source_ref}/{encoded_path}".rstrip("/")
     git = ("https://git.kernel.org/pub/scm/linux/kernel/git/"
-           f"{git_repo}/tree/{path}?h={tag}")
+           f"{git_repo}/tree/{encoded_path}?h={quote(source_ref, safe='')}")
     if line and not is_dir:
         elixir += f"#L{line}"
         github += f"#L{line}"
@@ -66,5 +80,6 @@ def links(version: str, path: str, line: int | None = None, *,
                         f"{quote(ident, safe='')}")
     if path.startswith("Documentation/") and path.endswith((".rst", ".txt", ".md")):
         rel = re.sub(r"\.(rst|txt|md)$", ".html", path[len("Documentation/"):])
-        out["docs"] = f"https://www.kernel.org/doc/html/{docs_series(version)}/{rel}"
+        out["docs"] = (f"https://www.kernel.org/doc/html/{docs_series(version)}/"
+                       f"{quote(rel, safe='/')}")
     return out

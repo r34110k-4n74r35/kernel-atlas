@@ -1,3 +1,5 @@
+import pytest
+
 from kernel_atlas import config
 
 
@@ -41,3 +43,38 @@ def test_tree_for_returns_none_when_source_is_gone(monkeypatch, tmp_path):
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
     assert config.tree_for("9.9", None) is None
     assert config.tree_for("9.9", "/nope") is None
+
+
+@pytest.mark.parametrize("version", ["../outside", "/tmp/outside", "a/b", "a\\b", " x"])
+def test_version_paths_reject_unsafe_components(monkeypatch, tmp_path, version):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    with pytest.raises(ValueError, match="unsafe kernel version"):
+        config.index_path(version)
+    with pytest.raises(ValueError, match="unsafe kernel version"):
+        config.source_path(version)
+
+
+def test_vendor_version_is_filename_safe(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    assert (config.index_path("6.6.12-acme+debug")
+            == tmp_path / "indexes" / "6.6.12-acme+debug.db")
+
+
+def test_unsafe_hand_edited_pin_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    pin = config.default_version_file()
+    pin.parent.mkdir(parents=True)
+    pin.write_text("/tmp/not-an-index\n", encoding="utf-8")
+    assert config.get_default_version() is None
+
+
+def test_project_root_does_not_claim_an_unrelated_src_layout_project(
+        monkeypatch, tmp_path):
+    host = tmp_path / "unrelated-app"
+    (host / "src").mkdir(parents=True)
+    (host / "pyproject.toml").write_text("[project]\nname='unrelated'\n")
+    installed = host / ".venv/lib/python3.12/site-packages/kernel_atlas/config.py"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("", encoding="utf-8")
+    monkeypatch.setattr(config, "__file__", str(installed))
+    assert config.project_root() is None
