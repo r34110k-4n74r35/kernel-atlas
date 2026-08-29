@@ -89,7 +89,15 @@ def _work(batch: list[tuple[int, str, bool]]):
             syms = tuple(
                 (s.name, s.kind, s.start_line, s.end_line, s.signature,
                  int(s.is_static), int(s.is_inline), int(s.is_exported), s.calls,
-                 s.indirect_calls)
+                 s.indirect_calls, s.summary, s.description,
+                 tuple((m.parent_index, m.name, m.kind, m.type_text,
+                        m.declaration, m.start_line, m.end_line, m.bit_width,
+                        m.array_dimensions, m.description,
+                        m.description_source, m.conditions, m.visibility,
+                        int(m.is_anonymous), m.generated_by)
+                       for m in s.members),
+                 s.aliases, int(s.is_anonymous), int(s.parse_complete),
+                 s.parse_warnings, s.unmatched_member_docs, s.conditions)
                 for s in parsed
             )
         out.append((file_id, lines, syms, status, error, parse))
@@ -205,17 +213,35 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
     started = time.monotonic()
 
     sym_rows: list[tuple] = []
+    alias_rows: list[tuple] = []
+    member_rows: list[tuple] = []
     call_rows: list[tuple] = []
     next_sym_id = 1
+    next_member_id = 1
 
     def flush() -> None:
-        nonlocal sym_rows, call_rows
+        nonlocal sym_rows, alias_rows, member_rows, call_rows
         if sym_rows:
             conn.executemany(
                 "INSERT INTO symbols(id, file_id, name, kind, start_line, end_line,"
-                " signature, is_static, is_inline, is_exported)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)", sym_rows)
+                " signature, summary, description, is_static, is_inline,"
+                " is_exported, is_anonymous, parse_complete, parse_warnings,"
+                " unmatched_member_docs, conditions)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", sym_rows)
             sym_rows = []
+        if alias_rows:
+            conn.executemany(
+                "INSERT INTO type_aliases(symbol_id,name) VALUES (?,?)",
+                alias_rows)
+            alias_rows = []
+        if member_rows:
+            conn.executemany(
+                "INSERT INTO type_members(id,symbol_id,parent_id,ordinal,name,"
+                " kind,type_text,declaration,start_line,end_line,bit_width,"
+                " array_dimensions,description,description_source,conditions,"
+                " visibility,is_anonymous,generated_by)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", member_rows)
+            member_rows = []
         if call_rows:
             conn.executemany(
                 "INSERT INTO calls(caller_id, callee, resolution) VALUES (?,?,?)",
@@ -243,9 +269,36 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                     if status == "skipped_oversize":
                         n_oversize += 1
                 for (name, kind, start, end, sig, st, inl, exp, calls,
-                     indirect_calls) in syms:
+                     indirect_calls, summary, description, members, aliases,
+                     anonymous, parse_complete, parse_warnings,
+                     unmatched_docs, conditions) in syms:
                     sym_rows.append((next_sym_id, file_id, name, kind, start, end,
-                                     sig, st, inl, exp))
+                                     sig, summary, description, st, inl, exp,
+                                     anonymous, parse_complete,
+                                     json.dumps(parse_warnings),
+                                     json.dumps(dict(unmatched_docs)),
+                                     json.dumps(conditions)))
+                    for alias in aliases:
+                        alias_rows.append((next_sym_id, alias))
+                    member_ids = list(range(
+                        next_member_id, next_member_id + len(members)))
+                    for ordinal, member in enumerate(members):
+                        (parent_index, member_name, member_kind, type_text,
+                         declaration, member_start, member_end, bit_width,
+                         dimensions, member_description, description_source,
+                         conditions, visibility, member_anonymous,
+                         generated_by) = member
+                        parent_id = (member_ids[parent_index]
+                                     if parent_index is not None else None)
+                        member_rows.append((
+                            member_ids[ordinal], next_sym_id, parent_id, ordinal,
+                            member_name, member_kind, type_text, declaration,
+                            member_start, member_end, bit_width,
+                            json.dumps(dimensions), member_description,
+                            description_source, json.dumps(conditions),
+                            visibility, member_anonymous, generated_by,
+                        ))
+                    next_member_id += len(members)
                     indirect = set(indirect_calls)
                     for callee in calls:
                         call_rows.append((
@@ -256,7 +309,7 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                     next_sym_id += 1
                     n_sym += 1
             done += len(result)
-            if len(sym_rows) > 50_000:
+            if len(sym_rows) > 50_000 or len(member_rows) > 100_000:
                 flush()
             if not quiet and done % 5000 < BATCH:
                 pct = done * 100 // max(total_files, 1)
@@ -797,6 +850,10 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
                 ("n_dirs", str(stats.dirs)),
                 ("n_files", str(stats.files)),
                 ("n_symbols", str(stats.symbols)),
+                ("n_type_aliases", str(conn.execute(
+                    "SELECT COUNT(*) FROM type_aliases").fetchone()[0])),
+                ("n_type_members", str(conn.execute(
+                    "SELECT COUNT(*) FROM type_members").fetchone()[0])),
                 ("n_subsystems", str(stats.subsystems)),
                 ("n_calls", str(stats.calls)),
                 ("n_calls_resolved", str(stats.calls_resolved)),

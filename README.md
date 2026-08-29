@@ -9,6 +9,7 @@ file map, extracts the C symbols it can parse, and maps each path to a
 - What else lives next to this folder, file, or function?
 - Which subsystem owns this symbol, and who maintains it?
 - Which subsystems overlap, and which ones call into one another?
+- What exactly is inside this structure, and what does each member mean?
 - I have a name from an oops. Where is it defined?
 - Show me the source, an editor path, or the Elixir / docs.kernel.org page.
 - Did this symbol move between the LTS I am running and another release?
@@ -98,6 +99,7 @@ ka versions                   # live list from kernel.org
 ka build lts --with-calls     # download + index the latest LTS (once)
 ka use 6.18                   # pin it; unique prefix is enough
 ka info mm                    # what is this directory, who maintains it?
+ka struct usb_device          # every field, shape, condition, and source doc
 ka siblings kernel/sched      # what sits next to the scheduler?
 ka find tcp_sendmsg --exact   # where is this symbol?
 ka show tcp_sendmsg           # print its source
@@ -255,7 +257,7 @@ alternatives are listed. Typos get "did you mean" suggestions.
 not, instead of guessing what the whole string might mean.
 
 Commands which act on one concrete source identity (`calls`, `show`, `path`,
-and `web`) do not accept that ranking as proof. Use `path:symbol` when
+`web`, and `struct`) do not accept that ranking as proof. Use `path:symbol` when
 same-named definitions are in different files, or `path:line` when more than
 one definition occurs in the same file. An absolute target is accepted only
 when it is inside the exact
@@ -263,6 +265,15 @@ recorded source tree for the selected index and that tree is still available;
 it is normalized to the indexed relative path and may retain a `:line` or
 `:symbol` suffix. An absolute path never switches the active index or silently
 substitutes a different source snapshot.
+
+`ka struct` resolves only struct/union tags and their direct typedef aliases; a
+same-named function or variable cannot win. An optional `struct ` or `union `
+prefix constrains the C kind. Because duplicate tags and configuration
+alternatives are common, an ambiguous name is an error, not a ranking decision.
+Qualify it as `path:name` or, for repeated definitions in one file,
+`path:line`; `--all` deliberately reports every matching definition. A line
+inside overlapping aggregates (for example a generated tagged group inside an
+outer struct) remains ambiguous and is never silently treated as exact.
 
 `ka docs bpf` is the exception: a bare name prefers the *area directory*
 (`kernel/bpf/`) over a symbol that happens to share it. `ka info bpf` still
@@ -368,6 +379,49 @@ For a symbol: kind, line span, signature, linkage (`EXPORT_SYMBOL` /
 `source_exists`, and structured unclassified-ownership information.
 `--max-subsystems` and `--max-candidates` trim the two lists that can get
 long.
+
+### `struct` / `structure`
+
+A source-level structure report designed for studying kernel interfaces and
+internal data flow:
+
+```bash
+ka struct usb_device
+ka struct 'struct usb_driver'
+ka struct include/linux/usb.h:usb_device
+ka struct include/uapi/linux/perf_event.h:1320
+ka struct perf_mem_data_src --all -f json
+```
+
+The report gives the kernel-doc summary and notes; tag and typedef aliases;
+definition span, subsystem ownership, related Documentation and source links;
+then every member in declaration order. Nested and anonymous structs/unions are
+shown hierarchically. Each member retains a normalized source declaration,
+parsed type, line span, array dimensions, bitfield width, callback shape,
+conditional directive trail, comment-derived public/private marker,
+description, and the description's source. The visibility label reflects
+kernel documentation comments such as `/* private: */`; C structs do not have
+access-control modifiers. `DECLARE_BITMAP`, flexible arrays, cacheline boundary
+markers, sysfs callback alternatives, and `struct_group*` families are decoded
+while retaining their original source spelling. Reusable tags created by
+`struct_group_tagged` / `__struct_group` can be queried directly.
+
+Source documentation comes from kernel-doc or adjacent comments. Known member
+macros can also carry explicitly labelled `macro-semantics` explanations from
+the parser; those do not inflate source-documentation coverage. Undocumented
+fields are labelled rather than filled with invented prose. A partial parse
+keeps the raw declaration and prints warnings. The JSON root is always
+`{query,index,n_definitions,definitions}`, including for one result, so `--all`
+does not change its shape. Each definition identifies its actual `kind`,
+nullable C `tag`, honest `c_name`, an exact `selector` when the command syntax
+can express one, parse completeness, source-documentation coverage, separately
+counted parser-supplied explanations, ownership evidence, and source
+availability. Structure data is stored in the index and remains queryable after
+the source tree is removed; `show` still requires that tree.
+
+This is a source-structure view, not an ABI layout calculator. It does not claim
+byte offsets, padding, alignment, or `sizeof`; those require a concrete
+configuration, architecture, compiler ABI, and fully expanded macros.
 
 ### `siblings` (`sib`) / `ls`
 
@@ -820,6 +874,11 @@ ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
 **I want the docs that go with this code.** `ka docs mm`, `ka docs bpf`,
 `ka show Documentation/mm/index.rst`.
 
+**I am following data through a subsystem boundary.** Start with
+`ka struct usb_device`, follow referenced `struct ...` types with another
+`ka struct`, then use the listed owner, Documentation files, and source links
+to connect the data representation to its subsystem.
+
 **Open it in an editor.** `vim $(ka path tcp_sendmsg)` or
 `code -g $(ka path tcp_sendmsg --line)`. `--line` appends `:LINE`.
 `path` / `show` need the exact source tree recorded in the index (normally
@@ -940,20 +999,47 @@ idioms are handled explicitly:
   per-CPU variants—marks a symbol as available to modules.
 - `DECLARE_WORK(name, fn)`, `DEFINE_MUTEX(name)`, `LIST_HEAD(name)`,
   `DECLARE_BITMAP(name, n)`, `DEFINE_PER_CPU(type, name)` declare `name`.
+- Structure bodies retain direct and nested members, comma declarators,
+  anonymous aggregates, arrays, flexible arrays, bitfields, callbacks,
+  source attributes/qualifiers, preprocessor directive trails, comment-derived
+  visibility markers, typedef aliases, and matching kernel-doc/adjacent
+  comments. Aggregate direct-member counts do not include the children of
+  nested structs or unions.
+- Inside structures, `DECLARE_BITMAP(name, n)` is represented as an
+  `unsigned long` array and `DECLARE_FLEX_ARRAY(type, name)` (including its
+  underscored form) as a flexible array; their raw macro declarations remain
+  authoritative.
 - Canonical sysfs attribute families such as `DEVICE_ATTR_*`, `DRIVER_ATTR_*`,
   `BUS_ATTR_*`, `CLASS_ATTR_*`, `BIN_ATTR_*`, and the supported sensor/IIO
   forms are recorded under the backing object name they actually generate.
   Unknown wrapper macros are skipped rather than turning an argument into a
   fictitious variable.
 - Trailing attribute macros (`____cacheline_aligned_in_smp`) are not mistaken
-  for variable names.
+  for variable names; their original annotation remains attached to the real
+  member. Cacheline group macros are represented by the zero-length marker
+  fields they generate (and aligned-end padding where applicable).
+- `__SYSFS_FUNCTION_ALTERNATIVE` keeps both callback spellings beneath a
+  configuration-dependent aggregate instead of falsely choosing struct or
+  union layout. `struct_group*` keeps its mirrored member hierarchy, and tagged
+  forms also create an independently resolvable structure definition.
 - Declarations inside `#ifdef` *in a function body* are locals, not file-scope.
 - `int (*fp)(void);` is a function-pointer variable; `int fp(void);` is a
   prototype. The two are told apart.
 
 Known limits:
 
-- Code inside `#if` branches is indexed regardless of `.config`.
+- Code inside `#if` branches is indexed regardless of `.config`. Structure
+  reports label each alternative with its directive trail; they do not imply
+  that mutually exclusive members coexist in one compiled layout.
+- Unknown member-generating macros cannot be expanded without the preprocessor.
+  Their normalized raw invocations are retained as explicit macro evidence,
+  and the aggregate is marked partial when member identity remains uncertain.
+- Aggregate summaries/descriptions and member documentation are source
+  evidence. Explicitly labelled `macro-semantics` member explanations are kept
+  separate, and missing or unmatched source documentation remains visible.
+- Structure reports cannot determine byte offsets, padding, alignment, or
+  `sizeof` without a selected configuration, target ABI, compiler, and macro
+  expansion.
 - Interactive target lookup may rank one likely definition of a name that is
   defined per architecture; `ka find --exact <name> -n 0` shows all of them.
   Call-identity resolution is stricter and never guesses one architecture.

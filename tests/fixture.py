@@ -99,9 +99,41 @@ static inline void ext4_helper(void) { }
 EXT4_SUPER_C = """\
 #include <linux/fs.h>
 
+/**
+ * struct ext4_sb_info - in-memory ext4 superblock study fixture
+ * @s_blocks_count: Total number of filesystem blocks.
+ * @s_inodes_count: Total number of inodes.
+ * @label: Human-readable volume label.
+ * @state: Two-bit filesystem state.
+ * @active: Whether the filesystem is active.
+ * @write_inode: Callback used to persist one inode.
+ * @generation: Full generation counter.
+ * @low: Low half of the promoted generation view.
+ * @high: High half of the promoted generation view.
+ * @features: Feature bitmap retained by DECLARE_BITMAP.
+ * @tail: Configuration-defined flexible payload.
+ *
+ * This intentionally mixes ordinary fields, callbacks, bitfields, anonymous
+ * aggregates, conditional source, declaration macros, and private data.
+ */
 struct ext4_sb_info {
 \tunsigned long s_blocks_count;
 \tunsigned int s_inodes_count;
+\tchar label[16];
+\tunsigned int state:2, active:1;
+\tint (*write_inode)(struct inode *inode);
+\tunion {
+\t\tunsigned long generation;
+\t\tstruct {
+\t\t\tunsigned int low;
+\t\t\tunsigned int high;
+\t\t};
+\t};
+#ifdef CONFIG_EXT4_STUDY_FEATURES
+\tDECLARE_BITMAP(features, 64);
+#endif
+\t/* private: */
+\tDECLARE_FLEX_ARRAY(unsigned char, tail);
 };
 
 static int ext4_fill_super(struct super_block *sb, void *data, int silent)
@@ -184,6 +216,24 @@ typedef unsigned int fmode_t;
 struct super_block {
 \tunsigned long s_blocksize;
 \tvoid *s_fs_info;
+};
+
+/**
+ * study_mask_t - anonymous typedef-backed structure
+ * @bits: Mask bits.
+ */
+typedef struct {
+\tunsigned long bits[2];
+} study_mask_t;
+
+/**
+ * union study_value - alternate scalar views
+ * @signed_value: Signed interpretation.
+ * @unsigned_value: Unsigned interpretation.
+ */
+union study_value {
+\tint signed_value;
+\tunsigned int unsigned_value;
 };
 
 enum rw_hint {

@@ -19,6 +19,8 @@ def _metadata(**overrides):
         "n_dirs": "1",
         "n_files": "0",
         "n_symbols": "0",
+        "n_type_aliases": "0",
+        "n_type_members": "0",
         "n_subsystems": "0",
         "n_calls": "0",
         "n_calls_resolved": "0",
@@ -386,6 +388,129 @@ def test_deep_validation_rejects_invalid_symbol_domains(tmp_path, assignment):
     conn.close()
 
 
+def test_deep_validation_anchors_aggregate_table_counts(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "truncated-members.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    conn.execute(
+        "DELETE FROM type_members WHERE id=(SELECT m.id FROM type_members m"
+        " LEFT JOIN type_members child ON child.parent_id=m.id"
+        " WHERE child.id IS NULL ORDER BY m.id DESC LIMIT 1)"
+    )
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match="type_members row count"):
+        db.validate_schema(conn, deep=True)
+    conn.close()
+
+
+def test_deep_validation_rejects_aliases_on_nonaggregates(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "function-alias.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    function_id = conn.execute(
+        "SELECT id FROM symbols WHERE kind='function' LIMIT 1").fetchone()[0]
+    conn.execute(
+        "INSERT INTO type_aliases(symbol_id,name) VALUES (?,'not_a_type')",
+        (function_id,),
+    )
+    count = conn.execute("SELECT COUNT(*) FROM type_aliases").fetchone()[0]
+    conn.execute(
+        "UPDATE meta SET value=? WHERE key='n_type_aliases'", (str(count),))
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match="non-aggregate symbol"):
+        db.validate_schema(conn, deep=True)
+    conn.close()
+
+
+@pytest.mark.parametrize("corruption,error", [
+    ("json", "invalid structure metadata"),
+    ("description_source", "table type_members.*invalid value"),
+])
+def test_deep_validation_rejects_invalid_aggregate_metadata(
+        mini_index, tmp_path, corruption, error):
+    import shutil
+
+    copied = tmp_path / f"bad-aggregate-{corruption}.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    if corruption == "json":
+        conn.execute(
+            "UPDATE symbols SET conditions='not-json'"
+            " WHERE id=(SELECT id FROM symbols WHERE kind='struct' LIMIT 1)"
+        )
+    else:
+        conn.execute(
+            "UPDATE type_members SET description=NULL"
+            " WHERE id=(SELECT id FROM type_members"
+            " WHERE description_source IS NOT NULL LIMIT 1)"
+        )
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match=error):
+        db.validate_schema(conn, deep=True)
+    conn.close()
+
+
+@pytest.mark.parametrize("corruption,error", [
+    ("cross_symbol_parent", "aggregate-member identity"),
+    ("field_parent", "aggregate-member identity"),
+    ("ordinal_gap", "member ordinals are not contiguous"),
+    ("preorder", "member preorder is not contiguous"),
+])
+def test_deep_validation_rejects_corrupt_aggregate_hierarchies(
+        mini_index, tmp_path, corruption, error):
+    import shutil
+
+    copied = tmp_path / f"bad-aggregate-{corruption}.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    if corruption == "cross_symbol_parent":
+        child = conn.execute(
+            "SELECT id,symbol_id FROM type_members WHERE name='s_inodes_count'"
+        ).fetchone()
+        parent = conn.execute(
+            "SELECT id FROM type_members WHERE symbol_id!=? LIMIT 1",
+            (child["symbol_id"],),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE type_members SET parent_id=? WHERE id=?",
+            (parent, child["id"]),
+        )
+    elif corruption == "field_parent":
+        parent = conn.execute(
+            "SELECT id FROM type_members WHERE name='s_blocks_count'"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE type_members SET parent_id=? WHERE name='s_inodes_count'",
+            (parent,),
+        )
+    elif corruption == "ordinal_gap":
+        conn.execute(
+            "UPDATE type_members SET ordinal=ordinal+100"
+            " WHERE id=(SELECT id FROM type_members ORDER BY id DESC LIMIT 1)"
+        )
+    else:
+        # ``generation`` is the first child of an anonymous union. Making it a
+        # root closes that union before the following nested-struct child tries
+        # to re-enter it.
+        conn.execute(
+            "UPDATE type_members SET parent_id=NULL WHERE name='generation'"
+        )
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match=error):
+        db.validate_schema(conn, deep=True)
+    conn.close()
+
+
 def test_deep_validation_checks_references_even_without_fk_declarations(
         tmp_path):
     template = tmp_path / "template.db"
@@ -402,7 +527,8 @@ def test_deep_validation_checks_references_even_without_fk_declarations(
     conn.row_factory = sqlite3.Row
     conn.execute("ATTACH DATABASE ? AS template", (str(template),))
     for table in (
-            "meta", "dirs", "files", "symbols", "subsystems",
+            "meta", "dirs", "files", "symbols", "type_aliases",
+            "type_members", "subsystems",
             "path_subsys", "dir_subsys", "source_includes",
             "translation_unit_roots", "calls"):
         conn.execute(
@@ -411,8 +537,11 @@ def test_deep_validation_checks_references_even_without_fk_declarations(
     conn.execute("UPDATE meta SET value='1' WHERE key='n_symbols'")
     conn.execute(
         "INSERT INTO symbols(id,file_id,name,kind,start_line,end_line,"
-        " signature,is_static,is_inline,is_exported)"
-        " VALUES (1,999,'orphan','function',1,1,NULL,0,0,0)")
+        " signature,summary,description,is_static,is_inline,is_exported,"
+        " is_anonymous,parse_complete,parse_warnings,unmatched_member_docs,"
+        " conditions)"
+        " VALUES (1,999,'orphan','function',1,1,NULL,NULL,NULL,0,0,0,0,1,"
+        " '[]','{}','[]')")
     conn.commit()
 
     with pytest.raises(db.SchemaError, match="dangling symbol file"):
