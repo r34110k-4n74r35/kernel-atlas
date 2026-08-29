@@ -109,6 +109,27 @@ def test_types_and_macros():
     assert syms["MAY_EXEC"].kind == "macro"
 
 
+def test_symbols_have_repeatable_source_order_with_explicit_ties():
+    source = """\
+#define EARLY_VALUE 1
+int source_variable;
+typedef struct same_line { int member; } zeta_t, alpha_t;
+static int later_function(void) { return EARLY_VALUE; }
+"""
+    expected = [
+        (1, "macro", "EARLY_VALUE"),
+        (2, "variable", "source_variable"),
+        (3, "struct", "same_line"),
+        (3, "typedef", "alpha_t"),
+        (3, "typedef", "zeta_t"),
+        (4, "function", "later_function"),
+    ]
+
+    for _ in range(8):
+        assert [(symbol.start_line, symbol.kind, symbol.name)
+                for symbol in parse(source)] == expected
+
+
 def test_file_scope_variable_but_not_locals():
     syms = by_name(parse("""
         static const struct file_operations ext4_fops = { .open = NULL };
@@ -261,6 +282,27 @@ def test_calls_are_collected_only_when_asked():
     assert parse(src)[0].calls == ()
     calls = parse(src, calls=True)[0].calls
     assert set(calls) == {"inner_one", "inner_two"}
+
+
+def test_call_tuples_have_repeatable_source_order():
+    source = """\
+int caller(void (*later_hook)(void), void (*early_hook)(void))
+{
+    first_call();
+    later_hook();
+    middle_call();
+    early_hook();
+    first_call();
+    return final_call();
+}
+"""
+    for _ in range(8):
+        caller = by_name(parse(source, calls=True))["caller"]
+        assert caller.calls == (
+            "first_call", "later_hook", "middle_call", "early_hook",
+            "final_call",
+        )
+        assert caller.indirect_calls == ("later_hook", "early_hook")
 
 
 def test_calls_through_parameters_and_local_objects_are_marked_indirect():

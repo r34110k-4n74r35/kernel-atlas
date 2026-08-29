@@ -1,4 +1,4 @@
-from kernel_atlas import render
+from kernel_atlas import render, structure_render
 from kernel_atlas.query import Entry
 from kernel_atlas.render import (entry_dict, human_size, render_plain, render_table,
                                  render_tree)
@@ -149,3 +149,25 @@ def test_structure_report_labels_anonymous_typedef_and_missing_source():
     assert "value_t (typedef to anonymous union)" in out
     assert "/missing/linux/include/value.h (missing)" in out
     assert "no primary MAINTAINERS match" in out
+
+
+def test_structure_report_uses_the_render_facade_paint_binding(monkeypatch):
+    detail = {
+        "kind": "struct",
+        "name": "sample",
+        "c_name": "struct sample",
+        "path": "include/sample.h",
+        "line": 1,
+        "members": [],
+    }
+
+    def marked(text, code, enabled):
+        return f"<{code}>{text}</{code}>" if enabled else text
+
+    monkeypatch.setattr(render, "paint", marked)
+    out = render.render_structure(detail, color=True)
+    direct = structure_render.render_structure(detail, color=True)
+
+    assert out.startswith("<1;36>struct sample</1;36>")
+    assert "<1>  Members (source order)</1>" in out
+    assert direct.startswith("\x1b[1;36mstruct sample\x1b[0m")
