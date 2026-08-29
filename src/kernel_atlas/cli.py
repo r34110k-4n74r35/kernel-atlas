@@ -1379,8 +1379,142 @@ def cmd_info(args):
 
     prefix = _command_prefix(args, meta)
     target_arg = shlex.quote(_target_spec(t))
-    print(f"\n  Next:  {prefix} siblings {target_arg}"
-          f"\n         {prefix} web {target_arg}")
+    next_lines = [f"\n  Next:  {prefix} siblings {target_arg}"]
+    if t.kind == "symbol" and t.symbol_kind in {"struct", "union"}:
+        next_lines.append(f"         {prefix} struct {target_arg}")
+    next_lines.append(f"         {prefix} web {target_arg}")
+    print("\n".join(next_lines))
+
+
+def cmd_struct(args):
+    """Explain an indexed C struct/union and every retained member."""
+    conn, meta = open_index(args)
+    requested = (args.target or "").strip()
+    kind_hint = None
+    target_text = requested
+    for aggregate_kind in ("struct", "union"):
+        prefix = aggregate_kind + " "
+        if target_text.startswith(prefix):
+            kind_hint = aggregate_kind
+            target_text = target_text[len(prefix):].strip()
+            break
+    spec = _normalize_target_spec(meta, target_text)
+    lookup_spec = f"{kind_hint} {spec}" if kind_hint else spec
+    res = query.resolve_structure(conn, lookup_spec)
+    if res.target is None:
+        kinds = set(filter(None, meta.get("kinds", "").split(",")))
+        needed = {kind_hint} if kind_hint else {"struct", "union"}
+        suffix = ("; rebuild the index with struct/union symbols enabled"
+                  if not (needed & kinds) else "")
+        _die((res.note or f"could not resolve aggregate {requested!r}") + suffix)
+
+    if res.candidates and not args.all:
+        candidates = [res.target, *res.candidates]
+        selectors = [query.structure_selector(conn, candidate)
+                     for candidate in candidates]
+        exact = [selector for selector in selectors if selector is not None]
+        examples = ", ".join(shlex.quote(selector) for selector in exact[:5])
+        more = (f", and {len(exact) - 5} more"
+                if len(exact) > 5 else "")
+        if len(exact) != len(candidates):
+            example_note = (f"; available exact selectors: {examples}{more}"
+                            if examples else "")
+            _die(f"{len(candidates)} aggregate definitions match {requested!r}; "
+                 "at least one cannot be isolated by path:name or path:line"
+                 f"{example_note}; pass --all")
+        forms = {"path:line" if selector.rpartition(":")[2].isdigit()
+                 else "path:name" for selector in exact}
+        qualifier = " or ".join(sorted(forms))
+        _die(f"{len(candidates)} aggregate definitions match {requested!r}; "
+             f"use {qualifier} for one exact identity "
+             f"(for example: {examples}{more}), or pass --all")
+
+    targets = ([res.target, *res.candidates] if args.all else [res.target])
+    definitions = []
+    source_root = find_source_tree(meta)
+    for target in targets:
+        detail = query.structure_detail(conn, target)
+        composition = query.all_subsystems(conn, "file", target.file_id or target.id)
+        subsystems = [row for row in composition
+                      if row["name"] not in query.CATCH_ALL]
+        catch_all = next((
+            row for row in composition
+            if row["name"] in query.CATCH_ALL and bool(row["is_primary"])
+        ), None)
+        unmatched = not any(bool(row["is_primary"]) for row in composition)
+        unclassified = None
+        if catch_all is not None or unmatched:
+            unclassified = {
+                "is_primary": bool(catch_all["is_primary"])
+                if catch_all is not None else False,
+                "unmatched": unmatched,
+                "match_score": (catch_all["score"]
+                                if catch_all is not None else None),
+                "match_rank": (catch_all["rank"]
+                               if catch_all is not None else None),
+                "maintainers_section": (catch_all["name"]
+                                        if catch_all is not None else None),
+            }
+        area = query.describe_area(target.path)
+        related = (query.documentation_for(conn, target, limit=args.max_docs)
+                   if args.max_docs else [])
+        recorded_root = meta.get("tree_path")
+        display_root = (source_root if source_root is not None else
+                        Path(recorded_root).expanduser()
+                        if recorded_root else None)
+        source = (source_member(display_root, target.path)
+                  if display_root is not None else None)
+        detail.update({
+            "index": index_version(meta),
+            "area": ({"name": area[0], "description": area[1]}
+                     if area else None),
+            "subsystems": [_subsystem_payload(row) for row in subsystems],
+            "unclassified_ownership": unclassified,
+            "links": _links_for(meta, target),
+            "related_documentation": [
+                {
+                    "path": entry.path,
+                    "name": entry.name,
+                    "lines": entry.lines,
+                    "size": entry.size,
+                    "links": links.links(index_version(meta), entry.path),
+                }
+                for entry in related
+            ],
+            "source_path": str(source) if source is not None else None,
+            "source_exists": ((source.exists() or source.is_symlink())
+                              if source is not None else None),
+            "layout_limits": [
+                "All preprocessor alternatives are source possibilities, not "
+                "members proven to coexist in one configured kernel.",
+                "Byte offsets, padding, alignment, and sizeof require a concrete "
+                "configuration, architecture, compiler ABI, and expanded macros.",
+            ],
+        })
+        definitions.append(detail)
+
+    payload = {
+        "query": args.target,
+        "index": index_version(meta),
+        "n_definitions": len(definitions),
+        "definitions": definitions,
+    }
+    if args.format == "json":
+        sys.stdout.write(render.render_json(payload))
+        return
+
+    color = render.use_color(args.color)
+    width = shutil.get_terminal_size((100, 24)).columns
+    for index, detail in enumerate(definitions):
+        if index:
+            print()
+        sys.stdout.write(render.render_structure(detail, color, width))
+    target_spec = shlex.quote(
+        f"{definitions[0]['path']}:{definitions[0]['line']}")
+    prefix = _command_prefix(args, meta)
+    print(f"\n  Next:  {prefix} show {target_spec}"
+          f"\n         {prefix} docs {target_spec}"
+          f"\n         {prefix} web {target_spec}")
 
 
 def cmd_siblings(args):
@@ -2512,6 +2646,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-subsystems", type=_nonneg_int, default=3)
     sp.add_argument("--max-candidates", type=_nonneg_int, default=10)
     sp.set_defaults(func=cmd_info)
+
+    sp = add("struct", aliases=["structure"],
+             help="explain a C struct/union and all indexed members")
+    sp.add_argument("target", help="usb_device | struct usb_device | "
+                                   "union perf_mem_data_src | "
+                                   "include/linux/usb.h:usb_device | "
+                                   "include/linux/usb.h:661")
+    sp.add_argument("--all", action="store_true",
+                    help="show every matching definition instead of requiring one")
+    sp.add_argument("--max-docs", type=_nonneg_int, default=5,
+                    help="maximum related Documentation/ files (0 disables)")
+    sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.set_defaults(func=cmd_struct)
 
     sp = add("siblings", aliases=["sib"],
                         help="what sits at the same level as this?")

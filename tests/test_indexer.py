@@ -68,6 +68,50 @@ def test_symlink_is_represented_without_following_it(tmp_path):
     assert stats.parsed == 1
 
 
+def test_build_persists_detailed_aggregate_rows_aliases_and_counts(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "types.h").write_text("""\
+/**
+ * struct study_type - indexed aggregate
+ * @value: Primary value.
+ * @nested: Nested view.
+ * @nested.inner: Nested value.
+ */
+typedef struct study_type {
+    int value;
+    struct {
+        long inner;
+    } nested;
+} study_type;
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    meta = db.validate_schema(conn, deep=True)
+    symbol = conn.execute(
+        "SELECT id,summary,parse_complete FROM symbols"
+        " WHERE kind='struct' AND name='study_type'"
+    ).fetchone()
+    aliases = conn.execute(
+        "SELECT name FROM type_aliases WHERE symbol_id=?", (symbol["id"],)
+    ).fetchall()
+    members = conn.execute(
+        "SELECT name,parent_id,description_source FROM type_members"
+        " WHERE symbol_id=? ORDER BY ordinal", (symbol["id"],)
+    ).fetchall()
+    conn.close()
+
+    assert symbol["summary"] == "indexed aggregate"
+    assert symbol["parse_complete"] == 1
+    assert [row["name"] for row in aliases] == ["study_type"]
+    assert [row["name"] for row in members] == ["value", "nested", "inner"]
+    assert members[2]["parent_id"] is not None
+    assert all(row["description_source"] == "kernel-doc" for row in members)
+    assert int(meta["n_type_aliases"]) == 1
+    assert int(meta["n_type_members"]) == 3
+
+
 def test_all_matching_subsystems_are_persisted(tmp_path):
     blocks = []
     for i in range(7):

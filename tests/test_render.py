@@ -85,3 +85,67 @@ def test_path_json_does_not_claim_symbol_linkage():
     assert "is_static" not in row
     assert "is_inline" not in row
     assert "is_exported" not in row
+
+
+def test_structure_report_renders_nested_members_without_color():
+    payload = {
+        "kind": "struct", "name": "sample", "tag": "sample",
+        "c_name": "struct sample", "path": "include/sample.h", "line": 10,
+        "end_line": 20, "index": "7.2", "is_anonymous": False,
+        "signature": "struct sample __packed { 1 member }",
+        "aliases": ["sample_t"], "direct_member_count": 1,
+        "total_member_count": 2, "documentable_member_count": 1,
+        "documented_member_count": 1,
+        "semantic_description_count": 2,
+        "documentation_coverage": 1.0, "parse_complete": True,
+        "summary": "A sample structure.", "description": "Long notes.",
+        "subsystems": [], "warnings": [], "unmatched_member_docs": {},
+        "related_documentation": [], "links": {}, "layout_limits": [],
+        "members": [{
+            "ordinal": 0, "name": None, "kind": "union", "type": "union",
+            "declaration": "union { int value; };", "line": 12,
+            "end_line": 14, "bit_width": None, "array_dimensions": [],
+            "description": None, "description_source": None,
+            "conditions": [], "visibility": "unspecified",
+            "is_anonymous": True, "generated_by": None,
+            "referenced_kind": None, "referenced_name": None,
+            "children": [{
+                "ordinal": 1, "name": "value", "kind": "field",
+                "type": "int", "declaration": "int value;", "line": 13,
+                "end_line": 13, "bit_width": None, "array_dimensions": [],
+                "description": "Stored value.",
+                "description_source": "kernel-doc", "conditions": [],
+                "visibility": "unspecified", "is_anonymous": False,
+                "generated_by": None, "referenced_kind": None,
+                "referenced_name": None, "children": [],
+            }],
+        }],
+    }
+    out = render.render_structure(payload, color=False, max_width=72)
+    assert "struct sample" in out
+    assert "struct sample __packed" in out
+    assert "<anonymous>" in out and "value" in out
+    assert "Stored value. [kernel-doc]" in out
+    assert "2 parser-supplied macro explanations" in out
+    assert "(undocumented)" in out
+    assert "\x1b[" not in out
+
+
+def test_structure_report_labels_anonymous_typedef_and_missing_source():
+    payload = {
+        "kind": "union", "name": "value_t", "tag": None, "c_name": None,
+        "path": "include/value.h", "line": 1, "end_line": 1,
+        "is_anonymous": True, "aliases": ["value_t"], "signature": None,
+        "source_path": "/missing/linux/include/value.h",
+        "source_exists": False, "subsystems": [],
+        "unclassified_ownership": {"unmatched": True},
+        "direct_member_count": 0, "total_member_count": 0,
+        "documentable_member_count": 0, "documented_member_count": 0,
+        "documentation_coverage": 0.0, "parse_complete": True,
+        "members": [], "warnings": [], "unmatched_member_docs": {},
+        "related_documentation": [], "links": {}, "layout_limits": [],
+    }
+    out = render.render_structure(payload, color=False)
+    assert "value_t (typedef to anonymous union)" in out
+    assert "/missing/linux/include/value.h (missing)" in out
+    assert "no primary MAINTAINERS match" in out

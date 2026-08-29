@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import call_resolution, config
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 class SchemaError(sqlite3.DatabaseError):
@@ -58,10 +58,51 @@ CREATE TABLE symbols (
     start_line  INTEGER NOT NULL DEFAULT 0,
     end_line    INTEGER NOT NULL DEFAULT 0,
     signature   TEXT,
+    summary     TEXT,
+    description TEXT,
     is_static   INTEGER NOT NULL DEFAULT 0,
     is_inline   INTEGER NOT NULL DEFAULT 0,
     is_exported INTEGER NOT NULL DEFAULT 0,
+    is_anonymous INTEGER NOT NULL DEFAULT 0,
+    parse_complete INTEGER NOT NULL DEFAULT 1,
+    parse_warnings TEXT NOT NULL DEFAULT '[]',
+    unmatched_member_docs TEXT NOT NULL DEFAULT '{}',
+    conditions TEXT NOT NULL DEFAULT '[]',
     FOREIGN KEY (file_id) REFERENCES files(id)
+);
+
+CREATE TABLE type_aliases (
+    symbol_id INTEGER NOT NULL,
+    name      TEXT NOT NULL,
+    UNIQUE (symbol_id, name),
+    FOREIGN KEY (symbol_id) REFERENCES symbols(id)
+);
+
+-- Preorder member rows make nested anonymous aggregates representable while
+-- retaining a stable declaration order.  Raw declarations remain the source
+-- of truth; the parsed shape columns are study-oriented conveniences.
+CREATE TABLE type_members (
+    id                 INTEGER PRIMARY KEY,
+    symbol_id          INTEGER NOT NULL,
+    parent_id          INTEGER,
+    ordinal            INTEGER NOT NULL,
+    name               TEXT,
+    kind               TEXT NOT NULL,
+    type_text          TEXT,
+    declaration        TEXT NOT NULL,
+    start_line         INTEGER NOT NULL,
+    end_line           INTEGER NOT NULL,
+    bit_width          TEXT,
+    array_dimensions   TEXT NOT NULL DEFAULT '[]',
+    description        TEXT,
+    description_source TEXT,
+    conditions         TEXT NOT NULL DEFAULT '[]',
+    visibility         TEXT NOT NULL DEFAULT 'unspecified',
+    is_anonymous       INTEGER NOT NULL DEFAULT 0,
+    generated_by       TEXT,
+    UNIQUE (symbol_id, ordinal),
+    FOREIGN KEY (symbol_id) REFERENCES symbols(id),
+    FOREIGN KEY (parent_id) REFERENCES type_members(id)
 );
 
 CREATE TABLE subsystems (
@@ -154,6 +195,8 @@ CREATE INDEX idx_files_ext      ON files(ext);
 CREATE INDEX idx_sym_name       ON symbols(name);
 CREATE INDEX idx_sym_file       ON symbols(file_id);
 CREATE INDEX idx_sym_kind       ON symbols(kind);
+CREATE INDEX idx_alias_name     ON type_aliases(name);
+CREATE INDEX idx_member_parent  ON type_members(parent_id);
 CREATE INDEX idx_ps_ref         ON path_subsys(ref_kind, ref_id, rank);
 CREATE INDEX idx_ps_sub         ON path_subsys(subsystem_id);
 CREATE INDEX idx_ds_dir         ON dir_subsys(dir_id, rank);
@@ -242,6 +285,10 @@ def _validate_row_domains(conn: sqlite3.Connection) -> None:
         "'same_file','included_source','unique_global','ambiguous','macro',"
         "'indirect','unresolved'"
     )
+    member_kind_values = (
+        "'field','function_pointer','struct','union','struct_group',"
+        "'unnamed_bitfield','macro'"
+    )
     subsystem_lists = (
         "maintainers", "reviewers", "lists", "trees", "websites",
         "patchwork", "bugs", "chats", "profiles", "keywords",
@@ -268,8 +315,36 @@ def _validate_row_domains(conn: sqlite3.Connection) -> None:
             f"(typeof(kind)='text' AND kind IN ({symbol_values}))",
             "(typeof(start_line)='integer' AND start_line>=1)",
             "(typeof(end_line)='integer' AND end_line>=start_line)",
-            text_or_null("signature"), boolean("is_static"),
+            text_or_null("signature"), text_or_null("summary"),
+            text_or_null("description"), boolean("is_static"),
             boolean("is_inline"), boolean("is_exported"),
+            boolean("is_anonymous"), boolean("parse_complete"),
+            clean_text("parse_warnings", nonempty=False),
+            clean_text("unmatched_member_docs", nonempty=False),
+            clean_text("conditions", nonempty=False),
+        )),
+        "type_aliases": " AND ".join((
+            integer_id("symbol_id"), clean_text("name"),
+        )),
+        "type_members": " AND ".join((
+            integer_id("id"), integer_id("symbol_id"),
+            "(parent_id IS NULL OR " + integer_id("parent_id") + ")",
+            nonnegative("ordinal"),
+            "(name IS NULL OR " + clean_text("name") + ")",
+            f"(typeof(kind)='text' AND kind IN ({member_kind_values}))",
+            text_or_null("type_text"), clean_text("declaration"),
+            "(typeof(start_line)='integer' AND start_line>=1)",
+            "(typeof(end_line)='integer' AND end_line>=start_line)",
+            text_or_null("bit_width"), clean_text("array_dimensions", False),
+            text_or_null("description"),
+            "(description_source IS NULL OR (typeof(description_source)='text'"
+            " AND description_source IN ('kernel-doc','inline-kernel-doc',"
+            "'source-comment','macro-semantics'))) ",
+            "((description IS NULL)=(description_source IS NULL))",
+            clean_text("conditions", False),
+            "(typeof(visibility)='text' AND visibility IN "
+            "('unspecified','public','private'))",
+            boolean("is_anonymous"), text_or_null("generated_by"),
         )),
         "subsystems": " AND ".join((
             nonnegative_id("id"), clean_text("name"), text_or_null("status"),
@@ -329,6 +404,48 @@ def _validate_row_domains(conn: sqlite3.Connection) -> None:
                 raise SchemaError(
                     f"index subsystem {row['id']} has invalid {field} metadata")
 
+    for row in conn.execute(
+            "SELECT id,parse_complete,parse_warnings,unmatched_member_docs,conditions"
+            " FROM symbols WHERE parse_complete!=1 OR parse_warnings!='[]'"
+            " OR unmatched_member_docs!='{}' OR conditions!='[]'"):
+        try:
+            warnings = json.loads(row["parse_warnings"])
+            unmatched = json.loads(row["unmatched_member_docs"])
+            conditions = json.loads(row["conditions"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SchemaError(
+                f"index symbol {row['id']} has invalid structure metadata") from exc
+        if not isinstance(warnings, list) or any(
+                not isinstance(value, str) for value in warnings):
+            raise SchemaError(
+                f"index symbol {row['id']} has invalid parse warnings")
+        if bool(row["parse_complete"]) != (len(warnings) == 0):
+            raise SchemaError(
+                f"index symbol {row['id']} has inconsistent parse completeness")
+        if not isinstance(unmatched, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in unmatched.items()):
+            raise SchemaError(
+                f"index symbol {row['id']} has invalid unmatched member docs")
+        if not isinstance(conditions, list) or any(
+                not isinstance(value, str) for value in conditions):
+            raise SchemaError(
+                f"index symbol {row['id']} has invalid conditions")
+
+    for row in conn.execute(
+            "SELECT id,array_dimensions,conditions FROM type_members"
+            " WHERE array_dimensions!='[]' OR conditions!='[]'"):
+        for field in ("array_dimensions", "conditions"):
+            try:
+                value = json.loads(row[field])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise SchemaError(
+                    f"index member {row['id']} has invalid {field}") from exc
+            if not isinstance(value, list) or any(
+                    not isinstance(item, str) for item in value):
+                raise SchemaError(
+                    f"index member {row['id']} has invalid {field}")
+
 
 def _valid_index_path(path: str, *, root: bool = False) -> bool:
     """Whether a stored source identity is normalized relative POSIX text."""
@@ -346,6 +463,8 @@ def _validate_deep_structure(conn: sqlite3.Connection,
     _validate_row_domains(conn)
     table_counts = {
         "n_dirs": "dirs", "n_files": "files", "n_symbols": "symbols",
+        "n_type_aliases": "type_aliases",
+        "n_type_members": "type_members",
         "n_subsystems": "subsystems", "n_calls": "calls",
     }
     for key, table in table_counts.items():
@@ -369,6 +488,12 @@ def _validate_deep_structure(conn: sqlite3.Connection,
          " ON d.id=f.dir_id WHERE d.id IS NULL LIMIT 1"),
         ("symbol file", "SELECT 1 FROM symbols s LEFT JOIN files f"
          " ON f.id=s.file_id WHERE f.id IS NULL LIMIT 1"),
+        ("type alias", "SELECT 1 FROM type_aliases a LEFT JOIN symbols s"
+         " ON s.id=a.symbol_id WHERE s.id IS NULL LIMIT 1"),
+        ("type member", "SELECT 1 FROM type_members m LEFT JOIN symbols s"
+         " ON s.id=m.symbol_id LEFT JOIN type_members p ON p.id=m.parent_id"
+         " WHERE s.id IS NULL OR (m.parent_id IS NOT NULL AND p.id IS NULL)"
+         " LIMIT 1"),
         ("file ownership", "SELECT 1 FROM path_subsys p LEFT JOIN files f"
          " ON f.id=p.ref_id LEFT JOIN subsystems s ON s.id=p.subsystem_id"
          " WHERE f.id IS NULL OR s.id IS NULL LIMIT 1"),
@@ -395,6 +520,9 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         ("directory", "dirs", "id"), ("directory path", "dirs", "path"),
         ("file", "files", "id"), ("file path", "files", "path"),
         ("symbol", "symbols", "id"),
+        ("type alias", "type_aliases", "symbol_id,name"),
+        ("type member", "type_members", "id"),
+        ("type member ordinal", "type_members", "symbol_id,ordinal"),
         ("subsystem", "subsystems", "id"),
         ("subsystem name", "subsystems", "name"),
         ("file ownership", "path_subsys", "ref_kind,ref_id,subsystem_id"),
@@ -531,6 +659,69 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         raise SchemaError(
             f"index symbol identity is incompatible with file metadata for "
             f"{bad_symbol_line['path']!r}")
+
+    bad_alias = conn.execute(
+        "SELECT a.symbol_id FROM type_aliases a JOIN symbols s"
+        " ON s.id=a.symbol_id WHERE s.kind NOT IN ('struct','union') LIMIT 1"
+    ).fetchone()
+    if bad_alias is not None:
+        raise SchemaError("index has an alias attached to a non-aggregate symbol")
+    bad_member = conn.execute(
+        "SELECT m.id FROM type_members m JOIN symbols s ON s.id=m.symbol_id"
+        " LEFT JOIN type_members p ON p.id=m.parent_id"
+        " WHERE s.kind NOT IN ('struct','union')"
+        " OR m.start_line<s.start_line OR m.end_line>s.end_line"
+        " OR (m.parent_id IS NOT NULL AND (p.symbol_id!=m.symbol_id"
+        " OR p.ordinal>=m.ordinal OR p.kind NOT IN "
+        " ('struct','union','struct_group','macro')"
+        " OR m.start_line<p.start_line OR m.end_line>p.end_line)) LIMIT 1"
+    ).fetchone()
+    if bad_member is not None:
+        raise SchemaError("index has an inconsistent aggregate-member identity")
+    bad_member_order = conn.execute(
+        "SELECT symbol_id FROM type_members GROUP BY symbol_id"
+        " HAVING MIN(ordinal)!=0 OR MAX(ordinal)!=COUNT(*)-1"
+        " OR COUNT(DISTINCT ordinal)!=COUNT(*) LIMIT 1"
+    ).fetchone()
+    if bad_member_order is not None:
+        raise SchemaError("index aggregate-member ordinals are not contiguous")
+
+    # Parent ids form a preorder forest.  Once traversal leaves a container's
+    # subtree it may never re-enter it; otherwise query reconstruction moves a
+    # later root underneath an earlier field despite contiguous ordinals.
+    current_symbol_id: int | None = None
+    parents: dict[int, int | None] = {}
+    previous_chain: list[int] = []
+    closed: set[int] = set()
+    for row in conn.execute(
+            "SELECT symbol_id,id,parent_id FROM type_members"
+            " ORDER BY symbol_id,ordinal"):
+        if row["symbol_id"] != current_symbol_id:
+            current_symbol_id = row["symbol_id"]
+            parents.clear()
+            previous_chain.clear()
+            closed.clear()
+        chain: list[int] = []
+        current = row["parent_id"]
+        seen: set[int] = set()
+        while current is not None:
+            if current in seen or current not in parents:
+                raise SchemaError(
+                    "index has an inconsistent aggregate-member hierarchy")
+            seen.add(current)
+            chain.append(current)
+            current = parents[current]
+        chain.reverse()
+        if any(ancestor in closed for ancestor in chain):
+            raise SchemaError(
+                "index aggregate-member preorder is not contiguous")
+        common = 0
+        while common < min(len(previous_chain), len(chain)) \
+                and previous_chain[common] == chain[common]:
+            common += 1
+        closed.update(previous_chain[common:])
+        parents[row["id"]] = row["parent_id"]
+        previous_chain = [*chain, row["id"]]
 
     recorded_states = {
         "n_parse_skipped": skipped, "n_parse_failed": failed,
@@ -702,7 +893,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
         raise SchemaError(f"index has an unsafe kernel version: {exc}") from exc
     required_meta = {
         "source", "tree_path", "built_at", "kinds", "has_calls",
-        "n_dirs", "n_files", "n_symbols", "n_subsystems", "n_calls",
+        "n_dirs", "n_files", "n_symbols", "n_type_aliases",
+        "n_type_members", "n_subsystems", "n_calls",
         "n_calls_resolved", "n_calls_ambiguous", "n_calls_macro",
         "n_calls_indirect", "n_calls_unresolved",
         "n_parse_skipped", "n_parse_failed", "n_oversize", "n_symlinks",
@@ -727,7 +919,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
     if any(kind not in allowed_kinds for kind in kinds) \
             or len(kinds) != len(set(kinds)):
         raise SchemaError("index metadata kinds is invalid or contains duplicates")
-    for key in ("n_dirs", "n_files", "n_symbols", "n_subsystems", "n_calls",
+    for key in ("n_dirs", "n_files", "n_symbols", "n_type_aliases",
+                "n_type_members", "n_subsystems", "n_calls",
                 "n_calls_resolved", "n_calls_ambiguous", "n_calls_macro",
                 "n_calls_indirect", "n_calls_unresolved",
                 "n_parse_skipped", "n_parse_failed", "n_oversize",
@@ -774,7 +967,16 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
                   "n_symbols", "is_symlink", "link_target", "index_status",
                   "index_error", "call_domain"},
         "symbols": {"id", "file_id", "name", "kind", "start_line", "end_line",
-                    "signature", "is_static", "is_inline", "is_exported"},
+                    "signature", "summary", "description", "is_static",
+                    "is_inline", "is_exported", "is_anonymous",
+                    "parse_complete", "parse_warnings",
+                    "unmatched_member_docs", "conditions"},
+        "type_aliases": {"symbol_id", "name"},
+        "type_members": {"id", "symbol_id", "parent_id", "ordinal", "name",
+                         "kind", "type_text", "declaration", "start_line",
+                         "end_line", "bit_width", "array_dimensions",
+                         "description", "description_source", "conditions",
+                         "visibility", "is_anonymous", "generated_by"},
         "subsystems": {"id", "name", "status", "maintainers", "reviewers",
                        "lists", "trees", "websites", "patchwork", "bugs",
                        "chats", "profiles", "keywords", "n_files",
