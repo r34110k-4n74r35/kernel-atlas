@@ -1132,12 +1132,32 @@ they need no network and never touch your real indexes.
 | --- | --- |
 | `config.py` | where kernels, indexes, and the `use` pin live |
 | `kernelsrc.py` | kernel.org release list, resumable download, checksum, atomic extract |
-| `cparse.py` | tree-sitter C extraction and kernel macro idioms |
+| `cparse.py` | tree-sitter ownership plus general function, call, declaration, and macro extraction |
+| `cparse_models.py` | parser symbol kinds and shared symbol/member records |
+| `cparse_shared.py` | kernel-C syntax tables and source/tree helpers shared by parsers |
+| `aggregate_parse.py` | struct/union/enum definitions, member shapes, source documentation, and aggregate macro idioms |
 | `maintainers.py` | `MAINTAINERS` parsing and path → subsystem matching |
 | `indexer.py` | tree walk, parallel parsing, subsystem attachment, atomic build |
 | `db.py` | SQLite schema plus structural and semantic integrity validation |
-| `query.py` | target resolution, container/level model, search |
+| `call_resolution.py` | conservative direct-call identity resolution and evidence accounting |
+| `query.py` | generic target resolution, container/level model, search, and compatibility facade |
+| `query_models.py` | shared query result, target, resolution, and scope records |
+| `query_targeting.py` | target normalization and deterministic candidate ranking |
+| `structure_query.py` | strict aggregate resolution, selectors, and nested study payloads |
 | `relationships.py` | ownership overlap and resolved cross-subsystem call flow |
 | `links.py` | Elixir / git.kernel.org / GitHub / docs.kernel.org URLs |
-| `render.py` | table / plain / json / csv / tree output |
-| `cli.py` | command line interface |
+| `render.py` | generic table / plain / json / csv / tree output and compatibility facade |
+| `render_format.py` | terminal-formatting primitives shared by renderers |
+| `structure_render.py` | hierarchical human-readable aggregate reports |
+| `cli.py` | argument parser, shared command services, public entry point, and compatibility facade |
+| `cli_lifecycle.py` | release, build, index selection/removal, statistics, and integrity commands |
+| `cli_browse.py` | information, listing, search, subsystem, tree, path, and source commands |
+| `cli_aggregate.py` | detailed struct/union study command |
+| `cli_calls.py` | backtrace, call-graph, and subsystem-relationship commands |
+| `cli_resources.py` | source links, related documentation, and cross-version lookup |
+
+The facade modules (`cparse.py`, `query.py`, `render.py`, and `cli.py`) retain
+their established imports and entry points. Parser/query/render feature modules
+depend only on shared models and helpers, not their invoking facade. CLI feature
+handlers receive shared services from `cli.py` without importing it. The result
+has one-way imports, while callers do not need to learn internal module names.
