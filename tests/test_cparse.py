@@ -865,6 +865,46 @@ def test_multiple_typedef_declarators_are_all_indexed():
     assert syms["second_t"].kind == "typedef"
 
 
+def test_typedef_tagged_type_names_and_direct_aliases_are_preserved():
+    symbols = parse("""\
+typedef enum study_mode {
+    STUDY_OFF,
+    STUDY_ON,
+} study_mode_t;
+typedef enum {
+    STUDY_LOW,
+    STUDY_HIGH,
+} anonymous_mode_t;
+typedef struct study_record {
+    int value;
+} study_record_t;
+""")
+
+    tagged_enum = next(
+        symbol for symbol in symbols
+        if symbol.kind == "enum" and symbol.name == "study_mode")
+    anonymous_enum = next(
+        symbol for symbol in symbols
+        if symbol.kind == "enum" and symbol.name == "anonymous_mode_t")
+    tagged_struct = next(
+        symbol for symbol in symbols
+        if symbol.kind == "struct" and symbol.name == "study_record")
+
+    assert tagged_enum.aliases == ("study_mode_t",)
+    assert not tagged_enum.is_anonymous
+    assert anonymous_enum.aliases == ("anonymous_mode_t",)
+    assert anonymous_enum.is_anonymous
+    assert tagged_struct.aliases == ("study_record_t",)
+    assert not tagged_struct.is_anonymous
+
+    typedef_names = {
+        symbol.name for symbol in symbols if symbol.kind == "typedef"
+    }
+    assert typedef_names == {
+        "study_mode_t", "anonymous_mode_t", "study_record_t",
+    }
+
+
 def test_struct_member_count_counts_comma_declarators():
     syms = by_name(parse("struct pair { int left, right; long generation; };"))
     assert "3 members" in syms["pair"].signature

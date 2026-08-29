@@ -12,6 +12,10 @@ from pathlib import Path
 from . import call_resolution, config
 
 SCHEMA_VERSION = "5"
+# Direct typedef spellings can belong to any C tagged-type definition.  Enum
+# aliases are retained even though type_members currently models only structs
+# and unions, and structure queries deliberately remain struct/union-scoped.
+TYPE_ALIAS_KINDS = ("struct", "union", "enum")
 
 
 class SchemaError(sqlite3.DatabaseError):
@@ -660,12 +664,20 @@ def _validate_deep_structure(conn: sqlite3.Connection,
             f"index symbol identity is incompatible with file metadata for "
             f"{bad_symbol_line['path']!r}")
 
+    alias_kind_params = ",".join("?" for _ in TYPE_ALIAS_KINDS)
     bad_alias = conn.execute(
-        "SELECT a.symbol_id FROM type_aliases a JOIN symbols s"
-        " ON s.id=a.symbol_id WHERE s.kind NOT IN ('struct','union') LIMIT 1"
+        "SELECT a.name AS alias,s.kind,s.name,f.path"
+        " FROM type_aliases a JOIN symbols s"
+        " ON s.id=a.symbol_id"
+        " JOIN files f ON f.id=s.file_id"
+        f" WHERE s.kind NOT IN ({alias_kind_params}) LIMIT 1",
+        TYPE_ALIAS_KINDS,
     ).fetchone()
     if bad_alias is not None:
-        raise SchemaError("index has an alias attached to a non-aggregate symbol")
+        raise SchemaError(
+            f"index has type alias {bad_alias['alias']!r} attached to "
+            f"unsupported symbol kind {bad_alias['kind']!r} at "
+            f"{bad_alias['path']}:{bad_alias['name']}")
     bad_member = conn.execute(
         "SELECT m.id FROM type_members m JOIN symbols s ON s.id=m.symbol_id"
         " LEFT JOIN type_members p ON p.id=m.parent_id"
