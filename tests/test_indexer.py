@@ -112,6 +112,42 @@ typedef struct study_type {
     assert int(meta["n_type_members"]) == 3
 
 
+def test_build_persists_enum_and_struct_typedef_aliases(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "tagged-types.h").write_text("""\
+typedef enum transport_mode {
+    TRANSPORT_MODE_FAST,
+} transport_mode_t;
+
+typedef enum {
+    ANONYMOUS_MODE_SAFE,
+} anonymous_mode_t;
+
+typedef struct tagged_record {
+    int value;
+} tagged_record_t;
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    meta = db.validate_schema(conn, deep=True)
+    aliases = conn.execute(
+        "SELECT s.kind,s.name,s.is_anonymous,a.name AS alias"
+        " FROM type_aliases a JOIN symbols s ON s.id=a.symbol_id"
+        " JOIN files f ON f.id=s.file_id WHERE f.path='tagged-types.h'"
+        " ORDER BY s.start_line,a.name"
+    ).fetchall()
+    conn.close()
+
+    assert [tuple(row) for row in aliases] == [
+        ("enum", "transport_mode", 0, "transport_mode_t"),
+        ("enum", "anonymous_mode_t", 1, "anonymous_mode_t"),
+        ("struct", "tagged_record", 0, "tagged_record_t"),
+    ]
+    assert int(meta["n_type_aliases"]) == 3
+
+
 def test_all_matching_subsystems_are_persisted(tmp_path):
     blocks = []
     for i in range(7):

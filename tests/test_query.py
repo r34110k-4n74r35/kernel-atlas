@@ -237,6 +237,34 @@ def test_structure_resolution_ignores_same_named_function(
     assert not resolved.candidates
 
 
+def test_structure_resolution_ignores_enum_typedef_aliases(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "enum-alias.db"
+    shutil.copy(mini_index, copied)
+    writer = db.connect(copied, readonly=False)
+    enum_id = writer.execute(
+        "SELECT id FROM symbols WHERE kind='enum' AND name='rw_hint'"
+    ).fetchone()[0]
+    writer.execute(
+        "INSERT INTO type_aliases(symbol_id,name) VALUES (?,'rw_hint_t')",
+        (enum_id,),
+    )
+    count = writer.execute("SELECT COUNT(*) FROM type_aliases").fetchone()[0]
+    writer.execute(
+        "UPDATE meta SET value=? WHERE key='n_type_aliases'", (str(count),)
+    )
+    writer.commit()
+    db.validate_schema(writer, deep=True)
+
+    resolved = query.resolve_structure(writer, "rw_hint_t")
+    writer.close()
+
+    assert resolved.target is None
+    assert "no struct/union tag or typedef alias" in resolved.note
+
+
 def test_resolve_qualified_duplicate_symbol_reports_line_ambiguity(
         mini_index, tmp_path):
     import shutil

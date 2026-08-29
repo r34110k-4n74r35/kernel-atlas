@@ -407,7 +407,7 @@ def test_deep_validation_anchors_aggregate_table_counts(
     conn.close()
 
 
-def test_deep_validation_rejects_aliases_on_nonaggregates(
+def test_deep_validation_rejects_aliases_on_unsupported_symbol_kinds(
         mini_index, tmp_path):
     import shutil
 
@@ -425,8 +425,33 @@ def test_deep_validation_rejects_aliases_on_nonaggregates(
         "UPDATE meta SET value=? WHERE key='n_type_aliases'", (str(count),))
     conn.commit()
 
-    with pytest.raises(db.SchemaError, match="non-aggregate symbol"):
+    with pytest.raises(
+            db.SchemaError,
+            match="type alias 'not_a_type'.*unsupported symbol kind 'function'"):
         db.validate_schema(conn, deep=True)
+    conn.close()
+
+
+def test_deep_validation_accepts_enum_typedef_aliases(mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "enum-alias.db"
+    shutil.copy(mini_index, copied)
+    conn = db.connect(copied, readonly=False)
+    enum_id = conn.execute(
+        "SELECT id FROM symbols WHERE kind='enum' AND name='rw_hint'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO type_aliases(symbol_id,name) VALUES (?,'rw_hint_t')",
+        (enum_id,),
+    )
+    count = conn.execute("SELECT COUNT(*) FROM type_aliases").fetchone()[0]
+    conn.execute(
+        "UPDATE meta SET value=? WHERE key='n_type_aliases'", (str(count),)
+    )
+    conn.commit()
+
+    db.validate_schema(conn, deep=True)
     conn.close()
 
 
