@@ -15,7 +15,7 @@ from .structure_render import render_structure as _render_structure
 
 COLUMNS = ("kind", "name", "path", "dir", "line", "span", "lines", "size",
            "symbols", "subdirs", "files", "flags", "subsystem", "signature",
-           "resolution")
+           "occurrences", "resolution")
 
 DEFAULT_COLUMNS = {
     "dir": ("kind", "name", "subdirs", "files"),
@@ -82,8 +82,6 @@ def cell(e: Entry, col: str) -> str:
     if col == "size":
         return human_size(e.size)
     if col == "symbols":
-        if e.kind == "dir":
-            return f"{e.n_subdirs or 0}d {e.n_files or 0}f"
         return str(e.n_symbols) if e.n_symbols is not None else "-"
     if col == "subdirs":
         return str(e.n_subdirs) if e.n_subdirs is not None else "-"
@@ -95,6 +93,14 @@ def cell(e: Entry, col: str) -> str:
         return e.subsystem or "-"
     if col == "signature":
         return e.signature or "-"
+    if col == "occurrences":
+        counts = (
+            (e.direct_count, "d"),
+            (e.indirect_count, "i"),
+            (e.macro_count, "m"),
+        )
+        return " ".join(f"{count}{suffix}" for count, suffix in counts if count) \
+            or ("0" if any(count == 0 for count, _ in counts) else "-")
     if col == "resolution":
         return e.resolution or "-"
     return ""
@@ -165,7 +171,8 @@ def entry_dict(e: Entry, columns=None) -> dict:
         "n_subdirs": e.n_subdirs, "n_symbols": e.n_symbols,
         "is_static": e.is_static, "is_inline": e.is_inline,
         "is_exported": e.is_exported, "subsystem": e.subsystem,
-        "resolution": e.resolution,
+        "resolution": e.resolution, "direct_count": e.direct_count,
+        "indirect_count": e.indirect_count, "macro_count": e.macro_count,
     }
     if e.is_target:
         d["is_target"] = True
@@ -186,6 +193,11 @@ def entry_dict(e: Entry, columns=None) -> dict:
             value = e.n_files
         elif col == "flags":
             value = _flags(e)
+        elif col == "occurrences":
+            value = (cell(e, col)
+                     if any(count is not None for count in (
+                         e.direct_count, e.indirect_count, e.macro_count))
+                     else None)
         else:
             value = d.get(col)
         # Explicit columns are a schema request.  Keep a requested key even

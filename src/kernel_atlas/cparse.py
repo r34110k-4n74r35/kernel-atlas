@@ -13,6 +13,7 @@ plain grammar:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 import tree_sitter_c
 from tree_sitter import Language, Parser, Query, QueryCursor, QueryError
@@ -30,6 +31,7 @@ from .cparse_models import (
     TYPEDEF,
     UNION,
     VARIABLE,
+    CallSite as CallSite,
     Symbol as Symbol,
     TypeMember as TypeMember,
 )
@@ -52,6 +54,13 @@ from .cparse_shared import (
 # Skip pathological/generated files; nothing human-readable is this big.
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_MEMBER_DECLARATION = _aggregate_parse.MAX_MEMBER_DECLARATION
+
+
+def validate_max_file_bytes(value: int) -> int:
+    """Return one supported parser read limit or raise a stable API error."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("max_file_bytes must be a positive integer")
+    return value
 
 _SYSCALL_MACRO = re.compile(r"^(COMPAT_)?SYSCALL_DEFINE(\d)$")
 _EXPORT_MACRO = re.compile(
@@ -171,7 +180,20 @@ _PATTERNS: list[str] = [
     # rejected by _is_file_scope below.
     "(ERROR (declaration) @decl)",
 ]
-_CALL_PATTERN = "(call_expression function: (identifier) @callee)"
+_CALL_PATTERN = "(call_expression) @call"
+_ConditionalPath = tuple[tuple[int, int], ...]
+_MacroEvent = tuple[int, bool, _ConditionalPath]
+
+
+@dataclass(frozen=True, slots=True)
+class _MacroTransitions:
+    events: dict[str, tuple[_MacroEvent, ...]]
+    # A conditional group chooses exactly one explicit branch. ``None`` is the
+    # implicit fall-through choice of a group which has no final ``#else``.
+    choices: dict[int, tuple[int | None, ...]]
+
+
+_EMPTY_MACRO_TRANSITIONS = _MacroTransitions({}, {})
 _SYMBOL_KIND_ORDER = {
     kind: position for position, kind in enumerate(ALL_KINDS)
 }
@@ -632,7 +654,9 @@ def _declaration_prefix_words(text: str) -> list[str] | None:
 
 def _source_exported_symbols(src: bytes, exported: set[str], existing: set[str],
                              want_fn: bool, want_var: bool,
-                             call_nodes: list | None = None) -> list[Symbol]:
+                             call_nodes: list | None = None,
+                             transitions: _MacroTransitions | None = None,
+                             ) -> list[Symbol]:
     """Conservative fallback for literal, exported top-level definitions.
 
     This is deliberately export-guided: root-level ERROR recovery can erase an
@@ -716,11 +740,19 @@ def _source_exported_symbols(src: bytes, exported: set[str], existing: set[str],
                 start = src.count(b"\n", 0, definition_start) + 1
                 end = src.count(b"\n", 0, closing) + 1
                 calls: tuple[str, ...] = ()
+                indirect_calls: tuple[str, ...] = ()
+                call_sites: tuple[CallSite, ...] = ()
                 if call_nodes is not None:
-                    calls = tuple(dict.fromkeys(
-                        _text(src, node)
+                    sites = tuple(
+                        site
                         for node in _source_sorted_nodes(call_nodes)
-                        if opening < node.start_byte < closing))
+                        if opening < node.start_byte < closing
+                        if (site := _call_site(
+                            src, node, {},
+                            transitions or _EMPTY_MACRO_TRANSITIONS)) is not None
+                    )
+                    calls, indirect_calls, call_sites = \
+                        _summarize_call_sites(sites)
                 out.append(Symbol(
                     name=name, kind=FUNCTION, start_line=start, end_line=end,
                     signature=_function_signature(
@@ -729,6 +761,7 @@ def _source_exported_symbols(src: bytes, exported: set[str], existing: set[str],
                     is_static="static" in words,
                     is_inline=any(word in _INLINE_SPECIFIERS for word in words),
                     is_exported=True, calls=calls,
+                    indirect_calls=indirect_calls, call_sites=call_sites,
                 ))
 
         if want_var and not any(symbol.name == name for symbol in out):
@@ -991,10 +1024,283 @@ def _source_sorted_nodes(nodes) -> list:
     ))
 
 
-def _collect_call_details(src: bytes, node,
-                          end_byte: int | None = None
-                          ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Callee names and the subset bound to local objects in a function body.
+def source_include_directives(src: bytes) -> tuple[tuple[str, str, int], ...]:
+    """Real quoted/angle ``#include`` directives whose operand ends in ``.c``.
+
+    A syntax-tree pass is intentional here: a raw line regex also sees examples
+    inside block comments and continued string literals, which would invent
+    translation-unit membership and confidently misresolve call identities.
+    """
+    _ensure_parser()
+    root = _PARSER.parse(src).root_node
+    nodes = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current.type == "preproc_include":
+            nodes.append(current)
+            continue
+        stack.extend(reversed(current.named_children))
+
+    directives: list[tuple[str, str, int]] = []
+    for node in _source_sorted_nodes(nodes):
+        path = node.child_by_field_name("path")
+        if path is None:
+            continue
+        raw = _text(src, path).strip()
+        if path.type == "string_literal" and len(raw) >= 2 \
+                and raw.startswith('"') and raw.endswith('"'):
+            delimiter, token = '"', raw[1:-1]
+        elif path.type == "system_lib_string" and len(raw) >= 2 \
+                and raw.startswith("<") and raw.endswith(">"):
+            delimiter, token = "<", raw[1:-1]
+        else:
+            continue
+        if token.endswith(".c"):
+            directives.append((delimiter, token, node.start_point[0] + 1))
+    return tuple(directives)
+
+
+def _macro_transitions(src: bytes, root) \
+        -> _MacroTransitions:
+    """Return guarded source-order changes for in-file macro state.
+
+    Each guard maps a conditional node to the branch containing the directive.
+    This distinguishes mutually exclusive ``#if``/``#else`` bodies while still
+    treating state observed after ``#endif`` as configuration-dependent.
+    """
+    transitions: dict[str, list[_MacroEvent]] = {}
+    choices: dict[int, tuple[int | None, ...]] = {}
+
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current.type in {"preproc_if", "preproc_ifdef"}:
+            branches: list[int | None] = [current.start_byte]
+            branch = next((
+                child for child in current.named_children
+                if child.type in {"preproc_elif", "preproc_else"}
+            ), None)
+            while branch is not None:
+                branches.append(branch.start_byte)
+                if branch.type == "preproc_else":
+                    break
+                branch = next((
+                    child for child in branch.named_children
+                    if child.type in {"preproc_elif", "preproc_else"}
+                ), None)
+            else:
+                # No final #else: the group can select no explicit body.
+                branches.append(None)
+            choices[current.start_byte] = tuple(branches)
+        if current.type in {"preproc_def", "preproc_function_def"}:
+            name_node = current.child_by_field_name("name")
+            if name_node is None:
+                name_node = next((child for child in current.named_children
+                                  if child.type == "identifier"), None)
+            if name_node is not None:
+                transitions.setdefault(_text(src, name_node), []).append((
+                    current.end_byte, True, _conditional_path(current),
+                ))
+            continue
+        if current.type == "preproc_call":
+            directive = next((child for child in current.named_children
+                              if child.type == "preproc_directive"), None)
+            argument = next((child for child in current.named_children
+                             if child.type == "preproc_arg"), None)
+            if directive is not None and argument is not None \
+                    and _text(src, directive).strip() == "#undef":
+                match = re.match(r"[A-Za-z_]\w*", _text(src, argument).lstrip())
+                if match is not None:
+                    transitions.setdefault(match.group(), []).append((
+                        current.end_byte, False, _conditional_path(current),
+                    ))
+            continue
+        stack.extend(reversed(current.named_children))
+    return _MacroTransitions(
+        {name: tuple(sorted(events)) for name, events in transitions.items()},
+        choices,
+    )
+
+
+def _conditional_group(branch):
+    """Root ``#if`` node for one tree-sitter ``#elif``/``#else`` node."""
+    group = branch.parent
+    while group is not None and group.type == "preproc_elif":
+        group = group.parent
+    return group if group is not None and group.type in {
+        "preproc_if", "preproc_ifdef",
+    } else None
+
+
+def _conditional_path(node) -> _ConditionalPath:
+    """Conditional-group/branch identities enclosing one syntax node."""
+    branches: dict[int, int] = {}
+    current = node
+    parent = node.parent
+    while parent is not None:
+        if parent.type.startswith(("preproc_else", "preproc_elif")):
+            group = _conditional_group(parent)
+            if group is not None:
+                # An #else after one or more #elif nodes is nested below those
+                # nodes in tree-sitter's AST. Preserve the nearest branch rather
+                # than overwriting it while walking through the chain.
+                branches.setdefault(group.start_byte, parent.start_byte)
+        elif parent.type.startswith("preproc_if") \
+                and not current.type.startswith((
+                    "preproc_else", "preproc_elif")):
+            branches.setdefault(parent.start_byte, parent.start_byte)
+        current, parent = parent, parent.parent
+    return tuple(sorted(branches.items()))
+
+
+def _macro_is_active_overapprox(
+        events: tuple[_MacroEvent, ...], offset: int,
+        call_branches: dict[int, int]) -> bool:
+    """Sound fallback when exact conditional enumeration would be excessive."""
+    states = {False}
+    for event_offset, defined, event_path in events:
+        if event_offset > offset:
+            break
+        if any(group in call_branches and call_branches[group] != branch
+               for group, branch in event_path):
+            continue
+        mandatory = all(call_branches.get(group) == branch
+                        for group, branch in event_path)
+        if mandatory:
+            states = {defined}
+        else:
+            states.add(defined)
+    return True in states
+
+
+def _macro_is_active(
+        transitions: _MacroTransitions,
+        name: str, offset: int,
+        call_path: tuple[tuple[int, int], ...] = ()) -> bool:
+    """Whether ``name`` can be defined in a configuration reaching a call."""
+    events = transitions.events.get(name, ())
+    call_branches = dict(call_path)
+    relevant_events = tuple(
+        event for event in events if event[0] <= offset and not any(
+            group in call_branches and call_branches[group] != branch
+            for group, branch in event[2]
+        )
+    )
+    if not relevant_events:
+        return False
+
+    groups = sorted({
+        group for _, _, event_path in relevant_events
+        for group, _ in event_path if group not in call_branches
+    })
+    assignments: list[dict[int, int | None]] = [dict(call_branches)]
+    for group in groups:
+        group_choices = transitions.choices.get(group)
+        if group_choices is None:
+            # Malformed/recovered preprocessor syntax: keep an implicit branch
+            # as well as every observed branch so this remains conservative.
+            group_choices = tuple(dict.fromkeys((
+                *(branch for _, _, path in relevant_events
+                  for candidate_group, branch in path
+                  if candidate_group == group),
+                None,
+            )))
+        if len(assignments) * len(group_choices) > 4096:
+            return _macro_is_active_overapprox(
+                relevant_events, offset, call_branches)
+        assignments = [
+            {**assignment, group: branch}
+            for assignment in assignments for branch in group_choices
+        ]
+
+    for assignment in assignments:
+        defined = False
+        for _, event_defined, event_path in relevant_events:
+            if all(assignment.get(group) == branch
+                   for group, branch in event_path):
+                defined = event_defined
+        if defined:
+            return True
+    return False
+
+
+def _call_target(src: bytes, node) -> tuple[str, bool] | None:
+    """Return a stable display name and whether syntax is inherently indirect."""
+    current = node.child_by_field_name("function") \
+        if node.type == "call_expression" else node
+    indirect = False
+    for _ in range(32):
+        if current is None:
+            return None
+        if current.type == "identifier":
+            return _text(src, current), indirect
+        if current.type == "field_expression":
+            raw = _squash(_text(src, current), 200)
+            raw = re.sub(r"\s*(->|\.)\s*", r"\1", raw)
+            return raw, True
+        if current.type == "pointer_expression":
+            argument = current.child_by_field_name("argument")
+            operand = argument or next(iter(current.named_children), None)
+            if operand is None:
+                return None
+            raw = re.sub(r"\s+", "", _text(src, current))
+            return raw[:200], True
+        if current.type in {
+                "subscript_expression", "conditional_expression",
+                "cast_expression"}:
+            raw = _squash(_text(src, current), 200)
+            raw = re.sub(r"\s*([\[\]])\s*", r"\1", raw)
+            return raw, True
+        if current.type in {"parenthesized_expression", "attributed_expression"}:
+            current = next(iter(current.named_children), None)
+            continue
+        return None
+    return None
+
+
+def _call_site(
+        src: bytes, node, bindings: dict[str, list[tuple[int, int]]],
+        transitions: _MacroTransitions) -> CallSite | None:
+    target = _call_target(src, node)
+    if target is None:
+        return None
+    name, syntactic_indirect = target
+    if not name or "\0" in name:
+        return None
+    function_node = node.child_by_field_name("function")
+    bare_identifier = function_node is not None \
+        and function_node.type == "identifier"
+    macro_active = bare_identifier and _macro_is_active(
+        transitions, name, node.start_byte, _conditional_path(node))
+    if macro_active:
+        kind = "macro"
+    elif syntactic_indirect or any(
+            start <= node.start_byte < end
+            for start, end in bindings.get(name, ())):
+        kind = "indirect"
+    else:
+        kind = "direct"
+    return CallSite(
+        name=name, kind=kind, start_line=node.start_point[0] + 1,
+        start_byte=node.start_byte,
+    )
+
+
+def _summarize_call_sites(
+        sites: tuple[CallSite, ...]
+        ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[CallSite, ...]]:
+    calls = tuple(dict.fromkeys(site.name for site in sites))
+    indirect = tuple(dict.fromkeys(
+        site.name for site in sites if site.kind == "indirect"))
+    return calls, indirect, sites
+
+
+def _collect_call_details(
+        src: bytes, node, end_byte: int | None = None,
+        transitions: _MacroTransitions | None = None,
+        ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[CallSite, ...]]:
+    """Callee names, indirect names, and source-level occurrence evidence.
 
     Accepts either a function_definition or a bare compound_statement — the
     latter is what SYSCALL_DEFINEn leaves us with, where the body is a sibling
@@ -1003,27 +1309,19 @@ def _collect_call_details(src: bytes, node,
     body = node if node.type == "compound_statement" else \
         node.child_by_field_name("body")
     if body is None:
-        return (), ()
+        return (), (), ()
     cursor = QueryCursor(_CALL_QUERY)
     caps = cursor.captures(body)
-    seen: dict[str, None] = {}
-    indirect: dict[str, None] = {}
-    direct: dict[str, None] = {}
     bindings = _local_object_bindings(src, node, body, end_byte)
-    for n in _source_sorted_nodes(caps.get("callee", [])):
-        if end_byte is not None and n.start_byte >= end_byte:
+    transitions = transitions or _EMPTY_MACRO_TRANSITIONS
+    sites: list[CallSite] = []
+    for call in _source_sorted_nodes(caps.get("call", [])):
+        if end_byte is not None and call.start_byte >= end_byte:
             continue
-        name = _text(src, n)
-        seen.setdefault(name, None)
-        if any(start <= n.start_byte < end
-               for start, end in bindings.get(name, ())):
-            indirect.setdefault(name, None)
-        else:
-            direct.setdefault(name, None)
-    # The calls table has one edge per caller/name.  If at least one spelling
-    # is a direct function call, preserve that useful edge; mark a name
-    # indirect only when every occurrence is bound to a local object.
-    return tuple(seen), tuple(name for name in indirect if name not in direct)
+        site = _call_site(src, call, bindings, transitions)
+        if site is not None:
+            sites.append(site)
+    return _summarize_call_sites(tuple(sites))
 
 
 def _collect_calls(src: bytes, node, end_byte: int | None = None) -> tuple[str, ...]:
@@ -1049,14 +1347,18 @@ def _recover_bpmp_empty_aggregates(
 
 def parse_source(
         src: bytes, kinds: frozenset[str],
-        want_calls: bool = False) -> list[Symbol]:
+        want_calls: bool = False, *,
+    max_file_bytes: int = MAX_FILE_BYTES) -> list[Symbol]:
     """Return the symbols defined in one C translation unit."""
+    max_file_bytes = validate_max_file_bytes(max_file_bytes)
     _ensure_parser()
-    if len(src) > MAX_FILE_BYTES:
+    if len(src) > max_file_bytes:
         return []
 
     tree = _PARSER.parse(src)
     caps = QueryCursor(_QUERY).captures(tree.root_node)
+    macro_states = (_macro_transitions(src, tree.root_node) if want_calls
+                    else _EMPTY_MACRO_TRANSITIONS)
     function_nodes = caps.get("function", [])
     recovered_ends = _recovered_function_ends(src, function_nodes)
     declaration_nodes = list(caps.get("decl", []))
@@ -1109,12 +1411,14 @@ def parse_source(
         m = _SYSCALL_MACRO.match(_text(src, type_node)) if type_node is not None else None
         if m:
             if want_sys and name.isidentifier():
-                calls, indirect_calls = _collect_call_details(
-                    src, node, effective_end) if want_calls else ((), ())
+                calls, indirect_calls, call_sites = _collect_call_details(
+                    src, node, effective_end, macro_states
+                ) if want_calls else ((), (), ())
                 symbols.append(Symbol(
                     name=_syscall_name(m, name), kind=SYSCALL,
                     start_line=start, end_line=end, signature=_squash(head),
                     calls=calls, indirect_calls=indirect_calls,
+                    call_sites=call_sites,
                 ))
             continue
 
@@ -1174,23 +1478,28 @@ def parse_source(
             continue
         calls: tuple[str, ...] = ()
         indirect_calls: tuple[str, ...] = ()
+        call_sites: tuple[CallSite, ...] = ()
         if want_calls:
             if source_body_end is not None:
                 if range_call_nodes is None:
                     range_call_nodes = _source_sorted_nodes(
                         QueryCursor(_CALL_QUERY).captures(
-                            tree.root_node).get("callee", []))
-                calls = tuple(dict.fromkeys(
-                    _text(src, call) for call in range_call_nodes
-                    if source_body_start < call.start_byte < source_body_end))
-                # The recovered extension may not belong to the function's
-                # AST body, but bindings in the reliable prefix still block
-                # false direct-function promotion.
-                _, indirect_calls = _collect_call_details(
-                    src, node, effective_end)
+                            tree.root_node).get("call", []))
+                body = node.child_by_field_name("body")
+                bindings = (_local_object_bindings(
+                    src, node, body, effective_end) if body is not None else {})
+                sites = tuple(
+                    site
+                    for call in range_call_nodes
+                    if source_body_start < call.start_byte < source_body_end
+                    if (site := _call_site(
+                        src, call, bindings, macro_states)) is not None
+                )
+                calls, indirect_calls, call_sites = \
+                    _summarize_call_sites(sites)
             else:
-                calls, indirect_calls = _collect_call_details(
-                    src, node, effective_end)
+                calls, indirect_calls, call_sites = _collect_call_details(
+                    src, node, effective_end, macro_states)
         symbols.append(Symbol(
             name=name,
             kind=FUNCTION,
@@ -1201,6 +1510,7 @@ def parse_source(
             is_static="static" in prefix,
             is_inline=any(w in _INLINE_SPECIFIERS for w in prefix),
             calls=calls, indirect_calls=indirect_calls,
+            call_sites=call_sites,
         ))
 
     for node in caps.get("macrocall", []):
@@ -1228,8 +1538,9 @@ def parse_source(
             start = node.start_point[0] + 1
             end = body.end_point[0] + 1 if body is not None and \
                 body.type == "compound_statement" else node.end_point[0] + 1
-            calls, indirect_calls = _collect_call_details(
-                src, body) if want_calls and body is not None else ((), ())
+            calls, indirect_calls, call_sites = _collect_call_details(
+                src, body, transitions=macro_states
+            ) if want_calls and body is not None else ((), (), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, arg),
                 kind=SYSCALL,
@@ -1238,6 +1549,7 @@ def parse_source(
                 signature=_squash(_text(src, node)),
                 calls=calls,
                 indirect_calls=indirect_calls,
+                call_sites=call_sites,
             ))
             continue
 
@@ -1278,12 +1590,14 @@ def parse_source(
             body = _following_compound(node)
             start = node.start_point[0] + 1
             end = body.end_point[0] + 1 if body is not None else node.end_point[0] + 1
-            calls, indirect_calls = _collect_call_details(
-                src, body) if want_calls and body is not None else ((), ())
+            calls, indirect_calls, call_sites = _collect_call_details(
+                src, body, transitions=macro_states
+            ) if want_calls and body is not None else ((), (), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, args[0]), kind=SYSCALL,
                 start_line=start, end_line=end, signature=_squash(text),
                 calls=calls, indirect_calls=indirect_calls,
+                call_sites=call_sites,
             ))
 
     if want_var:
@@ -1477,12 +1791,22 @@ def parse_source(
     # reparse just the short gap before the next known top-level function.
     for gap_start, gap_end in _recovery_gaps(src, function_nodes, recovered_ends):
         line_offset = src.count(b"\n", 0, gap_start)
-        for sym in parse_source(src[gap_start:gap_end], kinds, want_calls):
+        for sym in parse_source(
+                src[gap_start:gap_end], kinds, want_calls,
+                max_file_bytes=max_file_bytes):
             sym.start_line += line_offset
             sym.end_line += line_offset
             for member in sym.members:
                 member.start_line += line_offset
                 member.end_line += line_offset
+            for call_site in sym.call_sites:
+                call_site.start_line += line_offset
+                call_site.start_byte += gap_start
+                if call_site.kind != "indirect":
+                    call_site.kind = (
+                        "macro" if _macro_is_active(
+                            macro_states, call_site.name,
+                            call_site.start_byte) else "direct")
             symbols.append(sym)
 
     if exported and (want_fn or want_var):
@@ -1493,9 +1817,10 @@ def parse_source(
         call_nodes = None
         if want_calls and exported - existing:
             call_nodes = QueryCursor(_CALL_QUERY).captures(
-                tree.root_node).get("callee", [])
+                tree.root_node).get("call", [])
         symbols.extend(_source_exported_symbols(
-            src, exported, existing, want_fn, want_var, call_nodes))
+            src, exported, existing, want_fn, want_var, call_nodes,
+            macro_states))
 
     if exported:
         for sym in symbols:
@@ -1527,6 +1852,15 @@ def parse_source(
         if sym.indirect_calls:
             prior.indirect_calls = tuple(dict.fromkeys(
                 (*prior.indirect_calls, *sym.indirect_calls)))
+        if sym.call_sites:
+            prior.call_sites = tuple(sorted(
+                dict.fromkeys(
+                    (site.name, site.kind, site.start_line, site.start_byte)
+                    for site in (*prior.call_sites, *sym.call_sites)
+                ),
+                key=lambda value: (value[3], value[0], value[1]),
+            ))
+            prior.call_sites = tuple(CallSite(*site) for site in prior.call_sites)
         if not prior.summary and sym.summary:
             prior.summary = sym.summary
         if not prior.description and sym.description:
@@ -1561,10 +1895,14 @@ def parse_source(
     ))
 
 
-def parse_file(path, kinds: frozenset[str], want_calls: bool = False) -> list[Symbol]:
+def parse_file(
+        path, kinds: frozenset[str], want_calls: bool = False, *,
+        max_file_bytes: int = MAX_FILE_BYTES) -> list[Symbol]:
+    max_file_bytes = validate_max_file_bytes(max_file_bytes)
     try:
         with open(path, "rb") as fh:
-            src = fh.read()
+            src = fh.read(max_file_bytes + 1)
     except OSError:
         return []
-    return parse_source(src, kinds, want_calls)
+    return parse_source(
+        src, kinds, want_calls, max_file_bytes=max_file_bytes)

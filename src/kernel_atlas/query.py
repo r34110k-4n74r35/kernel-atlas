@@ -57,6 +57,51 @@ def like_under(path: str) -> str:
     return like_escape(path) + "/%"
 
 
+def line_selector_suffix(spec: str) -> str | None:
+    """Positive numeric suffix of an actual ``path:line`` selector.
+
+    A wholly numeric path is still a path.  Keeping the delimiter check here
+    prevents callers from independently recreating the subtle distinction.
+    """
+    raw = (spec or "").strip()
+    if ":" not in raw:
+        return None
+    tail = raw.rpartition(":")[2]
+    if re.fullmatch(r"[+]?\d+", tail) is None:
+        return None
+    try:
+        return tail if int(tail) > 0 else None
+    except ValueError:
+        return None
+
+
+def ambiguous_line_paths(conn: sqlite3.Connection, spec: str) -> list[str]:
+    """Indexed files competing for a basename-only ``path:line`` selector.
+
+    Generic informational resolution may use the symbol spanning a line to
+    explain which same-named file was selected.  Commands acting on one exact
+    source identity use this evidence to require a full indexed path instead.
+    """
+    if line_selector_suffix(spec) is None:
+        return []
+    head = _norm((spec or "").strip().rpartition(":")[0])
+    if not head:
+        return []
+    if conn.execute("SELECT 1 FROM files WHERE path=?", (head,)).fetchone():
+        return []
+    if "/" in head or "\\" in head:
+        return []
+    paths = [
+        row["path"]
+        for row in conn.execute(
+            "SELECT path FROM files WHERE name=?"
+            " ORDER BY LENGTH(path),path,id",
+            (head,),
+        ).fetchall()
+    ]
+    return paths if len(paths) > 1 else []
+
+
 def _sym_target(conn: sqlite3.Connection, row: sqlite3.Row) -> Target:
     # Keep the historical private signature for internal callers and tests.
     # The connection was never used to materialize the selected row.
@@ -148,7 +193,14 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
                     (fr["id"], line, line)).fetchall()
                 hits.extend(_sym_target(conn, row) for row in rows)
             if hits:
-                hits.sort(key=_rank_candidate)
+                # A source coordinate names the most specific enclosing
+                # declaration.  Candidate quality remains the deterministic
+                # tiebreaker for equal spans and basename matches.
+                hits.sort(key=lambda target: (
+                    (target.end_line or target.line or 0)
+                    - (target.line or 0),
+                    *_rank_candidate(target),
+                ))
                 note = f"line {line} falls inside this symbol"
                 if not exact_file and len(frows) > 1:
                     note += (f" (matched {head_n.rsplit('/', 1)[-1]!r} to "
@@ -251,18 +303,6 @@ def resolve(conn: sqlite3.Connection, spec: str) -> Resolution:
         return Resolution(dir_cands[0], dir_cands[1:], note)
 
     return Resolution(None, note=f"nothing in the index matches {raw!r}")
-
-
-def primary_subsystem(conn: sqlite3.Connection, ref_kind: str,
-                      ref_id: int) -> sqlite3.Row | None:
-    if ref_kind == "dir":
-        return uniform_directory_subsystem(conn, ref_id)
-    if ref_kind == "file":
-        return unique_file_subsystem(conn, ref_id)
-    return conn.execute(
-        "SELECT s.* FROM path_subsys p JOIN subsystems s ON s.id = p.subsystem_id"
-        " WHERE p.ref_kind = ? AND p.ref_id = ? ORDER BY p.rank LIMIT 1",
-        (ref_kind, ref_id)).fetchone()
 
 
 def all_subsystems(conn: sqlite3.Connection, ref_kind: str,
@@ -784,7 +824,8 @@ def callee_entries(conn: sqlite3.Connection, symbol_id: int,
                    limit: int = 200) -> list[Entry]:
     """Direct calls made by one callable, with conservative identity status."""
     sql = """
-        SELECT c.callee, c.resolution, s.id, s.kind, s.name, s.start_line,
+        SELECT c.callee, c.resolution, c.direct_count, c.indirect_count,
+               c.macro_count, s.id, s.kind, s.name, s.start_line,
                s.end_line, s.signature, s.is_static, s.is_inline,
                s.is_exported, f.path
         FROM calls c
@@ -801,7 +842,10 @@ def callee_entries(conn: sqlite3.Connection, symbol_id: int,
     for row in conn.execute(sql, params):
         if row["id"] is None:
             out.append(Entry(kind="?", name=row["callee"], path="-",
-                             resolution=row["resolution"]))
+                             resolution=row["resolution"],
+                             direct_count=row["direct_count"],
+                             indirect_count=row["indirect_count"],
+                             macro_count=row["macro_count"]))
         else:
             out.append(Entry(
                 kind=row["kind"], name=row["name"], path=row["path"],
@@ -810,6 +854,9 @@ def callee_entries(conn: sqlite3.Connection, symbol_id: int,
                 is_inline=bool(row["is_inline"]),
                 is_exported=bool(row["is_exported"]), ref_id=row["id"],
                 resolution=row["resolution"],
+                direct_count=row["direct_count"],
+                indirect_count=row["indirect_count"],
+                macro_count=row["macro_count"],
             ))
     return out
 
@@ -844,7 +891,10 @@ def callers(conn: sqlite3.Connection, symbol_id: int | str,
     sql = """
         SELECT s.id, s.file_id, s.name, s.kind, s.start_line, s.end_line,
                s.signature, s.is_static, s.is_inline, s.is_exported,
-               f.path, f.dir_id, c.resolution
+               f.path, f.dir_id, c.resolution,
+               SUM(c.direct_count) AS direct_count,
+               SUM(c.indirect_count) AS indirect_count,
+               SUM(c.macro_count) AS macro_count
         FROM calls c
         JOIN symbols s ON s.id = c.caller_id
         JOIN files f ON f.id = s.file_id
@@ -861,7 +911,10 @@ def callers(conn: sqlite3.Connection, symbol_id: int | str,
                   end_line=r["end_line"], signature=r["signature"],
                   is_static=bool(r["is_static"]), is_inline=bool(r["is_inline"]),
                   is_exported=bool(r["is_exported"]), ref_id=r["id"],
-                  resolution=r["resolution"]) for r in rows]
+                  resolution=r["resolution"],
+                  direct_count=r["direct_count"],
+                  indirect_count=r["indirect_count"],
+                  macro_count=r["macro_count"]) for r in rows]
 
 
 def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> list[Entry]:

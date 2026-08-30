@@ -80,6 +80,30 @@ def test_explicit_json_columns_are_exact_and_keep_nulls():
     }
 
 
+def test_symbols_column_is_not_repurposed_for_directory_counts():
+    entry = Entry(kind="dir", name="ext4", path="fs/ext4",
+                  n_subdirs=2, n_files=3)
+    assert render.cell(entry, "symbols") == "-"
+    assert entry_dict(entry, ["symbols"]) == {"symbols": None}
+
+
+def test_call_occurrences_keep_mixed_evidence_compact_and_machine_readable():
+    entry = Entry(
+        kind="function", name="target", path="x.c",
+        direct_count=2, indirect_count=1, macro_count=1,
+    )
+    assert render.cell(entry, "occurrences") == "2d 1i 1m"
+    assert entry_dict(entry)["direct_count"] == 2
+    assert entry_dict(entry)["indirect_count"] == 1
+    assert entry_dict(entry)["macro_count"] == 1
+    assert entry_dict(entry, ["occurrences"]) == {
+        "occurrences": "2d 1i 1m",
+    }
+    assert entry_dict(
+        Entry(kind="file", name="x.c", path="x.c"), ["occurrences"]
+    ) == {"occurrences": None}
+
+
 def test_path_json_does_not_claim_symbol_linkage():
     row = entry_dict(Entry(kind="dir", name="mm", path="mm"))
     assert "is_static" not in row

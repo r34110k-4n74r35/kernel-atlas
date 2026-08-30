@@ -1,3 +1,5 @@
+import pytest
+
 from kernel_atlas import cparse
 
 KINDS = frozenset(cparse.DEFAULT_KINDS)
@@ -9,6 +11,18 @@ def parse(src: str, kinds=KINDS, calls=False):
 
 def by_name(symbols):
     return {s.name: s for s in symbols}
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, "1024", 0, -1])
+def test_public_parse_size_limit_requires_a_positive_integer(tmp_path, value):
+    source = tmp_path / "sample.c"
+    source.write_text("int sample(void) { return 0; }\n")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        cparse.parse_source(b"int sample(void) {}", KINDS,
+                            max_file_bytes=value)
+    with pytest.raises(ValueError, match="positive integer"):
+        cparse.parse_file(source, KINDS, max_file_bytes=value)
 
 
 def test_plain_functions_and_static_inline():
@@ -338,6 +352,151 @@ def test_calls_through_parameters_and_local_objects_are_marked_indirect():
     assert syms["through_local"].indirect_calls == ("callback",)
     assert syms["before_local"].indirect_calls == ()
     assert syms["through_prototype"].indirect_calls == ()
+
+
+def test_call_sites_retain_member_dereference_and_direct_evidence():
+    caller = by_name(parse("""\
+int caller(void (*fp)(void), struct ops *ops)
+{
+    fn();
+    ops->fn();
+    usb_hcd->driver->alloc_dev();
+    (*fp)();
+    return 0;
+}
+    """, calls=True))["caller"]
+
+    assert caller.calls == (
+        "fn", "ops->fn", "usb_hcd->driver->alloc_dev", "*fp",
+    )
+    assert caller.indirect_calls == (
+        "ops->fn", "usb_hcd->driver->alloc_dev", "*fp",
+    )
+    assert [(site.name, site.kind) for site in caller.call_sites] == [
+        ("fn", "direct"),
+        ("ops->fn", "indirect"),
+        ("usb_hcd->driver->alloc_dev", "indirect"),
+        ("*fp", "indirect"),
+    ]
+
+
+def test_call_sites_retain_subscript_and_conditional_indirect_expressions():
+    caller = by_name(parse("""\
+int caller(int (**check_part)(void), int condition,
+           int (*left)(void), int (*right)(void))
+{
+    check_part[2]();
+    ((int (*)(void))left)();
+    return (condition ? left : right)();
+}
+    """, calls=True))["caller"]
+
+    assert caller.calls == (
+        "check_part[2]", "(int (*)(void))left", "condition ? left : right",
+    )
+    assert caller.indirect_calls == caller.calls
+    assert {site.kind for site in caller.call_sites} == {"indirect"}
+
+
+def test_macro_call_state_respects_future_defines_and_undef_boundaries():
+    syms = by_name(parse("""\
+int target(void);
+int before(void) { return target(); }
+#define target() 1
+int during(void) { return target(); }
+#undef target
+int after(void) { return target(); }
+    """, calls=True))
+
+    assert syms["before"].call_sites[0].kind == "direct"
+    assert syms["during"].call_sites[0].kind == "macro"
+    assert syms["after"].call_sites[0].kind == "direct"
+
+
+def test_conditional_macro_transitions_never_promote_a_possible_macro():
+    defined = by_name(parse("""\
+#ifdef CONFIG_TARGET
+#define target() 1
+#endif
+int caller(void) { return target(); }
+    """, calls=True))["caller"]
+    maybe_undefined = by_name(parse("""\
+#define target() 1
+#ifdef CONFIG_TARGET
+#undef target
+#endif
+int caller(void) { return target(); }
+    """, calls=True))["caller"]
+    definitely_undefined = by_name(parse("""\
+#ifdef CONFIG_TARGET
+#define target() 1
+#endif
+#undef target
+int caller(void) { return target(); }
+    """, calls=True))["caller"]
+
+    assert defined.call_sites[0].kind == "macro"
+    assert maybe_undefined.call_sites[0].kind == "macro"
+    assert definitely_undefined.call_sites[0].kind == "direct"
+
+
+def test_macro_state_is_scoped_to_its_conditional_branch():
+    syms = by_name(parse("""\
+#if CONFIG_TARGET
+#define target() 1
+int macro_branch(void) { return target(); }
+#else
+int direct_branch(void) { return target(); }
+#endif
+int after_branches(void) { return target(); }
+    """, calls=True))
+
+    assert syms["macro_branch"].call_sites[0].kind == "macro"
+    assert syms["direct_branch"].call_sites[0].kind == "direct"
+    assert syms["after_branches"].call_sites[0].kind == "macro"
+
+
+def test_exhaustive_conditional_undefs_clear_a_preexisting_macro():
+    caller = by_name(parse("""\
+#define target() 1
+#if CONFIG_A
+#undef target
+#else
+#undef target
+#endif
+int caller(void) { return target(); }
+    """, calls=True))["caller"]
+
+    assert caller.call_sites[0].kind == "direct"
+
+
+def test_elif_and_else_are_distinct_macro_state_branches():
+    syms = by_name(parse("""\
+#if CONFIG_A
+int first_branch(void) { return target(); }
+#elif CONFIG_B
+#define target() 1
+int macro_branch(void) { return target(); }
+#else
+int final_branch(void) { return target(); }
+#endif
+    """, calls=True))
+
+    assert syms["first_branch"].call_sites[0].kind == "direct"
+    assert syms["macro_branch"].call_sites[0].kind == "macro"
+    assert syms["final_branch"].call_sites[0].kind == "direct"
+
+
+def test_function_like_macro_precedes_a_same_named_pointer_binding():
+    caller = by_name(parse("""\
+#define callback() 1
+int caller(int (*callback)(void))
+{
+    return callback() + (callback)();
+}
+    """, calls=True))["caller"]
+
+    assert [site.kind for site in caller.call_sites] == ["macro", "indirect"]
 
 
 def test_kinds_filter_is_respected():
@@ -1267,6 +1426,42 @@ struct source_evidence { int first; int second; };
                for member in structure.members)
 
 
+def test_license_and_copyright_headers_are_not_aggregate_summaries():
+    syms = by_name(parse("""\
+/* Copyright 2026 Example Authors. Licensed under GPL-2.0. */
+struct adjacent_header { int value; };
+
+/* A detached prose block that is not structure documentation. */
+
+struct detached_header { int value; };
+
+/* struct detached_named - also physically detached. */
+
+struct detached_named { int value; };
+"""))
+
+    assert syms["adjacent_header"].summary is None
+    assert syms["detached_header"].summary is None
+    assert syms["detached_named"].summary is None
+
+
+def test_ordinary_aggregate_docs_can_describe_author_and_license_fields():
+    structure = by_name(parse("""\
+/*
+ * struct publication - Source metadata.
+ * @author: Person responsible for the source.
+ * @license_name: License selected for redistribution.
+ */
+struct publication { const char *author; const char *license_name; };
+"""))["publication"]
+
+    assert structure.summary == "Source metadata."
+    assert [member.description for member in structure.members] == [
+        "Person responsible for the source.",
+        "License selected for redistribution.",
+    ]
+
+
 def test_anonymous_tag_member_is_retained_without_inventing_a_field_name():
     outer = by_name(parse("""\
 struct promoted { int value; };
@@ -1359,7 +1554,10 @@ static void caller(void)
     """, calls=True))
 
     assert syms["caller"].calls == ("target",)
-    assert syms["caller"].indirect_calls == ()
+    assert syms["caller"].indirect_calls == ("target",)
+    assert [site.kind for site in syms["caller"].call_sites] == [
+        "direct", "indirect", "direct",
+    ]
 
 
 def test_one_line_macro_span_does_not_extend_past_end_of_file():

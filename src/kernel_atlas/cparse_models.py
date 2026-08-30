@@ -51,6 +51,21 @@ class TypeMember:
 
 
 @dataclass(slots=True)
+class CallSite:
+    """One source-level call occurrence retained for index evidence.
+
+    ``kind`` is ``direct`` for an identifier that can name a function,
+    ``indirect`` for a local object, explicit dereference, or aggregate member,
+    and ``macro`` when an in-file definition is active at this byte offset.
+    """
+
+    name: str
+    kind: str
+    start_line: int
+    start_byte: int
+
+
+@dataclass(slots=True)
 class Symbol:
     """One indexed source-level C identity."""
 
@@ -66,6 +81,7 @@ class Symbol:
     # Names invoked through a parameter or block-scope object. They remain in
     # ``calls`` for call-site coverage, but must not resolve as direct calls.
     indirect_calls: tuple[str, ...] = ()
+    call_sites: tuple[CallSite, ...] = ()
     summary: str | None = None
     description: str | None = None
     members: tuple[TypeMember, ...] = ()

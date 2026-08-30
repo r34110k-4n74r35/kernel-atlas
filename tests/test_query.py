@@ -298,6 +298,29 @@ def test_resolve_by_line_number(conn):
     assert t.kind == "symbol" and t.name == "ext4_inode_blocks_set"
 
 
+def test_line_resolution_prefers_the_smallest_enclosing_symbol(
+        mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "nested-line.db"
+    shutil.copy(mini_index, copied)
+    writer = db.connect(copied, readonly=False)
+    file_id = writer.execute(
+        "SELECT id FROM files WHERE path='fs/ext4/inode.c'"
+    ).fetchone()[0]
+    writer.execute(
+        "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature)"
+        " VALUES (?,'local_exact','struct',4,4,'struct local_exact')",
+        (file_id,),
+    )
+    resolved = query.resolve(writer, "fs/ext4/inode.c:4")
+    writer.close()
+
+    assert resolved.target.name == "local_exact"
+    assert resolved.target.line == resolved.target.end_line == 4
+    assert resolved.candidates[0].name == "ext4_inode_blocks_set"
+
+
 def test_resolve_ambiguous_reports_candidates(conn):
     res = query.resolve(conn, "super.c")
     assert res.target is not None
@@ -362,6 +385,20 @@ def test_resolve_basename_colon_line_picks_the_file_that_has_the_symbol(conn):
     t = query.resolve(conn, "super.c:1").target
     assert t is not None and t.name == "btrfs_mount"
     assert t.path == "fs/btrfs/super.c"
+
+
+@pytest.mark.parametrize("spec", ["super.c:1", "super.c:01", "super.c:+01"])
+def test_ambiguous_line_paths_match_every_positive_resolver_spelling(conn, spec):
+    assert query.line_selector_suffix(spec) == spec.rpartition(":")[2]
+    assert query.ambiguous_line_paths(conn, spec) == [
+        "fs/ext4/super.c", "fs/btrfs/super.c",
+    ]
+
+
+def test_wholly_numeric_targets_are_not_line_selectors(conn):
+    assert query.line_selector_suffix("8250") is None
+    assert query.ambiguous_line_paths(conn, "8250") == []
+    assert query.ambiguous_line_paths(conn, "fs/btrfs/super.c:1") == []
 
 
 def test_parent_path_of_a_top_level_file_is_the_root():
@@ -584,6 +621,34 @@ def test_call_graph(conn):
     callee = query.resolve(conn, "fs/ext4/inode.c:ext4_get_block").target
     inbound = query.callers(conn, callee.id)
     assert inbound[0].resolution == "same_file"
+
+
+def test_call_queries_preserve_mixed_occurrence_evidence(mini_index, tmp_path):
+    import shutil
+
+    copied = tmp_path / "mixed-call-evidence.db"
+    shutil.copy(mini_index, copied)
+    writer = db.connect(copied, readonly=False)
+    writer.execute(
+        "UPDATE calls SET direct_count=2,indirect_count=1,macro_count=1"
+        " WHERE callee='ext4_get_block'"
+    )
+    writer.execute(
+        "UPDATE meta SET value=(SELECT CAST(SUM(direct_count+indirect_count+"
+        " macro_count) AS TEXT) FROM calls) WHERE key='n_call_occurrences'"
+    )
+    writer.commit()
+
+    caller = query.resolve(writer, "ext4_bmap").target
+    outgoing = query.callee_entries(writer, caller.id)
+    edge = next(entry for entry in outgoing if entry.name == "ext4_get_block")
+    assert (edge.direct_count, edge.indirect_count, edge.macro_count) == (2, 1, 1)
+
+    callee = query.resolve(writer, "ext4_get_block").target
+    incoming = query.callers(writer, callee.id)
+    edge = next(entry for entry in incoming if entry.name == "ext4_bmap")
+    assert (edge.direct_count, edge.indirect_count, edge.macro_count) == (2, 1, 1)
+    writer.close()
 
 
 def test_callers_string_api_rejects_ambiguous_callable_identity(

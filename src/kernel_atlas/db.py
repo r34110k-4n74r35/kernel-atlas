@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import call_resolution, config
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 # Direct typedef spellings can belong to any C tagged-type definition.  Enum
 # aliases are retained even though type_members currently models only structs
 # and unions, and structure queries deliberately remain struct/union-scoped.
@@ -176,13 +176,17 @@ CREATE TABLE translation_unit_roots (
 );
 
 CREATE TABLE calls (
-    caller_id  INTEGER NOT NULL,
-    callee     TEXT NOT NULL,
-    callee_id  INTEGER,
-    resolution TEXT NOT NULL DEFAULT 'unresolved'
+    caller_id      INTEGER NOT NULL,
+    callee         TEXT NOT NULL,
+    callee_id      INTEGER,
+    resolution     TEXT NOT NULL DEFAULT 'unresolved'
       CHECK (resolution IN
              ('same_file', 'included_source', 'unique_global', 'ambiguous',
               'macro', 'indirect', 'unresolved')),
+    direct_count   INTEGER NOT NULL DEFAULT 1 CHECK (direct_count >= 0),
+    indirect_count INTEGER NOT NULL DEFAULT 0 CHECK (indirect_count >= 0),
+    macro_count    INTEGER NOT NULL DEFAULT 0 CHECK (macro_count >= 0),
+    CHECK (direct_count + indirect_count + macro_count > 0),
     CHECK ((resolution IN ('same_file', 'included_source', 'unique_global')) =
            (callee_id IS NOT NULL)),
     UNIQUE (caller_id, callee),
@@ -380,6 +384,9 @@ def _validate_row_domains(conn: sqlite3.Connection) -> None:
             "(callee_id IS NULL OR " + integer_id("callee_id") + ")",
             f"(typeof(resolution)='text'"
             f" AND resolution IN ({resolution_values}))",
+            nonnegative("direct_count"), nonnegative("indirect_count"),
+            nonnegative("macro_count"),
+            "direct_count+indirect_count+macro_count>0",
         )),
     }
     for table, predicate in checks.items():
@@ -476,6 +483,12 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         if actual != int(meta[key]):
             raise SchemaError(
                 f"index {table} row count disagrees with {key} metadata")
+    actual_occurrences = int(conn.execute(
+        "SELECT COALESCE(SUM(direct_count+indirect_count+macro_count),0)"
+        " FROM calls").fetchone()[0])
+    if actual_occurrences != int(meta["n_call_occurrences"]):
+        raise SchemaError(
+            "index call occurrence count disagrees with metadata")
 
     foreign_error = next(iter(conn.execute("PRAGMA foreign_key_check")), None)
     if foreign_error is not None:
@@ -605,7 +618,7 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         if not row["is_symlink"] and row["link_target"] is not None:
             raise SchemaError(
                 f"index file {row['path']!r} has an unexpected link target")
-        parse_ext = row["ext"] in {".c", ".h"}
+        parse_ext = row["ext"] in {".c", ".h", ".c_shipped", ".h_shipped"}
         valid_states = ({"parsed", "skipped_binary", "skipped_oversize",
                          "read_error", "parse_error"} if parse_ext else
                         {"indexed", "binary", "read_error"})
@@ -634,7 +647,8 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         skipped += row["index_status"] in {"skipped_binary", "skipped_oversize"}
         if row["is_symlink"]:
             symlinks += 1
-            if Path(row["name"]).suffix.lower() in {".c", ".h"}:
+            if Path(row["name"]).suffix.lower() in {
+                    ".c", ".h", ".c_shipped", ".h_shipped"}:
                 skipped += 1
 
     for row in dirs:
@@ -656,7 +670,8 @@ def _validate_deep_structure(conn: sqlite3.Connection,
                 f"index symbol rollup is inconsistent for {row['path']!r}")
     bad_symbol_line = conn.execute(
         "SELECT f.path FROM symbols s JOIN files f ON f.id=s.file_id"
-        " WHERE s.end_line>f.lines OR f.ext NOT IN ('.c','.h')"
+        " WHERE s.end_line>f.lines"
+        " OR f.ext NOT IN ('.c','.h','.c_shipped','.h_shipped')"
         " OR f.index_status!='parsed' LIMIT 1"
     ).fetchone()
     if bad_symbol_line is not None:
@@ -840,7 +855,8 @@ def _validate_deep_structure(conn: sqlite3.Connection,
         " JOIN files member ON member.id=edge.included_id"
         " WHERE edge.includer_id=edge.included_id OR edge.line<1"
         " OR edge.line>parent.lines"
-        " OR parent.ext IS NOT '.c' OR member.ext IS NOT '.c'"
+        " OR parent.ext NOT IN ('.c','.c_shipped')"
+        " OR member.ext NOT IN ('.c','.c_shipped')"
         " OR parent.index_status IS NOT 'parsed'"
         " OR member.index_status IS NOT 'parsed' LIMIT 1"
     ).fetchone()
@@ -849,7 +865,8 @@ def _validate_deep_structure(conn: sqlite3.Connection,
     bad_unit_root = conn.execute(
         "SELECT root.file_id FROM translation_unit_roots root"
         " JOIN files f ON f.id=root.file_id"
-        " WHERE f.ext!='.c' OR f.index_status!='parsed' LIMIT 1"
+        " WHERE f.ext NOT IN ('.c','.c_shipped')"
+        " OR f.index_status!='parsed' LIMIT 1"
     ).fetchone()
     if bad_unit_root is not None:
         raise SchemaError("index has an invalid translation-unit root")
@@ -871,7 +888,7 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
     Keeping this explicit lets callers inspect or repair arbitrary SQLite files
     when needed, while normal CLI open paths can reject stale, future, corrupt,
     or interrupted indexes before printing partial results.  ``deep=True``
-    additionally scans every call edge; normal interactive opens deliberately
+    additionally scans every call record; normal interactive opens deliberately
     avoid imposing that multi-million-row audit on each command.
     """
     try:
@@ -903,10 +920,28 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
         config.validate_version(meta["kernel_version"])
     except ValueError as exc:
         raise SchemaError(f"index has an unsafe kernel version: {exc}") from exc
+    managed_keys = {
+        "managed_tree_id", "managed_tree_device", "managed_tree_inode",
+        "managed_tree_digest",
+    }
+    present_managed = managed_keys & meta.keys()
+    if present_managed and present_managed != managed_keys:
+        raise SchemaError("index has incomplete managed source identity metadata")
+    if present_managed:
+        if (re.fullmatch(r"[0-9a-f]{64}", meta["managed_tree_id"]) is None
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", meta["managed_tree_digest"]) is None):
+            raise SchemaError("index has invalid managed source identity metadata")
+        for key in ("managed_tree_device", "managed_tree_inode"):
+            if (re.fullmatch(r"[0-9]+", meta[key]) is None
+                    or len(meta[key]) > 20):
+                raise SchemaError(
+                    f"index metadata {key} is not a valid filesystem identity")
     required_meta = {
         "source", "tree_path", "built_at", "kinds", "has_calls",
         "n_dirs", "n_files", "n_symbols", "n_type_aliases",
         "n_type_members", "n_subsystems", "n_calls",
+        "n_call_occurrences",
         "n_calls_resolved", "n_calls_ambiguous", "n_calls_macro",
         "n_calls_indirect", "n_calls_unresolved",
         "n_parse_skipped", "n_parse_failed", "n_oversize", "n_symlinks",
@@ -933,6 +968,7 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
         raise SchemaError("index metadata kinds is invalid or contains duplicates")
     for key in ("n_dirs", "n_files", "n_symbols", "n_type_aliases",
                 "n_type_members", "n_subsystems", "n_calls",
+                "n_call_occurrences",
                 "n_calls_resolved", "n_calls_ambiguous", "n_calls_macro",
                 "n_calls_indirect", "n_calls_unresolved",
                 "n_parse_skipped", "n_parse_failed", "n_oversize",
@@ -954,14 +990,19 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
             "n_calls", "n_calls_resolved", "n_calls_ambiguous",
             "n_calls_macro", "n_calls_indirect", "n_calls_unresolved")):
         total = int(meta["n_calls"])
+        occurrences = int(meta["n_call_occurrences"])
+        if occurrences < total:
+            raise SchemaError(
+                "index reports fewer call occurrences than call records")
         classified = sum(int(meta[key]) for key in (
             "n_calls_resolved", "n_calls_ambiguous", "n_calls_macro",
             "n_calls_indirect", "n_calls_unresolved"))
         if classified != total:
             raise SchemaError(
                 "index call-resolution counts do not add up to n_calls")
-        if meta.get("has_calls") == "0" and total:
-            raise SchemaError("index without a call graph reports call edges")
+        if meta.get("has_calls") == "0" and (total or occurrences):
+            raise SchemaError(
+                "index without a call graph reports call evidence")
     if "build_seconds" in meta:
         try:
             seconds = float(meta["build_seconds"])
@@ -999,7 +1040,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
                        "coverage", "rank"},
         "source_includes": {"includer_id", "included_id", "line"},
         "translation_unit_roots": {"file_id"},
-        "calls": {"caller_id", "callee", "callee_id", "resolution"},
+        "calls": {"caller_id", "callee", "callee_id", "resolution",
+                  "direct_count", "indirect_count", "macro_count"},
     }
     try:
         present = {r[0] for r in conn.execute(
@@ -1127,7 +1169,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
             bad_local = conn.execute(
                 "SELECT c.resolution,c.callee,expected.resolution AS expected"
                 + comparison
-                + " WHERE c.resolution IN ('same_file','included_source') AND ("
+                + " WHERE c.direct_count>0 AND c.resolution IN "
+                "('same_file','included_source') AND ("
                 + mismatch + ") LIMIT 1"
             ).fetchone()
             if bad_local is not None:
@@ -1138,7 +1181,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
             bad_unique = conn.execute(
                 "SELECT c.callee,expected.resolution AS expected"
                 + comparison
-                + " WHERE c.resolution='unique_global' AND ("
+                + " WHERE c.direct_count>0"
+                " AND c.resolution='unique_global' AND ("
                 + mismatch + ") LIMIT 1"
             ).fetchone()
             if bad_unique is not None:
@@ -1149,7 +1193,7 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
             bad_classification = conn.execute(
                 "SELECT c.callee,c.resolution,expected.resolution AS expected"
                 + comparison
-                + " WHERE c.resolution!='indirect' AND ("
+                + " WHERE c.direct_count>0 AND ("
                 + mismatch + ") LIMIT 1"
             ).fetchone()
             if bad_classification is not None:
@@ -1158,6 +1202,17 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
                     "index call classification is inconsistent for "
                     f"{bad_classification['callee']!r}: recorded "
                     f"{bad_classification['resolution']}, expected {expected}")
+
+            bad_parser_classification = conn.execute(
+                "SELECT callee,resolution FROM calls WHERE direct_count=0 AND ("
+                " (macro_count>0 AND resolution!='macro') OR"
+                " (macro_count=0 AND resolution!='indirect')) LIMIT 1"
+            ).fetchone()
+            if bad_parser_classification is not None:
+                raise SchemaError(
+                    "index parser-supplied call classification is inconsistent "
+                    f"for {bad_parser_classification['callee']!r}: recorded "
+                    f"{bad_parser_classification['resolution']}")
         finally:
             call_resolution.drop_evidence(conn)
     except SchemaError:

@@ -101,6 +101,7 @@ def cmd_calls(args, support):
                   else query.resolve_symbol(conn, target_spec))
     if resolution.target is None:
         support._die(resolution.note)
+    support._require_exact_line_qualifier(conn, target_spec)
     target = resolution.target
     if (target.kind != "symbol"
             or target.symbol_kind not in ("function", "syscall")):
@@ -139,8 +140,9 @@ def cmd_calls(args, support):
     want_subsystem = (
         args.format != "names"
         and (args.with_subsystem or "subsystem" in explicit_columns))
-    default_columns = ("kind", "name", "path", "line", "resolution") + (
-        ("subsystem",) if want_subsystem else ())
+    default_columns = ("kind", "name", "path", "line", "occurrences",
+                       "resolution") + (
+                           ("subsystem",) if want_subsystem else ())
 
     if args.callers:
         entries = support._post_filter(
@@ -166,7 +168,8 @@ def cmd_calls(args, support):
     support.emit(
         entries, args, {"function"}, want_subsystem,
         f"Functions called by {target.display}  [{support._linux(meta)}]\n",
-        index=support.index_version(meta), default_columns=default_columns)
+        index=support.index_version(meta),
+        default_columns=default_columns)
 
 
 def cmd_relationships(args, support):

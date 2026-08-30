@@ -3,7 +3,18 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
+
+
+_UPSTREAM_VERSION_RE = re.compile(
+    r"v?(?:\d+\.\d+(?:\.\d+){0,2}|\d+\.\d+-rc\d+)\Z")
+_LINUX_NEXT_RE = re.compile(r"next-\d{8}\Z")
+_KERNEL_ORG_HOSTS = {
+    "cdn.kernel.org",
+    "git.kernel.org",
+    "kernel.org",
+    "www.kernel.org",
+}
 
 
 def elixir_tag(version: str) -> str:
@@ -28,18 +39,77 @@ def _numeric_parts(version: str) -> list[int]:
     return [int(part) for part in match.group(1).split(".")] if match else []
 
 
+def is_upstream_release(version: str) -> bool:
+    """Whether *version* follows an upstream Linux release identity.
+
+    Since Linux 3.0, mainline releases use ``X.Y`` and stable updates use
+    ``X.Y.Z`` with a positive stable number.  Linux 2.6 used ``2.6.Z`` for
+    mainline releases and ``2.6.Z.N`` for stable updates.  Keeping that era
+    distinction prevents both routing 2.6 mainline tags to the stable tree and
+    inventing modern tags such as ``v6.18.0``.
+    """
+    value = (version or "").strip()
+    if _UPSTREAM_VERSION_RE.fullmatch(value) is None:
+        return False
+    if "-rc" in value:
+        return True
+
+    parts = _numeric_parts(value)
+    if parts[:2] == [2, 6]:
+        return (len(parts) == 3
+                or (len(parts) == 4 and parts[3] > 0))
+    if parts and parts[0] >= 3:
+        return (len(parts) == 2
+                or (len(parts) == 3 and parts[2] > 0))
+    # Preserve the prior shape-based handling for older release families.
+    return True
+
+
+def has_upstream_provenance(version: str, source: str | None = None) -> bool:
+    """Whether an index can claim links for this upstream release identity.
+
+    A caller which has no source metadata may still use this module as a small
+    URL helper. Index-backed callers pass the recorded source: a matching
+    kernel.org archive establishes a release reference, while a local path or
+    arbitrary archive is not assumed to correspond to that upstream tag.
+    """
+    value = (version or "").strip()
+    if not (is_upstream_release(value) or _LINUX_NEXT_RE.fullmatch(value)):
+        return False
+    if source is None or source == "kernel.org":
+        return True
+    parsed = urlsplit(source)
+    if parsed.scheme.lower() != "https" or parsed.hostname not in _KERNEL_ORG_HOSTS:
+        return False
+    archive = unquote(parsed.path.rsplit("/", 1)[-1])
+    suffixes = (".tar.xz", ".tar.gz", ".tar.bz2")
+    if _LINUX_NEXT_RE.fullmatch(value):
+        return value in archive and archive.endswith(suffixes)
+    normalized = value.removeprefix("v")
+    return any(archive == f"linux-{normalized}{suffix}" for suffix in suffixes)
+
+
 def is_stable_patch(version: str) -> bool:
-    """Three-part versions (6.18.45) live on the stable tree, not torvalds/linux."""
-    return len(_numeric_parts(version)) >= 3
+    """Whether *version* belongs to the stable tree rather than mainline."""
+    if not is_upstream_release(version):
+        return False
+    parts = _numeric_parts(version)
+    if parts[:2] == [2, 6]:
+        return len(parts) == 4
+    return len(parts) >= 3
 
 
 def links(version: str, path: str, line: int | None = None, *,
-          is_dir: bool = False, ident: str | None = None) -> dict[str, str]:
+          is_dir: bool = False, ident: str | None = None,
+          source: str | None = None) -> dict[str, str]:
     """URLs for a repo-relative path.
 
     `docs` is only set for Documentation/ files. `ident` is the Elixir
     cross-reference page for a symbol name.
     """
+    if not has_upstream_provenance(version, source):
+        return {}
+
     path = (path or "").lstrip("/")
     encoded_path = quote(path, safe="/")
     tag = elixir_tag(version)

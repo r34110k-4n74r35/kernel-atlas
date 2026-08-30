@@ -23,6 +23,7 @@ def _metadata(**overrides):
         "n_type_members": "0",
         "n_subsystems": "0",
         "n_calls": "0",
+        "n_call_occurrences": "0",
         "n_calls_resolved": "0",
         "n_calls_ambiguous": "0",
         "n_calls_macro": "0",
@@ -35,6 +36,8 @@ def _metadata(**overrides):
         "build_seconds": "0.0",
     }
     values.update(overrides)
+    if "n_call_occurrences" not in overrides:
+        values["n_call_occurrences"] = values["n_calls"]
     return list(values.items())
 
 
@@ -195,6 +198,18 @@ def test_validate_schema_rejects_incomplete_current_metadata(tmp_path):
     conn.close()
 
 
+def test_validate_schema_rejects_partial_managed_tree_identity(tmp_path):
+    conn = db.create(tmp_path / "partial-tree-id.db")
+    conn.executemany(
+        "INSERT INTO meta(key,value) VALUES (?,?)",
+        _metadata(managed_tree_id="a" * 64),
+    )
+    conn.commit()
+    with pytest.raises(db.SchemaError, match="incomplete managed source identity"):
+        db.validate_schema(conn)
+    conn.close()
+
+
 def test_validate_schema_rejects_unsafe_kernel_version(tmp_path):
     conn = db.create(tmp_path / "unsafe-version.db")
     conn.executemany(
@@ -289,6 +304,40 @@ def test_validate_schema_rejects_invalid_unique_global_target(
 def test_validate_schema_accepts_a_reproducible_unique_global_target(tmp_path):
     conn = _identity_index(tmp_path, "unique_global")
     assert db.validate_schema(conn, deep=True)["kernel_version"] == "9.9"
+    conn.close()
+
+
+def test_deep_validation_checks_persisted_indirect_call_evidence(tmp_path):
+    conn = _identity_index(tmp_path, "unique_global")
+    conn.execute(
+        "UPDATE calls SET callee_id=NULL,resolution='indirect' WHERE caller_id=1")
+    conn.execute("UPDATE meta SET value='0' WHERE key='n_calls_resolved'")
+    conn.execute("UPDATE meta SET value='1' WHERE key='n_calls_indirect'")
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match="classification is inconsistent"):
+        db.validate_schema(conn, deep=True)
+    conn.close()
+
+
+def test_call_rows_require_nonempty_occurrence_evidence(tmp_path):
+    conn = db.create(tmp_path / "empty-call-evidence.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO calls(caller_id,callee,direct_count,indirect_count,"
+            " macro_count) VALUES (1,'target',0,0,0)")
+    conn.close()
+
+
+def test_deep_validation_rejects_inconsistent_call_occurrence_counts(tmp_path):
+    conn = _identity_index(tmp_path, "unique_global")
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute("UPDATE calls SET direct_count=999 WHERE caller_id=1")
+    conn.execute("PRAGMA ignore_check_constraints=OFF")
+    conn.commit()
+
+    with pytest.raises(db.SchemaError, match="occurrence count"):
+        db.validate_schema(conn, deep=True)
     conn.close()
 
 

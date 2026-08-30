@@ -6,9 +6,11 @@ import argparse
 import re
 import shlex
 import sqlite3
+import stat
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from . import __version__
 from . import (cli_aggregate, cli_browse, cli_calls, cli_lifecycle,
                cli_resources, config, cparse, db, links, query, render)
 from . import indexer  # noqa: F401 - public monkeypatch seam for build tests
@@ -97,7 +99,7 @@ def resolve_index_spec(spec: str) -> Path:
         path = config.index_path(spec)
     except ValueError as exc:
         _die(str(exc))
-    if path.is_file():
+    if path.is_file() or path.is_symlink():
         return path
     matches = [p for p in config.list_indexes() if version_prefix_match(p.stem, spec)]
     if len(matches) == 1:
@@ -106,6 +108,14 @@ def resolve_index_spec(spec: str) -> Path:
         _die(f"{spec!r} is ambiguous: " + ", ".join(p.stem for p in matches))
     have = ", ".join(p.stem for p in config.list_indexes()) or "none built yet"
     _die(f"no index for {spec!r} (built: {have})")
+
+
+def _default_version_pin() -> str | None:
+    """Read the configured pin with a concise CLI error on corruption."""
+    try:
+        return config.get_default_version()
+    except (OSError, ValueError) as exc:
+        _die(f"cannot read the default version pin: {exc}")
 
 
 def default_index(*, warn: bool = True) -> Path:
@@ -117,7 +127,7 @@ def default_index(*, warn: bool = True) -> Path:
     available = config.list_indexes()
     if not available:
         _die(f"no index built yet — run '{PROG} build lts' first")
-    pinned = config.get_default_version()
+    pinned = _default_version_pin()
     if pinned:
         path = config.index_path(pinned)
         if path.is_file():
@@ -300,9 +310,28 @@ def pick_columns(args, kinds_listed: set[str], with_subsystem: bool) -> list[str
     return cols
 
 
+_COLUMN_OUTPUT_FORMATS = {"table", "json", "csv"}
+
+
+def _validate_listing_output(args) -> None:
+    """Reject column controls when the selected format has a fixed shape."""
+    if args.format in _COLUMN_OUTPUT_FORMATS:
+        return
+    if getattr(args, "columns", None) is not None:
+        _die(f"--columns does not apply to --format {args.format}")
+    if getattr(args, "with_subsystem", False):
+        _die(f"--with-subsystem does not apply to --format {args.format}")
+
+
+def _listing_has_columns(args) -> bool:
+    """Whether the selected listing renderer can expose chosen columns."""
+    return args.format in _COLUMN_OUTPUT_FORMATS
+
+
 def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: bool,
          header: str = "", index: str | None = None,
          default_columns: tuple[str, ...] | None = None):
+    _validate_listing_output(args)
     fmt = args.format
     machine = fmt in ("json", "csv", "names", "plain")
     color = render.use_color(args.color)
@@ -528,6 +557,17 @@ def _checked_grep(pattern: str | None) -> str | None:
     return pattern
 
 
+_MAX_CLI_COUNT = 2**31 - 1
+_MAX_JOBS = 256
+
+
+def _nonempty_arg(value: str) -> str:
+    """Reject empty option values before truthiness can turn them into defaults."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
 def _nonneg_int(value: str) -> int:
     try:
         i = int(value)
@@ -535,6 +575,8 @@ def _nonneg_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"must be an integer, not {value!r}")
     if i < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
+    if i > _MAX_CLI_COUNT:
+        raise argparse.ArgumentTypeError(f"must be <= {_MAX_CLI_COUNT}")
     return i
 
 
@@ -542,6 +584,13 @@ def _positive_int(value: str) -> int:
     i = _nonneg_int(value)
     if i < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
+    return i
+
+
+def _jobs_int(value: str) -> int:
+    i = _positive_int(value)
+    if i > _MAX_JOBS:
+        raise argparse.ArgumentTypeError(f"must be <= {_MAX_JOBS}")
     return i
 
 
@@ -619,7 +668,22 @@ def _call_graph_rebuild_advice(args, meta: dict) -> str:
             "this same index with --with-calls --force")
 
 
-def _require_unique_symbol_identity(res: query.Resolution, spec: str) -> None:
+def _require_exact_line_qualifier(conn: sqlite3.Connection, spec: str) -> None:
+    """Require a full file path when ``basename:line`` matches many files."""
+    paths = query.ambiguous_line_paths(conn, spec)
+    if len(paths) < 2:
+        return
+    tail = query.line_selector_suffix(spec)
+    examples = ", ".join(f"{path}:{tail}" for path in paths[:3])
+    basename = (spec or "").strip().rpartition(":")[0]
+    _die(f"{len(paths)} files named {basename!r} make this line selector "
+         "ambiguous; use one full indexed path:line"
+         + (f" (for example: {examples})" if examples else ""))
+
+
+def _require_unique_symbol_identity(
+        res: query.Resolution, spec: str,
+        conn: sqlite3.Connection | None = None) -> None:
     """Reject a guessed definition for commands whose output uses its line.
 
     ``info`` intentionally ranks and explains alternatives, but ``show``,
@@ -627,8 +691,10 @@ def _require_unique_symbol_identity(res: query.Resolution, spec: str) -> None:
     ``path:symbol`` qualifier is still ambiguous when conditional definitions
     repeat a name in the same file; ``path:line`` is the lossless spelling.
     """
-    tail = (spec or "").strip().rpartition(":")[2]
-    line_qualified = re.fullmatch(r"[+]?[1-9][0-9]*", tail) is not None
+    if conn is not None:
+        _require_exact_line_qualifier(conn, spec)
+    tail = query.line_selector_suffix(spec)
+    line_qualified = tail is not None
     target = res.target
     if line_qualified and (target is None or target.kind != "symbol"):
         # ``resolve`` deliberately falls back to the containing file so that
@@ -636,7 +702,19 @@ def _require_unique_symbol_identity(res: query.Resolution, spec: str) -> None:
         # that act on a concrete source identity must not silently reinterpret
         # a failed ``path:line`` selector as the whole file.
         _die(res.note or f"no symbol spans line {tail}")
-    if target is None or target.kind != "symbol":
+    if target is None:
+        return
+    if target.kind in {"file", "dir"}:
+        alternatives = [candidate for candidate in res.candidates
+                        if candidate.kind == target.kind]
+        if not alternatives:
+            return
+        candidates = [target, *alternatives]
+        noun = "files" if target.kind == "file" else "directories"
+        examples = ", ".join(candidate.path or "." for candidate in candidates[:3])
+        _die(f"{len(candidates)} {noun} match {spec!r}; use one full indexed path"
+             + (f" (for example: {examples})" if examples else ""))
+    if target.kind != "symbol":
         return
     if line_qualified:
         return
@@ -663,7 +741,8 @@ def _links_for(meta: dict, t: query.Target) -> dict[str, str]:
     return links.links(
         index_version(meta), t.path, t.line,
         is_dir=(t.kind == "dir"),
-        ident=(t.name if t.kind == "symbol" else None))
+        ident=(t.name if t.kind == "symbol" else None),
+        source=meta.get("source"))
 
 
 def _subsystem_payload(row) -> dict:
@@ -684,8 +763,8 @@ def _subsystem_payload(row) -> dict:
     return payload
 
 
-# How many bytes of a file `show` will dump without --lines. Matches the
-# indexer: anything bigger is almost certainly generated.
+# How many bytes of a file `show` will dump without --lines.  This interactive
+# display guard is intentionally stricter than the parser's 4 MiB input cap.
 _MAX_SHOW = 2 * 1024 * 1024
 _SLASH_COUNT = "(LENGTH(path) - LENGTH(REPLACE(path, '/', '')))"
 
@@ -711,17 +790,50 @@ def cmd_use(args):
 
 
 def _unlink_index(path: Path) -> int:
-    """Delete an index and any SQLite sidecar files. Returns bytes freed."""
+    """Delete one regular index and its sidecars, or an index symlink leaf."""
+
+    def inspect(leaf: Path):
+        try:
+            return leaf.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    primary = inspect(path)
+    if primary is None:
+        raise FileNotFoundError(path)
+    if stat.S_ISLNK(primary.st_mode):
+        # SQLite sidecars belong beside the symlink target, not beside the
+        # alias.  Removing an alias must never guess ownership of adjacent data.
+        path.unlink()
+        return 0
+    if not stat.S_ISREG(primary.st_mode):
+        raise OSError(f"refusing to remove non-regular index entry {path}")
+
+    leaves = (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"),
+              path.with_suffix(".db-journal"))
+    observed = []
+    for leaf in leaves:
+        info = inspect(leaf)
+        if info is None:
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            raise OSError(f"refusing non-regular SQLite sidecar {leaf}")
+        observed.append((leaf, info))
+
     freed = 0
-    for extra in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"),
-                  path.with_suffix(".db-journal")):
-        if extra.is_file():
-            freed += extra.stat().st_size
-            extra.unlink()
+    for leaf, expected in observed:
+        current = inspect(leaf)
+        if (current is None
+                or (current.st_dev, current.st_ino, current.st_mode)
+                != (expected.st_dev, expected.st_ino, expected.st_mode)):
+            raise OSError(f"index entry changed while being removed: {leaf}")
+        if stat.S_ISREG(current.st_mode):
+            freed += current.st_size
+        leaf.unlink()
     return freed
 
 
-def _managed_source_recorded_by(path: Path) -> Path | None:
+def _managed_source_record(path: Path) -> tuple[Path, dict[str, str]] | None:
     """The safely removable managed source identified by an index.
 
     Selection aliases need not equal the indexed kernel version, and a custom
@@ -737,21 +849,31 @@ def _managed_source_recorded_by(path: Path) -> Path | None:
         recorded = meta.get("tree_path")
         if not isinstance(recorded, str) or not recorded:
             return None
-        source = meta.get("source")
         recorded_path = Path(recorded).expanduser()
-        if isinstance(source, str) and source \
-                and _same_path(Path(source).expanduser(), recorded_path):
-            # ``build --src`` records the local input tree as its source.  A
-            # coincidental conventional cache name does not make that
-            # user-owned tree disposable.
+        identity_keys = (
+            "managed_tree_id", "managed_tree_device", "managed_tree_inode",
+            "managed_tree_digest",
+        )
+        identity = {key: meta.get(key) for key in identity_keys}
+        if any(not isinstance(value, str) or not value
+               for value in identity.values()):
+            # Custom --src indexes never receive this acquisition nonce, even
+            # when their tree happens to use the conventional cache spelling.
             return None
         expected = config.source_path(version)
-        return expected if _same_path(recorded_path, expected) else None
+        return ((expected, identity)
+                if _same_path(recorded_path, expected) else None)
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return None
     finally:
         if conn is not None:
             conn.close()
+
+
+def _managed_source_recorded_by(path: Path) -> Path | None:
+    """Compatibility path-only view of a managed source authorization."""
+    record = _managed_source_record(path)
+    return record[0] if record is not None else None
 
 
 def cmd_remove(args):
@@ -877,6 +999,7 @@ def cmd_trace(args):
 
 
 def cmd_calls(args):
+    _validate_listing_output(args)
     return cli_calls.cmd_calls(args, sys.modules[__name__])
 
 
@@ -990,17 +1113,20 @@ def _add_output_opts(p, sorts=True, limit_default=0):
     g.add_argument("--grep", "-g", help="only names matching this regex")
     if sorts:
         g.add_argument("--sort", default="name",
-                       choices=("name", "path", "kind", "line", "size", "lines"))
+                       choices=("name", "path", "kind", "line", "size", "lines"),
+                       help="sort key; size applies to path rows, while lines "
+                            "is the definition span for symbols")
     g.add_argument("--with-subsystem", "-S", action="store_true",
                    help="add a subsystem column")
 
 
-def _add_filter_opts(p):
+def _add_filter_opts(p, *, kinds_help: str | None = None):
     g = p.add_argument_group("filters")
     g.add_argument("--kinds", "-k",
-                   help="what to list: dir,file,function,syscall,struct,union,enum,"
-                        "typedef,macro,variable,prototype — or all/symbols/paths/"
-                        "functions/types")
+                   help=kinds_help or
+                   "what to list: dir,file,function,syscall,struct,union,enum,"
+                   "typedef,macro,variable,prototype — or all/symbols/paths/"
+                   "functions/types")
     g.add_argument("--exported", action="store_true",
                    help="only EXPORT_SYMBOL'd symbols")
     linkage = g.add_mutually_exclusive_group()
@@ -1018,9 +1144,10 @@ def _global_opts(parser, suppress: bool):
     """
     kw = {"default": argparse.SUPPRESS} if suppress else {}
     g = parser.add_argument_group("index selection")
-    g.add_argument("--kernel", "-K", help="which built index to use (e.g. 6.12.104)",
-                   **kw)
-    g.add_argument("--db", help="path to a specific index file", **kw)
+    g.add_argument("--kernel", "-K", type=_nonempty_arg,
+                   help="which built index to use (e.g. 6.12.104)", **kw)
+    g.add_argument("--db", type=_nonempty_arg,
+                   help="path to a specific index file", **kw)
     g.add_argument("--color", choices=("auto", "always", "never"),
                    **(kw or {"default": "auto"}))
 
@@ -1032,51 +1159,73 @@ def build_parser() -> argparse.ArgumentParser:
                     "symbols and subsystems.",
         epilog=f"Start with:  {PROG} build lts     then:  {PROG} info mm",
     )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     _global_opts(p, suppress=False)
 
     common = argparse.ArgumentParser(add_help=False)
     _global_opts(common, suppress=True)
+    lifecycle_common = argparse.ArgumentParser(add_help=False)
+    lifecycle_display = lifecycle_common.add_argument_group("display")
+    lifecycle_display.add_argument(
+        "--color", choices=("auto", "always", "never"),
+        default=argparse.SUPPRESS,
+    )
 
     subs = p.add_subparsers(dest="command", required=True)
 
     def add(name, **kwargs):
         return subs.add_parser(name, parents=[common], **kwargs)
 
-    sp = add("versions", help="list kernel versions available on kernel.org")
+    def add_lifecycle(name, **kwargs):
+        # Lifecycle commands do not select an index to query.  Keep --color
+        # usable after the subcommand without advertising meaningless -K/--db
+        # options in their help.
+        return subs.add_parser(name, parents=[lifecycle_common], **kwargs)
+
+    sp = add_lifecycle(
+        "versions", help="list kernel versions available on kernel.org")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_versions)
 
-    sp = add("build", help="download a kernel and build its index")
+    sp = add_lifecycle("build", help="download a kernel and build its index")
     # No hardcoded default: with --src the version comes from the tree's own
     # Makefile, otherwise the alias 'lts' is applied in cmd_build.
-    sp.add_argument("version", nargs="?", default=None,
+    sp.add_argument("version", nargs="?", default=None, type=_nonempty_arg,
                     help="version or alias: lts (default), stable, mainline, 6.12.104")
-    sp.add_argument("--src", help="index an existing local kernel tree instead")
-    sp.add_argument("--output", "-o", help="write the index here")
-    sp.add_argument("--jobs", "-j", type=_positive_int, help="parallel parser processes")
-    sp.add_argument("--kinds", help="symbol kinds to index (default: "
-                                    + ",".join(cparse.DEFAULT_KINDS) + ")")
+    sp.add_argument("--src", type=_nonempty_arg,
+                    help="index an existing local kernel tree instead")
+    sp.add_argument("--output", "-o", type=_nonempty_arg,
+                    help="write the index here")
+    sp.add_argument("--jobs", "-j", type=_jobs_int, help="parallel parser processes")
+    sp.add_argument("--kinds", type=_nonempty_arg,
+                    help="symbol kinds to index (default: "
+                         + ",".join(cparse.DEFAULT_KINDS) + ")")
     sp.add_argument("--with-calls", action="store_true",
                     help="also record a call graph (bigger index, enables 'calls')")
-    sp.add_argument("--keep-tarball", action="store_true")
+    sp.add_argument("--keep-tarball", action="store_true",
+                    help="keep a downloaded source archive after extraction")
     sp.add_argument("--no-verify", action="store_true",
                     help="skip the sha256 check against kernel.org")
     sp.add_argument("--force", action="store_true", help="rebuild if it already exists")
-    sp.add_argument("--quiet", "-q", action="store_true")
+    sp.add_argument("--quiet", "-q", action="store_true",
+                    help="suppress download and indexing progress")
     sp.set_defaults(func=cmd_build)
 
-    sp = add("indexes", help="list indexes you have built")
+    sp = add_lifecycle("indexes", help="list indexes you have built")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_indexes)
 
-    sp = add("use", help="pin which kernel version commands use by default")
+    sp = add_lifecycle(
+        "use", help="pin which kernel version commands use by default")
     sp.add_argument("version", nargs="?",
                     help="version or unique prefix; omit to show the current one")
     sp.add_argument("--clear", action="store_true",
                     help="unpin; go back to the highest built version")
     sp.set_defaults(func=cmd_use)
 
-    sp = add("remove", aliases=["rm"], help="delete built indexes")
+    sp = add_lifecycle(
+        "remove", aliases=["rm"], help="delete built indexes")
     sp.add_argument("versions", nargs="+", metavar="VERSION",
                     help="one or more versions (or unique prefixes) to delete")
     sp.add_argument("--source", action="store_true",
@@ -1096,8 +1245,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="mm | mm/page_alloc.c | tcp_sendmsg | "
                                    "tcp.c:tcp_sendmsg | mm/page_alloc.c:5268")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
-    sp.add_argument("--max-subsystems", type=_nonneg_int, default=3)
-    sp.add_argument("--max-candidates", type=_nonneg_int, default=10)
+    sp.add_argument("--max-subsystems", type=_nonneg_int, default=3,
+                    help="maximum ownership matches to show (default: 3)")
+    sp.add_argument("--max-candidates", type=_nonneg_int, default=10,
+                    help="maximum ambiguous target candidates (default: 10)")
     sp.set_defaults(func=cmd_info)
 
     sp = add("struct", aliases=["structure"],
@@ -1133,26 +1284,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("find", help="search for a symbol by name")
     sp.add_argument("pattern")
     match = sp.add_mutually_exclusive_group()
-    match.add_argument("--exact", action="store_true")
+    match.add_argument("--exact", action="store_true",
+                       help="match the complete, case-sensitive name")
     match.add_argument("--glob", action="store_true",
                        help="pattern is a glob (tcp_*)")
-    match.add_argument("--prefix", action="store_true")
-    _add_filter_opts(sp)
+    match.add_argument("--prefix", action="store_true",
+                       help="match a case-insensitive name prefix")
+    _add_filter_opts(
+        sp,
+        kinds_help="symbol kinds to search (path kinds are not accepted)",
+    )
     _add_output_opts(sp, limit_default=50)
     sp.set_defaults(func=cmd_find)
 
     sp = add("subsystems", help="list subsystems from MAINTAINERS")
-    sp.add_argument("--grep", "-g")
+    sp.add_argument("--grep", "-g", help="only names matching this regex")
     sp.add_argument("--sort", default="size",
-                    choices=("size", "claimed", "primary", "name"))
-    sp.add_argument("--limit", "-n", type=_nonneg_int, default=0)
+                    choices=("size", "claimed", "primary", "name"),
+                    help="sort key (default: size)")
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=0,
+                    help="max subsystems (default: all)")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystems)
 
     sp = add("subsystem", help="detail for one subsystem")
     sp.add_argument("name")
     sp.add_argument("--files", action="store_true", help="also list every file")
-    sp.add_argument("--limit", "-n", type=_nonneg_int, default=15)
+    sp.add_argument("--limit", "-n", type=_nonneg_int, default=15,
+                    help="max directory rows (default: 15; 0 = all); does not "
+                         "limit the --files list")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_subsystem)
 
@@ -1175,7 +1335,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("tree", help="draw the directory tree")
     sp.add_argument("target", nargs="?", default="")
-    sp.add_argument("--depth", "-d", type=_nonneg_int, default=2)
+    sp.add_argument("--depth", "-d", type=_nonneg_int, default=2,
+                    help="maximum directory depth (default: 2; 0 = target only)")
     sp.add_argument("--files", action="store_true", help="include files")
     sp.add_argument("--format", "-f", default="tree", choices=("tree", "json"))
     sp.set_defaults(func=cmd_tree)
@@ -1183,7 +1344,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("web", help="print Elixir / git.kernel.org / GitHub / docs URLs")
     sp.add_argument("target")
     sp.add_argument("--url", choices=("elixir", "ident", "git", "github", "docs"),
-                    help="print just this URL, for `open $(ka web … --url elixir)`")
+                    help='print just this URL, for `open "$(ka web … '
+                         '--url elixir)"`')
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
     sp.set_defaults(func=cmd_web)
 
@@ -1211,7 +1373,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target")
     sp.add_argument("--callers", action="store_true",
                     help="show callers instead of callees")
-    _add_filter_opts(sp)
+    _add_filter_opts(
+        sp,
+        kinds_help="resolved result identities to keep: function,syscall",
+    )
     _add_output_opts(sp, limit_default=200)
     sp.set_defaults(func=cmd_calls)
 

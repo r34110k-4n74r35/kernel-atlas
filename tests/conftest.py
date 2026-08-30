@@ -19,7 +19,11 @@ def mini_tree(tmp_path_factory):
 @pytest.fixture(scope="session")
 def mini_index(mini_tree, tmp_path_factory):
     out = tmp_path_factory.mktemp("index") / "test.db"
-    indexer.build(mini_tree, out, "6.12.104", want_calls=True, jobs=2, quiet=True)
+    indexer.build(
+        mini_tree, out, "6.12.104", want_calls=True, jobs=2, quiet=True,
+        source=("https://cdn.kernel.org/pub/linux/kernel/v6.x/"
+                "linux-6.12.104.tar.xz"),
+    )
     return out
 
 

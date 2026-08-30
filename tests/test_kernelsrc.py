@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import http.client
 import shutil
 import tarfile
 import threading
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import config, kernelsrc
+from kernel_atlas import __version__, config, kernelsrc
 
 
 def _make_tree(path: Path, version=("6", "12", "104", "")) -> Path:
@@ -22,6 +23,13 @@ def _make_tree(path: Path, version=("6", "12", "104", "")) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def test_user_agent_reports_package_version_and_project_homepage():
+    assert kernelsrc.USER_AGENT == (
+        f"kernel-atlas/{__version__} "
+        "(+https://github.com/r34110k-4n74r35/kernel-atlas)"
+    )
 
 
 def test_detect_version_uses_canonical_kernel_org_name(tmp_path):
@@ -91,6 +99,25 @@ def test_exact_release_falls_back_to_cdn_when_live_feed_is_malformed(monkeypatch
     assert release.source == kernelsrc.tarball_url("6.12.104")
 
 
+def test_get_normalizes_a_truncated_http_response(monkeypatch):
+    def truncated(*args, **kwargs):
+        raise http.client.IncompleteRead(b"partial", 100)
+
+    monkeypatch.setattr(kernelsrc.urllib.request, "urlopen", truncated)
+    with pytest.raises(OSError, match="incomplete HTTP response"):
+        kernelsrc._get("https://example.invalid/releases.json")
+
+
+def test_explicit_release_falls_back_after_a_truncated_live_feed(monkeypatch):
+    def truncated(*args, **kwargs):
+        raise http.client.IncompleteRead(b"partial", 100)
+
+    monkeypatch.setattr(kernelsrc.urllib.request, "urlopen", truncated)
+    release = kernelsrc.resolve_version("6.12.104")
+    assert release.moniker == "explicit"
+    assert release.source == kernelsrc.tarball_url("6.12.104")
+
+
 def test_normal_download_fails_closed_when_checksum_is_unavailable(
         monkeypatch, tmp_path):
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
@@ -125,6 +152,39 @@ def test_cached_tree_must_match_requested_version(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="reports Linux 1.2.3, not 9.9"):
         kernelsrc.ensure_source("9.9", quiet=True)
     assert tree.is_dir(), "a mismatched cache must be preserved for the user to inspect"
+
+
+def test_unrecognized_existing_source_destination_is_preserved(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    tree = config.source_path("9.9")
+    tree.mkdir(parents=True)
+    notes = tree / "unfinished-research.txt"
+    notes.write_text("keep me\n", encoding="utf-8")
+    monkeypatch.setattr(
+        kernelsrc, "download",
+        lambda *args, **kwargs: pytest.fail("must refuse before downloading"),
+    )
+
+    with pytest.raises(RuntimeError, match="already exists.*move or remove"):
+        kernelsrc.ensure_source("9.9", quiet=True, verify=False)
+
+    assert notes.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_broken_source_destination_symlink_is_preserved(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    tree = config.source_path("9.9")
+    tree.parent.mkdir(parents=True)
+    try:
+        tree.symlink_to(tmp_path / "missing-personal-tree", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        kernelsrc.ensure_source("9.9", quiet=True, verify=False)
+
+    assert tree.is_symlink()
 
 
 def test_release_candidate_git_snapshot_warns_and_extracts_tar_gz(
@@ -224,6 +284,59 @@ def test_extract_rejects_symlink_as_the_top_level_tree(monkeypatch, tmp_path):
     assert not (destination / "linux-9.9").exists()
 
 
+def test_acquisition_does_not_claim_a_destination_published_during_extract(
+        monkeypatch, tmp_path):
+    source = _make_tree(
+        tmp_path / "source" / "linux-9.9", ("9", "9", "0", ""))
+    archive = tmp_path / "linux-9.9.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(source, arcname=source.name)
+    destination = tmp_path / "kernels"
+    original_extractall = tarfile.TarFile.extractall
+
+    def race_publication(handle, path, *args, **kwargs):
+        original_extractall(handle, path, *args, **kwargs)
+        replacement = destination / "linux-9.9"
+        replacement.mkdir(parents=True)
+        (replacement / "personal-notes").write_text("keep me\n")
+
+    monkeypatch.setattr(kernelsrc.shutil, "which", lambda command: None)
+    monkeypatch.setattr(tarfile.TarFile, "extractall", race_publication)
+
+    with pytest.raises(RuntimeError, match="appeared during extraction"):
+        kernelsrc.extract(
+            archive, destination, quiet=True, require_new=True)
+
+    assert (destination / "linux-9.9" / "personal-notes").read_text() == (
+        "keep me\n")
+
+
+def test_acquisition_does_not_replace_an_empty_directory_racing_publication(
+        monkeypatch, tmp_path):
+    source = _make_tree(
+        tmp_path / "source" / "linux-9.9", ("9", "9", "0", ""))
+    archive = tmp_path / "linux-9.9.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(source, arcname=source.name)
+    destination = tmp_path / "kernels"
+    final = destination / "linux-9.9"
+    original = kernelsrc._rename_noreplace
+
+    def race(source_path, destination_path):
+        final.mkdir()
+        original(source_path, destination_path)
+
+    monkeypatch.setattr(kernelsrc.shutil, "which", lambda command: None)
+    monkeypatch.setattr(kernelsrc, "_rename_noreplace", race)
+
+    with pytest.raises(RuntimeError, match="appeared during extraction"):
+        kernelsrc.extract(
+            archive, destination, quiet=True, require_new=True)
+
+    assert final.is_dir()
+    assert list(final.iterdir()) == []
+
+
 def test_source_lock_serializes_same_version_acquisition(monkeypatch, tmp_path):
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
     first_entered = threading.Event()
@@ -249,6 +362,120 @@ def test_source_lock_serializes_same_version_acquisition(monkeypatch, tmp_path):
     one.join(2)
     two.join(2)
     assert second_entered.is_set()
+
+
+def test_source_lock_is_reentrant_for_ensure_source_callers(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    with kernelsrc.source_lock("9.9"):
+        with kernelsrc.source_lock("9.9"):
+            assert True
+
+
+def test_output_lock_serializes_publication_for_the_same_path(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    output = tmp_path / "indexes" / "study.db"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first():
+        with kernelsrc.output_lock(output):
+            first_entered.set()
+            assert release_first.wait(2)
+
+    def second():
+        with kernelsrc.output_lock(output):
+            second_entered.set()
+
+    one = threading.Thread(target=first)
+    two = threading.Thread(target=second)
+    one.start()
+    assert first_entered.wait(2)
+    two.start()
+    assert not second_entered.wait(0.05)
+    release_first.set()
+    one.join(2)
+    two.join(2)
+    assert second_entered.is_set()
+
+
+def test_output_lock_serializes_an_existing_symlink_alias(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "home"))
+    target = tmp_path / "real.db"
+    target.write_bytes(b"index")
+    alias = tmp_path / "alias.db"
+    try:
+        alias.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    entered = threading.Event()
+
+    def through_alias():
+        with kernelsrc.output_lock(alias):
+            entered.set()
+
+    with kernelsrc.output_lock(target):
+        worker = threading.Thread(target=through_alias)
+        worker.start()
+        assert not entered.wait(0.05)
+    worker.join(2)
+    assert entered.is_set()
+
+
+def test_output_lock_for_dangling_alias_does_not_create_target_parents(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "home"))
+    missing_parent = tmp_path / "personal" / "missing"
+    alias = tmp_path / "alias.db"
+    try:
+        alias.symlink_to(missing_parent / "real.db")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with kernelsrc.output_lock(alias):
+        assert True
+
+    assert not missing_parent.exists()
+
+
+def test_lifecycle_lock_rejects_a_symlink_without_writing_its_target(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "home"))
+    output = tmp_path / "study.db"
+    lock = kernelsrc._output_lock_paths(output)[0]
+    lock.parent.mkdir(parents=True)
+    victim = tmp_path / "personal-notes"
+    victim.write_bytes(b"")
+    try:
+        lock.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(OSError):
+        with kernelsrc.output_lock(output):
+            pytest.fail("unsafe lock must not be acquired")
+    assert victim.read_bytes() == b""
+
+
+def test_lifecycle_lock_rejects_a_hard_link_without_writing_its_target(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "home"))
+    output = tmp_path / "study.db"
+    lock = kernelsrc._output_lock_paths(output)[0]
+    lock.parent.mkdir(parents=True)
+    victim = tmp_path / "personal-notes"
+    victim.write_bytes(b"")
+    try:
+        lock.hardlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {exc}")
+
+    with pytest.raises(OSError, match="unsafe lifecycle lock"):
+        with kernelsrc.output_lock(output):
+            pytest.fail("unsafe lock must not be acquired")
+    assert victim.read_bytes() == b""
 
 
 class _Response(io.BytesIO):
@@ -299,3 +526,76 @@ def test_download_rejects_malformed_content_length(monkeypatch, tmp_path):
             quiet=True,
             retries=1,
         )
+
+
+def test_download_rejects_a_symlink_part_without_touching_its_target(
+        monkeypatch, tmp_path):
+    dest = tmp_path / "linux.tar.xz"
+    part = dest.with_name(dest.name + ".part")
+    victim = tmp_path / "personal-notes"
+    victim.write_bytes(b"do not append")
+    try:
+        part.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr(
+        kernelsrc.urllib.request, "urlopen",
+        lambda *args, **kwargs: pytest.fail("unsafe part must fail before HTTP"),
+    )
+
+    with pytest.raises(OSError, match="unsafe partial download"):
+        kernelsrc.download(
+            "https://example.invalid/linux.tar.xz", dest,
+            quiet=True, retries=1)
+
+    assert victim.read_bytes() == b"do not append"
+    assert part.is_symlink()
+
+
+def test_download_rejects_a_hard_link_part_without_touching_its_target(
+        monkeypatch, tmp_path):
+    dest = tmp_path / "linux.tar.xz"
+    part = dest.with_name(dest.name + ".part")
+    victim = tmp_path / "personal-notes"
+    victim.write_bytes(b"do not append")
+    try:
+        part.hardlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"hard links unavailable: {exc}")
+    monkeypatch.setattr(
+        kernelsrc.urllib.request, "urlopen",
+        lambda *args, **kwargs: pytest.fail("unsafe part must fail before HTTP"),
+    )
+
+    with pytest.raises(OSError, match="unsafe partial download"):
+        kernelsrc.download(
+            "https://example.invalid/linux.tar.xz", dest,
+            quiet=True, retries=1)
+
+    assert victim.read_bytes() == b"do not append"
+
+
+def test_download_part_rejects_a_regular_file_swap_before_open(
+        monkeypatch, tmp_path):
+    part = tmp_path / "linux.tar.xz.part"
+    part.write_bytes(b"partial")
+    original_part = tmp_path / "original-part"
+    victim = tmp_path / "personal-notes"
+    victim.write_bytes(b"keep me")
+    original_open = kernelsrc.os.open
+    raced = False
+
+    def swapping_open(path, flags, mode=0o777):
+        nonlocal raced
+        if Path(path) == part and not raced:
+            part.rename(original_part)
+            victim.rename(part)
+            raced = True
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(kernelsrc.os, "open", swapping_open)
+    with pytest.raises(OSError, match="unsafe partial download"):
+        kernelsrc._open_download_part(part, append=False)
+
+    assert part.read_bytes() == b"keep me"
+    assert original_part.read_bytes() == b"partial"

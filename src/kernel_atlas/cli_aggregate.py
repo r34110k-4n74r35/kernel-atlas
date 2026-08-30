@@ -34,6 +34,8 @@ def cmd_struct(args, support):
             (resolution.note
              or f"could not resolve aggregate {requested!r}") + suffix)
 
+    support._require_exact_line_qualifier(conn, spec)
+
     if resolution.candidates and not args.all:
         candidates = [resolution.target, *resolution.candidates]
         selectors = [query.structure_selector(conn, candidate)
@@ -108,7 +110,8 @@ def cmd_struct(args, support):
                     "lines": entry.lines,
                     "size": entry.size,
                     "links": links.links(
-                        support.index_version(meta), entry.path),
+                        support.index_version(meta), entry.path,
+                        source=meta.get("source")),
                 }
                 for entry in related
             ],
@@ -144,6 +147,10 @@ def cmd_struct(args, support):
     target_spec = shlex.quote(
         f"{definitions[0]['path']}:{definitions[0]['line']}")
     prefix = support._command_prefix(args, meta)
-    print(f"\n  Next:  {prefix} show {target_spec}"
-          f"\n         {prefix} docs {target_spec}"
-          f"\n         {prefix} web {target_spec}")
+    next_lines = [
+        f"\n  Next:  {prefix} show {target_spec}",
+        f"         {prefix} docs {target_spec}",
+    ]
+    if definitions[0]["links"]:
+        next_lines.append(f"         {prefix} web {target_spec}")
+    print("\n".join(next_lines))

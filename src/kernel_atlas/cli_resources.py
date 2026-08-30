@@ -14,10 +14,16 @@ def cmd_web(args, support):
     """Print Elixir, kernel Git, GitHub, and kernel documentation URLs."""
     conn, meta = support.open_index(args)
     resolution = support.resolve_or_die(conn, args.target, meta)
-    support._require_unique_symbol_identity(resolution, args.target)
+    support._require_unique_symbol_identity(resolution, args.target, conn)
     target = resolution.target
     link_map = support._links_for(meta, target)
     version = support.index_version(meta)
+
+    if not link_map:
+        support._die(
+            f"no upstream release-reference URLs for {target.display}; this "
+            "index was built from local/custom source or a nonmatching "
+            "archive (use 'path' or 'show' for the recorded source tree)")
 
     if args.url:
         url = link_map.get(args.url)
@@ -77,7 +83,8 @@ def cmd_docs(args, support):
                 "size": entry.size,
                 "index": version,
             }
-            item.update(links.links(version, entry.path))
+            item.update(links.links(
+                version, entry.path, source=meta.get("source")))
             payload.append(item)
         sys.stdout.write(render.render_json(payload))
         return
@@ -93,9 +100,10 @@ def cmd_docs(args, support):
         print(f"  {entry.path}")
     prefix = support._command_prefix(args, meta)
     first = shlex.quote(entries[0].path)
-    print(render.paint(
-        f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
-        f"   Next: {prefix} web {first}", "90", color))
+    summary = f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
+    if links.links(version, entries[0].path, source=meta.get("source")):
+        summary += f"   Next: {prefix} web {first}"
+    print(render.paint(summary, "90", color))
 
 
 def cmd_locate(args, support):
@@ -146,6 +154,12 @@ def cmd_locate(args, support):
                 })
                 continue
             target = resolution.target
+            line_qualified = query.line_selector_suffix(resolved_spec) is not None
+            if line_qualified and target is not None and target.kind != "symbol":
+                # Generic informational resolution falls back to a real file
+                # when no symbol spans a requested line.  Cross-version lookup
+                # must retain that as a miss, not silently change identities.
+                target = None
             if target is None:
                 rows.append({
                     "version": version,
@@ -197,7 +211,7 @@ def cmd_locate(args, support):
         version = row["version"].ljust(version_width)
         prefix = f"  {mark} {version}"
         if not row.get("found"):
-            why = row.get("error") or "not in this index"
+            why = row.get("error") or row.get("note") or "not in this index"
             print(f"{prefix}  {render.paint(why, '90', color)}")
             continue
         location = row["path"]
@@ -206,3 +220,5 @@ def cmd_locate(args, support):
         subsystem = row.get("subsystem") or "-"
         print(f"{prefix}  {row['kind']:<10} {location:<42} "
               f"{render.paint(subsystem, '35', color)}")
+        if row.get("note"):
+            print(render.paint(f"      note: {row['note']}", "33", color))

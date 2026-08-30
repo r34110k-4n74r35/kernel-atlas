@@ -23,6 +23,9 @@ from .cparse_shared import (
 
 
 MAX_MEMBER_DECLARATION = 32_000
+_BOILERPLATE_COMMENT_RE = re.compile(
+    r"(?i)^(?:SPDX-License-Identifier\s*:|copyright\b|"
+    r"licen[cs]e(?:d)?\s*(?:under|:)|all rights reserved\b|authors?\s*:)")
 FragmentParser = Callable[[bytes, str, str], Symbol | None]
 FileScopePredicate = Callable[[bytes, object], bool]
 
@@ -124,6 +127,17 @@ def _comment_lines(text: str) -> list[str]:
     text = re.sub(r"\*/\s*$", "", text)
     return [re.sub(r"^\s*\* ?", "", line).rstrip()
             for line in text.splitlines()]
+
+
+def _is_boilerplate_comment(text: str) -> bool:
+    """Whether an ordinary comment starts a legal/attribution header line.
+
+    Match line roles rather than isolated words. Aggregate fields such as
+    ``@author`` and prose which discusses a license are useful documentation,
+    not evidence that the whole block is a file header.
+    """
+    return any(_BOILERPLATE_COMMENT_RE.match(line.strip()) is not None
+               for line in _comment_lines(text) if line.strip())
 
 
 def _paragraphs(lines: list[str]) -> str | None:
@@ -240,7 +254,8 @@ def _adjacent_comment_raw(src: bytes, offset: int, *, kernel_doc: bool = False) 
         -> str | None:
     prefix = src[:offset]
     end = prefix.rfind(b"*/")
-    if end < 0 or prefix[end + 2:].strip():
+    gap = prefix[end + 2:] if end >= 0 else b""
+    if end < 0 or gap.strip() or (not kernel_doc and gap.count(b"\n") > 1):
         return None
     begin = prefix.rfind(b"/*", 0, end)
     if begin < 0:
@@ -264,14 +279,16 @@ def _adjacent_ordinary_comment(src: bytes, node) -> str | None:
     start = _outer_declaration(node).start_byte
     prefix = src[:start]
     end = prefix.rfind(b"*/")
-    if end < 0 or prefix[end + 2:].strip():
+    gap = prefix[end + 2:]
+    if gap.strip() or gap.count(b"\n") > 1:
         return None
     begin = prefix.rfind(b"/*", 0, end)
     if begin < 0 or prefix[begin:begin + 3] == b"/**":
         return None
     value = _paragraphs(_comment_lines(
         prefix[begin:end + 2].decode("utf-8", "replace")))
-    if value and "SPDX-License-Identifier" not in value:
+    if value and not _is_boilerplate_comment(
+            prefix[begin:end + 2].decode("utf-8", "replace")):
         return value
     return None
 
@@ -1644,8 +1661,17 @@ def parse_definition(
             if ordinary_raw is not None:
                 ordinary_doc = _parse_aggregate_doc(
                     ordinary_raw, identities, "source-comment")
-                if (ordinary_doc.summary or ordinary_doc.description
-                        or ordinary_doc.members):
+                comment_lines = [
+                    line.strip() for line in _comment_lines(ordinary_raw)
+                    if line.strip()
+                ]
+                named = bool(comment_lines) and any(re.match(
+                    rf"(?:(?:struct|union|typedef)\s+)?{re.escape(identity)}"
+                    r"\s*[-:]",
+                    comment_lines[0],
+                ) for identity in identities)
+                if ((ordinary_doc.members or named)
+                        and (named or not _is_boilerplate_comment(ordinary_raw))):
                     doc = ordinary_doc
         summary, description = doc.summary, doc.description
         if summary is None and description is None:
