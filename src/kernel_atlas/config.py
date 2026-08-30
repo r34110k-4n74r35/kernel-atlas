@@ -1,8 +1,8 @@
 """Where kernel trees and built indexes live.
 
-Everything is kept inside the project directory rather than a hidden cache, so
-the kernel source you are studying sits right next to the tool and can be opened
-in an editor or grepped directly:
+An editable checkout keeps study data beside the project; a normal installed
+copy falls back to ``~/.kernel-atlas``.  In either case the data root can be
+overridden with ``KERNEL_ATLAS_HOME``:
 
     kernel-atlas/
       kernels/linux-6.18.45/   <- the actual kernel source, browsable
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from pathlib import Path
 
 SOURCES_DIRNAME = "kernels"
@@ -91,7 +92,10 @@ def list_indexes() -> list[Path]:
     d = index_dir()
     if not d.is_dir():
         return []
-    return sorted(d.glob("*.db"))
+    # Keep corrupt regular SQLite files visible for diagnosis, but do not let a
+    # directory or dangling alias poison default selection.  An exact dangling
+    # alias can still be named explicitly to ``remove`` it.
+    return sorted(path for path in d.glob("*.db") if path.is_file())
 
 
 def default_version_file() -> Path:
@@ -99,26 +103,54 @@ def default_version_file() -> Path:
 
 
 def get_default_version() -> str | None:
-    """The version pinned with `ka use`, or None if nothing is pinned."""
+    """The version pinned with `ka use`, or None if no pin file exists.
+
+    A present pin is configuration, not a hint: malformed contents and read
+    failures must remain visible to callers instead of silently changing which
+    index is selected.
+    """
+    pin = default_version_file()
     try:
-        value = default_version_file().read_text(encoding="utf-8").strip()
-    except OSError:
+        value = pin.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
         return None
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"default version pin {pin} is not valid UTF-8"
+        ) from None
     if not value:
-        return None
+        raise ValueError(f"default version pin {pin} is empty")
     try:
         return validate_version(value)
     except ValueError:
-        # Treat a corrupt or hand-edited unsafe pin as stale rather than ever
-        # allowing it to redirect index lookup outside ``indexes/``.
-        return None
+        # Do not include the untrusted contents in the error: the pin may have
+        # been replaced by a symlink to an unrelated file.  Validation still
+        # prevents it from redirecting index lookup outside ``indexes/``.
+        raise ValueError(
+            f"default version pin {pin} does not contain a safe version"
+        ) from None
 
 
 def set_default_version(version: str) -> None:
+    """Atomically pin ``version`` without following a hostile leaf symlink."""
     version = validate_version(version)
     f = default_version_file()
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(version + "\n", encoding="utf-8")
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{f.name}.", suffix=".tmp", dir=f.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(version + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Replacing the directory entry, rather than opening ``f`` for writing,
+        # replaces a leaf symlink itself and makes concurrent readers see either
+        # the old complete pin or the new complete pin.
+        temporary.replace(f)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def clear_default_version() -> None:

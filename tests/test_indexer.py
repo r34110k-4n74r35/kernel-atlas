@@ -20,6 +20,66 @@ def _tree(root: Path, maintainers: str | None = None) -> Path:
     return root
 
 
+@pytest.mark.parametrize(
+    ("kinds", "message"),
+    [
+        ("function", "iterable"),
+        (b"function", "iterable"),
+        (None, "iterable"),
+        (17, "iterable"),
+        ((), "at least one"),
+        (("function", "function"), "duplicates"),
+        (("function", 17), "every kind must be a string"),
+        (("not-a-kind",), "unknown symbol kind"),
+    ],
+)
+def test_build_rejects_invalid_kinds_before_touching_paths(
+        tmp_path, kinds, message):
+    with pytest.raises(ValueError, match=message):
+        indexer.build(
+            tmp_path / "missing-tree", tmp_path / "index.db", "9.9",
+            kinds=kinds, jobs=1, quiet=True,
+        )
+    assert not (tmp_path / "index.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("jobs", "message"),
+    [
+        (True, "integer"),
+        (False, "integer"),
+        (1.0, "integer"),
+        ("1", "integer"),
+        (0, "between 1 and 256"),
+        (-1, "between 1 and 256"),
+        (257, "between 1 and 256"),
+    ],
+)
+def test_build_rejects_invalid_jobs_before_call_requirements(
+        tmp_path, jobs, message):
+    with pytest.raises(ValueError, match=message):
+        indexer.build(
+            tmp_path / "missing-tree", tmp_path / "index.db", "9.9",
+            kinds=("function",), want_calls=True, jobs=jobs, quiet=True,
+        )
+    assert not (tmp_path / "index.db").exists()
+
+
+def test_build_rejects_directory_output_before_scanning(tmp_path, monkeypatch):
+    tree = _tree(tmp_path / "linux-9.9")
+    out = tmp_path / "index.db"
+    out.mkdir()
+
+    monkeypatch.setattr(
+        indexer, "_scan_tree",
+        lambda *args, **kwargs: pytest.fail("source scan must not start"),
+    )
+    with pytest.raises(ValueError, match="index output is a directory"):
+        indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+
+    assert out.is_dir()
+
+
 def test_oversize_header_is_counted_and_explicitly_skipped(tmp_path):
     tree = _tree(tmp_path / "linux-9.9")
     line = b"#define GENERATED_VALUE 1\n"
@@ -41,6 +101,88 @@ def test_oversize_header_is_counted_and_explicitly_skipped(tmp_path):
     assert stats.skipped == stats.oversize == 1
     assert meta["n_parse_skipped"] == "1"
     assert meta["n_oversize"] == "1"
+
+
+def test_direct_build_records_the_supplied_tree_as_local_source(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    meta = db.validate_schema(conn)
+    conn.close()
+
+    assert meta["source"] == str(tree.resolve())
+
+
+def test_pre_publish_failure_preserves_the_previous_index(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    out = tmp_path / "index.db"
+    previous = b"previous index"
+    out.write_bytes(previous)
+
+    def reject_publication() -> None:
+        raise RuntimeError("source changed")
+
+    with pytest.raises(RuntimeError, match="source changed"):
+        indexer.build(
+            tree, out, "9.9", jobs=1, quiet=True,
+            pre_publish=reject_publication)
+
+    assert out.read_bytes() == previous
+    assert list(tmp_path.glob(".index.db.*.building")) == []
+
+
+def test_build_uses_the_parser_size_contract_and_allows_a_custom_limit(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    source = b"#define VALUE 1\n" * 20
+    (tree / "limited.h").write_bytes(source)
+    out = tmp_path / "index.db"
+
+    assert indexer.MAX_READ == cparse.MAX_FILE_BYTES
+    stats = indexer.build(
+        tree, out, "9.9", jobs=1, quiet=True, max_file_bytes=128)
+    conn = db.connect(out)
+    status = conn.execute(
+        "SELECT index_status FROM files WHERE path='limited.h'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert status == "skipped_oversize"
+    assert stats.oversize == 1
+    assert cparse.parse_source(
+        source, cparse.DEFAULT_KINDS, max_file_bytes=128) == []
+
+
+def test_shipped_c_and_header_sources_are_parsed(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "generated.c_shipped").write_text(
+        "int shipped_function(void) { return 1; }\n")
+    (tree / "generated.h_shipped").write_text(
+        "struct shipped_type { int value; };\n")
+    out = tmp_path / "index.db"
+
+    stats = indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = list(conn.execute(
+        "SELECT f.path,s.name,s.kind FROM symbols s"
+        " JOIN files f ON f.id=s.file_id"
+        " WHERE f.path LIKE '%_shipped' ORDER BY f.path,s.kind,s.name"))
+    statuses = dict(conn.execute(
+        "SELECT path,index_status FROM files WHERE path LIKE '%_shipped'"))
+    conn.close()
+
+    assert stats.parsed == 2
+    assert statuses == {
+        "generated.c_shipped": "parsed",
+        "generated.h_shipped": "parsed",
+    }
+    assert ("generated.c_shipped", "shipped_function", "function") in {
+        tuple(row) for row in rows
+    }
+    assert ("generated.h_shipped", "shipped_type", "struct") in {
+        tuple(row) for row in rows
+    }
 
 
 def test_symlink_is_represented_without_following_it(tmp_path):
@@ -310,6 +452,26 @@ def test_build_time_includes_publication_validation(monkeypatch, tmp_path):
 
     monkeypatch.setattr(db, "validate_schema", slow_validation)
     stats = indexer.build(tree, out, "9.9", jobs=1, quiet=True)
+    conn = db.connect(out)
+    recorded = float(db.get_meta(conn)["build_seconds"])
+    conn.close()
+
+    assert stats.seconds >= 0.05
+    assert recorded >= 0.1
+
+
+def test_build_time_includes_pre_publish_validation(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "one.c").write_text("int one(void) { return 1; }\n")
+    out = tmp_path / "index.db"
+
+    def slow_pre_publish():
+        time.sleep(0.05)
+
+    stats = indexer.build(
+        tree, out, "9.9", jobs=1, quiet=True,
+        pre_publish=slow_pre_publish,
+    )
     conn = db.connect(out)
     recorded = float(db.get_meta(conn)["build_seconds"])
     conn.close()
@@ -604,6 +766,121 @@ int macro_caller(void) { return callback(); }
     assert tuple(row) == (None, "macro")
 
 
+def test_call_resolution_respects_same_file_macro_source_intervals(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "nfs.c").write_text("""\
+static int rpc_call_sync(void) { return 1; }
+static int before_define(void) { return rpc_call_sync(); }
+#define rpc_call_sync() 2
+static int while_defined(void) { return rpc_call_sync(); }
+#undef rpc_call_sync
+static int after_undef(void) { return rpc_call_sync(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = {
+        row["caller"]: (
+            row["resolution"], row["direct_count"], row["macro_count"])
+        for row in conn.execute(
+            "SELECT caller.name AS caller,c.resolution,c.direct_count,"
+            " c.macro_count FROM calls c"
+            " JOIN symbols caller ON caller.id=c.caller_id"
+            " WHERE c.callee='rpc_call_sync'")
+    }
+    db.validate_schema(conn, deep=True)
+    conn.close()
+
+    assert rows == {
+        "before_define": ("same_file", 1, 0),
+        "while_defined": ("macro", 0, 1),
+        "after_undef": ("same_file", 1, 0),
+    }
+
+
+@pytest.mark.parametrize("suffix", [".h", ".h_shipped"])
+def test_future_macro_in_same_header_does_not_block_earlier_call(
+        tmp_path, suffix):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / f"api{suffix}").write_text("""\
+static int target(void) { return 1; }
+static int caller(void) { return target(); }
+#define target() 2
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.resolution,c.direct_count,c.macro_count FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='caller' AND c.callee='target'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == ("same_file", 1, 0)
+
+
+def test_macro_from_included_c_source_remains_a_conservative_blocker(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_text("#define wrapped_call() 1\n")
+    (tree / "wrapper.c").write_text("""\
+#include "member.c"
+int caller(void) { return wrapped_call(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    row = conn.execute(
+        "SELECT c.callee_id,c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='caller' AND c.callee='wrapped_call'"
+    ).fetchone()
+    conn.close()
+
+    assert tuple(row) == (None, "macro")
+
+
+def test_call_edges_persist_mixed_and_expression_level_indirect_evidence(
+        tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "calls.c").write_text("""\
+static void target(void) { }
+static void caller(struct ops *ops)
+{
+    target();
+    {
+        void (*target)(void) = 0;
+        target();
+    }
+    ops->target();
+    (*ops->finish)();
+}
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    rows = {
+        row["callee"]: (
+            row["resolution"], row["direct_count"], row["indirect_count"])
+        for row in conn.execute(
+            "SELECT c.callee,c.resolution,c.direct_count,c.indirect_count"
+            " FROM calls c JOIN symbols caller ON caller.id=c.caller_id"
+            " WHERE caller.name='caller'")
+    }
+    db.validate_schema(conn, deep=True)
+    conn.close()
+
+    assert rows == {
+        "target": ("same_file", 1, 1),
+        "ops->target": ("indirect", 0, 1),
+        "*ops->finish": ("indirect", 0, 1),
+    }
+
+
 def test_call_build_resolves_quoted_c_members_in_the_same_unit(tmp_path):
     tree = _tree(tmp_path / "linux-9.9")
     (tree / "member.c").write_text(
@@ -634,6 +911,32 @@ int aggregate(void) { return load_firmware(); }
 
     assert tuple(include) == ("aggregate.c", "member.c", 1)
     assert tuple(call) == ("included_source", "member.c")
+
+
+def test_commented_source_include_does_not_invent_a_translation_unit(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_text(
+        "static int member_helper(void) { return 1; }\n")
+    (tree / "caller.c").write_text("""\
+/* This is an example, not a preprocessing directive:
+#include "member.c"
+ */
+int caller(void) { return member_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    includes = conn.execute("SELECT COUNT(*) FROM source_includes").fetchone()[0]
+    resolution = conn.execute(
+        "SELECT c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='caller' AND c.callee='member_helper'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert includes == 0
+    assert resolution == "unresolved"
 
 
 def test_global_in_quoted_member_is_visible_through_root_domain(tmp_path):
@@ -809,6 +1112,309 @@ def test_tools_build_object_list_records_a_translation_unit_root(tmp_path):
     conn.close()
 
     assert root is not None
+
+
+def test_literal_make_compile_and_link_rules_record_translation_unit_roots(
+        tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    ring = tree / "tools" / "virtio" / "ringtest"
+    ring.mkdir(parents=True)
+    (ring / "Makefile").write_text("""\
+dual.o: dual.c main.h
+standalone: dual.o
+poll.o: poll.c dual.c main.h
+poll: poll.o
+""")
+    (ring / "main.h").write_text("\n")
+    (ring / "dual.c").write_text(
+        "int dual_source(void) { return 1; }\n")
+    (ring / "poll.c").write_text('#include "dual.c"\n')
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    roots = {
+        row[0] for row in conn.execute(
+            "SELECT f.path FROM translation_unit_roots root"
+            " JOIN files f ON f.id=root.file_id")
+    }
+    conn.close()
+
+    assert "tools/virtio/ringtest/dual.c" in roots
+    assert "tools/virtio/ringtest/poll.c" in roots
+
+
+def test_kbuild_include_paths_resolve_angle_and_quoted_c_members(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    shared = tree / "shared"
+    shared.mkdir()
+    (shared / "angle_member.c").write_text(
+        "static int angle_helper(void) { return 1; }\n")
+    (shared / "quote_member.c").write_text(
+        "static int quote_helper(void) { return 1; }\n")
+    probes = tree / "tools" / "probes"
+    probes.mkdir(parents=True)
+    (probes / "Makefile").write_text("""\
+hostprogs := angle quote
+HOSTCFLAGS_angle.o := -I$(srctree)/shared/
+HOSTCFLAGS_quote.o := -I $(srctree)/shared/
+""")
+    (probes / "angle.c").write_text("""\
+#include <angle_member.c>
+int angle(void) { return angle_helper(); }
+""")
+    (probes / "quote.c").write_text("""\
+#include "quote_member.c"
+int quote(void) { return quote_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    includes = {
+        (row["parent"], row["member"])
+        for row in conn.execute(
+            "SELECT parent.path AS parent,member.path AS member"
+            " FROM source_includes edge"
+            " JOIN files parent ON parent.id=edge.includer_id"
+            " JOIN files member ON member.id=edge.included_id")
+    }
+    resolutions = {
+        row["caller"]: row["resolution"]
+        for row in conn.execute(
+            "SELECT caller.name AS caller,c.resolution FROM calls c"
+            " JOIN symbols caller ON caller.id=c.caller_id")
+    }
+    conn.close()
+
+    assert includes == {
+        ("tools/probes/angle.c", "shared/angle_member.c"),
+        ("tools/probes/quote.c", "shared/quote_member.c"),
+    }
+    assert resolutions["angle"] == "included_source"
+    assert resolutions["quote"] == "included_source"
+
+
+def test_target_include_order_distinguishes_srctree_from_objtree(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    tools_lib = tree / "tools" / "arch" / "x86" / "lib"
+    arch_lib = tree / "arch" / "x86" / "lib"
+    probe_dir = tree / "arch" / "x86" / "tools"
+    tools_lib.mkdir(parents=True)
+    arch_lib.mkdir(parents=True)
+    probe_dir.mkdir(parents=True)
+    (tools_lib / "insn.c").write_text(
+        "static int decode_insn(void) { return 1; }\n")
+    (arch_lib / "insn.c").write_text(
+        "static int decode_insn(void) { return 2; }\n")
+    (probe_dir / "Makefile").write_text("""\
+hostprogs := probe
+HOSTCFLAGS_probe.o := -I$(srctree)/tools/arch/x86/lib/ \\
+                      -I$(objtree)/arch/x86/lib/
+""")
+    (probe_dir / "probe.c").write_text("""\
+#include <insn.c>
+int probe(void) { return decode_insn(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT member.path FROM source_includes edge"
+        " JOIN files parent ON parent.id=edge.includer_id"
+        " JOIN files member ON member.id=edge.included_id"
+        " WHERE parent.path='arch/x86/tools/probe.c'"
+    ).fetchone()
+    resolution = conn.execute(
+        "SELECT c.resolution,target_file.path FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " JOIN symbols target ON target.id=c.callee_id"
+        " JOIN files target_file ON target_file.id=target.file_id"
+        " WHERE caller.name='probe' AND c.callee='decode_insn'"
+    ).fetchone()
+    conn.close()
+
+    assert include[0] == "tools/arch/x86/lib/insn.c"
+    assert tuple(resolution) == (
+        "included_source", "tools/arch/x86/lib/insn.c")
+
+
+def test_general_include_directory_precedes_target_specific_directory(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    general = tree / "general"
+    specific = tree / "specific"
+    probe_dir = tree / "tools" / "probe"
+    general.mkdir()
+    specific.mkdir()
+    probe_dir.mkdir(parents=True)
+    (general / "member.c").write_text(
+        "static int selected_helper(void) { return 1; }\n")
+    (specific / "member.c").write_text(
+        "static int selected_helper(void) { return 2; }\n")
+    (probe_dir / "Makefile").write_text("""\
+hostprogs := probe
+ccflags-y := -I$(srctree)/general
+CFLAGS_probe.o := -I$(srctree)/specific
+""")
+    (probe_dir / "probe.c").write_text("""\
+#include <member.c>
+int probe(void) { return selected_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT member.path FROM source_includes edge"
+        " JOIN files parent ON parent.id=edge.includer_id"
+        " JOIN files member ON member.id=edge.included_id"
+        " WHERE parent.path='tools/probe/probe.c'"
+    ).fetchone()
+    conn.close()
+
+    assert include[0] == "general/member.c"
+
+
+def test_c_include_flag_categories_follow_makefile_lib_order(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    probe_dir = tree / "drivers" / "probe"
+    probe_dir.mkdir(parents=True)
+    for dirname in ("cpp", "cflags", "subdir", "local", "target", "linker"):
+        include_dir = tree / dirname
+        include_dir.mkdir()
+        (include_dir / "member.c").write_text(
+            f"static int selected_helper(void) {{ return {len(dirname)}; }}\n")
+    # Deliberately list the variables in reverse semantic order. LDFLAGS is not
+    # part of C compilation at all; the remaining order comes from Makefile.lib.
+    (probe_dir / "Makefile").write_text("""\
+LDFLAGS_probe.o := -I$(srctree)/linker
+CFLAGS_probe.o := -I$(srctree)/target
+ccflags-y := -I$(srctree)/local
+subdir-ccflags-y := -I$(srctree)/subdir
+KBUILD_CFLAGS := -I$(srctree)/cflags
+KBUILD_CPPFLAGS := -I$(srctree)/cpp
+""")
+    (probe_dir / "probe.c").write_text("""\
+#include <member.c>
+int probe(void) { return selected_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT member.path FROM source_includes edge"
+        " JOIN files parent ON parent.id=edge.includer_id"
+        " JOIN files member ON member.id=edge.included_id"
+        " WHERE parent.path='drivers/probe/probe.c'"
+    ).fetchone()
+    conn.close()
+
+    assert include[0] == "cpp/member.c"
+
+
+def test_opaque_include_directory_blocks_a_later_source_guess(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    specific = tree / "specific"
+    probe_dir = tree / "tools" / "probe"
+    specific.mkdir()
+    probe_dir.mkdir(parents=True)
+    (specific / "member.c").write_text(
+        "static int selected_helper(void) { return 2; }\n")
+    (probe_dir / "Makefile").write_text("""\
+hostprogs := probe
+CFLAGS_probe.o := -I$(objtree)/generated -I$(srctree)/specific
+""")
+    (probe_dir / "probe.c").write_text("""\
+#include <member.c>
+int probe(void) { return selected_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT 1 FROM source_includes edge"
+        " JOIN files parent ON parent.id=edge.includer_id"
+        " WHERE parent.path='tools/probe/probe.c'"
+    ).fetchone()
+    resolution = conn.execute(
+        "SELECT c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='probe' AND c.callee='selected_helper'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert include is None
+    assert resolution == "unresolved"
+
+
+@pytest.mark.parametrize("obj", ["$(obj)", "${obj}"])
+def test_obj_include_paths_do_not_alias_generated_output_to_sources(
+        tmp_path, obj):
+    tree = _tree(tmp_path / "linux-9.9")
+    probe_dir = tree / "drivers" / "probe"
+    generated = probe_dir / "generated"
+    generated.mkdir(parents=True)
+    (generated / "member.c").write_text(
+        "static int generated_helper(void) { return 1; }\n")
+    (probe_dir / "Makefile").write_text(
+        f"ccflags-y := -I{obj}/generated\n")
+    (probe_dir / "caller.c").write_text("""\
+#include <member.c>
+int caller(void) { return generated_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    include = conn.execute(
+        "SELECT 1 FROM source_includes edge"
+        " JOIN files parent ON parent.id=edge.includer_id"
+        " WHERE parent.path='drivers/probe/caller.c'"
+    ).fetchone()
+    resolution = conn.execute(
+        "SELECT c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='caller' AND c.callee='generated_helper'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert include is None
+    assert resolution == "unresolved"
+
+
+def test_directory_local_include_flags_do_not_leak_into_children(tmp_path):
+    tree = _tree(tmp_path / "linux-9.9")
+    shared = tree / "shared"
+    shared.mkdir()
+    (shared / "member.c").write_text(
+        "static int member_helper(void) { return 1; }\n")
+    parent = tree / "tools" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / "Makefile").write_text(
+        "ccflags-y := -I$(srctree)/shared\n")
+    (child / "caller.c").write_text("""\
+#include <member.c>
+int caller(void) { return member_helper(); }
+""")
+    out = tmp_path / "index.db"
+
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    includes = conn.execute(
+        "SELECT COUNT(*) FROM source_includes").fetchone()[0]
+    resolution = conn.execute(
+        "SELECT c.resolution FROM calls c"
+        " JOIN symbols caller ON caller.id=c.caller_id"
+        " WHERE caller.name='caller' AND c.callee='member_helper'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert includes == 0
+    assert resolution == "unresolved"
 
 
 def test_included_member_uses_its_root_translation_unit_domain(tmp_path):

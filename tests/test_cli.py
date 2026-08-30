@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from pathlib import Path
 
 import pytest
 
-from kernel_atlas import cli, config, db
+from kernel_atlas import __version__, cli, config, db, kernelsrc
 
 
 def _fake_index(root, version: str) -> None:
@@ -28,6 +30,7 @@ def _fake_index(root, version: str) -> None:
         ("n_type_members", "0"),
         ("n_subsystems", "0"),
         ("n_calls", "0"),
+        ("n_call_occurrences", "0"),
         ("n_calls_resolved", "0"),
         ("n_calls_ambiguous", "0"),
         ("n_calls_macro", "0"),
@@ -41,6 +44,41 @@ def _fake_index(root, version: str) -> None:
     ])
     db.finalize(conn)
     conn.close()
+
+
+def _authorize_source(root, version: str, tree, *, index=None):
+    source = f"https://cdn.kernel.org/linux-{version}.tar.xz"
+    identity = kernelsrc._write_source_identity(
+        version, tree, source, authoritative=True)
+    index = index or root / "indexes" / f"{version}.db"
+    if index.is_file():
+        conn = sqlite3.connect(index)
+        conn.executemany("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", [
+            ("managed_tree_id", identity.token),
+            ("managed_tree_device", str(identity.device)),
+            ("managed_tree_inode", str(identity.inode)),
+            ("managed_tree_digest", identity.digest),
+        ])
+        conn.commit()
+        conn.close()
+    return identity
+
+
+def _fake_source(root, version: str, *, reports: str | None = None,
+                 authorize: bool = True, index=None):
+    tree = root / "kernels" / f"linux-{version}"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "MAINTAINERS").write_text("TEST\nF: *\n")
+    parts = (reports or version).split(".")
+    major, patch = parts[:2]
+    sublevel = parts[2] if len(parts) > 2 else "0"
+    (tree / "Makefile").write_text(
+        f"VERSION = {major}\nPATCHLEVEL = {patch}\n"
+        f"SUBLEVEL = {sublevel}\nEXTRAVERSION =\n",
+    )
+    if authorize:
+        _authorize_source(root, version, tree, index=index)
+    return tree
 
 
 @pytest.fixture
@@ -58,6 +96,45 @@ def test_use_pins_a_version_and_accepts_a_unique_prefix(home, capsys):
     out = capsys.readouterr().out
     assert "6.18.45" in out
 
+
+def test_remove_does_not_clear_a_concurrently_selected_different_pin(
+        home, monkeypatch, capsys):
+    config.set_default_version("7.2")
+    original_get = config.get_default_version
+    remove_read_pin = threading.Event()
+    allow_remove_to_clear = threading.Event()
+    results = []
+
+    def delayed_get():
+        if threading.current_thread().name == "remove-worker":
+            value = original_get()
+            remove_read_pin.set()
+            assert allow_remove_to_clear.wait(2)
+            return value
+        return original_get()
+
+    monkeypatch.setattr(config, "get_default_version", delayed_get)
+
+    remove_worker = threading.Thread(
+        name="remove-worker",
+        target=lambda: results.append(cli.main(["remove", "7.2"])),
+    )
+    use_worker = threading.Thread(
+        name="use-worker",
+        target=lambda: results.append(cli.main(["use", "6.18.45"])),
+    )
+    remove_worker.start()
+    assert remove_read_pin.wait(2)
+    use_worker.start()
+    assert use_worker.is_alive(), "the concurrent pin writer should wait"
+    allow_remove_to_clear.set()
+    remove_worker.join(2)
+    use_worker.join(2)
+
+    assert sorted(results) == [0, 0]
+    assert original_get() == "6.18.45"
+    capsys.readouterr()
+
     assert cli.main(["use"]) == 0
     out = capsys.readouterr().out
     assert "pinned: 6.18.45" in out
@@ -74,6 +151,80 @@ def test_use_clear_and_both_args_rejected(home, capsys):
         cli.main(["use", "7.2", "--clear"])
 
 
+def test_invalid_pin_is_a_clean_cli_error_and_use_clear_repairs_it(home, capsys):
+    pin = config.default_version_file()
+    pin.write_text("../untrusted\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        cli.main(["stats"])
+    error = capsys.readouterr().err
+    assert "cannot read the default version pin" in error
+    assert "Traceback" not in error
+
+    assert cli.main(["use", "--clear"]) == 0
+    assert not pin.exists()
+    assert "cleared invalid default pin" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "command", ["versions", "build", "indexes", "use", "remove"])
+def test_lifecycle_help_does_not_advertise_index_selection(command, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main([command, "--help"])
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--kernel" not in help_text
+    assert "--db" not in help_text
+    assert "--color" in help_text
+
+
+def test_top_level_version_reports_the_installed_implementation(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["--version"])
+    assert stopped.value.code == 0
+    assert capsys.readouterr().out.strip() == f"{cli.PROG} {__version__}"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--db", "", "stats"],
+    ["stats", "--db", "   "],
+    ["--kernel", "", "stats"],
+    ["stats", "--kernel", "\t"],
+    ["build", ""],
+    ["build", "--src", ""],
+    ["build", "--output", "   "],
+    ["build", "--kinds", "\t"],
+])
+def test_empty_selectors_and_build_values_are_rejected_by_argparse(argv, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(argv)
+    assert stopped.value.code == 2
+    assert "must not be empty" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("command", "phrases"), [
+    ("build", ["keep a downloaded source archive", "suppress download"]),
+    ("find", ["complete, case-sensitive name", "name prefix"]),
+    ("subsystems", ["only names matching", "sort key", "max subsystems"]),
+    ("subsystem", ["max directory rows", "does not limit the --files list"]),
+    ("info", ["maximum ownership matches", "ambiguous target candidates"]),
+    ("tree", ["maximum directory depth"]),
+])
+def test_high_use_command_help_explains_its_options(command, phrases, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main([command, "--help"])
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    for phrase in phrases:
+        assert phrase in help_text
+
+
+def test_lifecycle_index_selection_after_subcommand_is_unrecognized(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["build", "--db", "study.db"])
+    assert "unrecognized arguments: --db" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("argv", [
     ["--db", "one.db", "--kernel", "6.12", "stats"],
     ["--db", "one.db", "stats", "--kernel", "6.12"],
@@ -84,16 +235,36 @@ def test_index_selection_options_are_unambiguous(capsys, argv):
     assert "mutually exclusive" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("argv", [
-    ["--kernel", "6.12", "indexes"],
-    ["indexes", "--db", "ignored.db"],
-    ["build", "--kernel", "6.12"],
-    ["--db", "ignored.db", "versions"],
+@pytest.mark.parametrize(("argv", "message"), [
+    (["--kernel", "6.12", "indexes"], "does not apply"),
+    (["indexes", "--db", "ignored.db"], "unrecognized arguments"),
+    (["build", "--kernel", "6.12"], "unrecognized arguments"),
+    (["--db", "ignored.db", "versions"], "does not apply"),
 ])
-def test_index_selectors_are_rejected_where_they_have_no_effect(capsys, argv):
+def test_index_selectors_are_rejected_where_they_have_no_effect(
+        capsys, argv, message):
     with pytest.raises(SystemExit):
         cli.main(argv)
-    assert "does not apply" in capsys.readouterr().err
+    assert message in capsys.readouterr().err
+
+
+def test_stats_reports_parse_input_outcomes(mini_index, capsys):
+    conn = sqlite3.connect(mini_index)
+    parsed = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE index_status='parsed'").fetchone()[0]
+    conn.close()
+
+    assert cli.main(["--db", str(mini_index), "stats"]) == 0
+    assert f"parse inputs {parsed:,} parsed, 0 skipped, 0 failed" in (
+        capsys.readouterr().out)
+
+    assert cli.main([
+        "--db", str(mini_index), "stats", "--format", "json",
+    ]) == 0
+    payload = __import__("json").loads(capsys.readouterr().out)
+    assert payload["parse_inputs"] == {
+        "parsed": parsed, "skipped": 0, "failed": 0, "oversized": 0,
+    }
 
 
 @pytest.mark.parametrize("payload", [
@@ -127,6 +298,25 @@ def test_use_rejects_an_unusable_index_before_pinning(home, capsys):
 
     with pytest.raises(SystemExit):
         cli.main(["use", "broken"])
+    assert config.get_default_version() is None
+    assert "not a usable index" in capsys.readouterr().err
+
+
+def test_use_does_not_pin_an_index_removed_while_waiting_for_its_lock(
+        home, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    index = home / "indexes" / "7.2.db"
+
+    @contextmanager
+    def removed_before_lock(path):
+        assert path == index
+        path.unlink()
+        yield
+
+    monkeypatch.setattr(kernelsrc, "output_lock", removed_before_lock)
+    with pytest.raises(SystemExit):
+        cli.main(["use", "7.2"])
     assert config.get_default_version() is None
     assert "not a usable index" in capsys.readouterr().err
 
@@ -224,13 +414,307 @@ def test_remove_deletes_the_index_and_clears_a_matching_pin(home, capsys):
 
 
 def test_remove_with_source_and_duplicate_specs(home, capsys):
-    (home / "kernels" / "linux-7.2").mkdir(parents=True)
-    (home / "kernels" / "linux-7.2" / "MAINTAINERS").write_text("x")
+    _fake_source(home, "7.2")
     # Prefix + exact must not fail on the second name after the first delete.
     assert cli.main(["remove", "7.2", "7.2", "--source"]) == 0
     assert not (home / "indexes" / "7.2.db").is_file()
     assert not (home / "kernels" / "linux-7.2").exists()
     assert "removed source" in capsys.readouterr().out
+
+
+def test_remove_source_failure_keeps_index_and_pin_for_a_retry(
+        home, monkeypatch, capsys):
+    from kernel_atlas import cli_lifecycle
+
+    index = home / "indexes" / "7.2.db"
+    tree = _fake_source(home, "7.2")
+    config.set_default_version("7.2")
+    monkeypatch.setattr(
+        cli_lifecycle.shutil, "rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError("tree is busy")),
+    )
+
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+
+    assert index.is_file()
+    marker = kernelsrc.source_identity_marker("7.2")
+    assert marker is not None and marker.removing
+    assert not tree.exists()
+    assert kernelsrc.source_quarantine_path(marker).is_dir()
+    assert config.get_default_version() == "7.2"
+    error = capsys.readouterr().err
+    assert "could not remove source" in error
+    assert "correct the errors and retry" in error
+
+
+def test_remove_source_finishes_before_deleting_its_authorizing_index(
+        home, monkeypatch):
+    tree = _fake_source(home, "7.2")
+    original = cli._unlink_index
+
+    def checked_unlink(path):
+        assert not tree.exists()
+        return original(path)
+
+    monkeypatch.setattr(cli, "_unlink_index", checked_unlink)
+    assert cli.main(["remove", "7.2", "--source"]) == 0
+
+
+def test_remove_source_retry_survives_index_unlink_failure(
+        home, monkeypatch, capsys):
+    index = home / "indexes" / "7.2.db"
+    tree = _fake_source(home, "7.2")
+    original = cli._unlink_index
+
+    def fail(path):
+        raise PermissionError("database is in use")
+
+    monkeypatch.setattr(cli, "_unlink_index", fail)
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+    assert index.is_file() and not tree.exists()
+    marker = kernelsrc.source_identity_marker("7.2")
+    assert marker is not None and marker.removing
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli, "_unlink_index", original)
+    assert cli.main(["remove", "7.2", "--source"]) == 0
+    assert not index.exists()
+    assert kernelsrc.source_identity_marker("7.2") is None
+
+
+def test_remove_two_indexes_authorizing_the_same_source_in_one_batch(
+        home, capsys):
+    import shutil
+
+    tree = _fake_source(home, "7.2")
+    standard = home / "indexes" / "7.2.db"
+    study = home / "indexes" / "study.db"
+    shutil.copyfile(standard, study)
+
+    assert cli.main(["remove", "7.2", "study", "--source"]) == 0
+    assert not tree.exists()
+    assert not standard.exists() and not study.exists()
+    assert kernelsrc.source_identity_marker("7.2") is None
+    out = capsys.readouterr().out
+    assert "removed source" in out
+    assert "source already removed" in out
+
+
+def test_remove_index_failure_is_nonzero_and_preserves_its_pin(
+        home, monkeypatch, capsys):
+    index = home / "indexes" / "7.2.db"
+    config.set_default_version("7.2")
+
+    def fail(path):
+        raise PermissionError("database is in use")
+
+    monkeypatch.setattr(cli, "_unlink_index", fail)
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2"])
+
+    assert index.is_file()
+    assert config.get_default_version() == "7.2"
+    assert "could not remove index" in capsys.readouterr().err
+
+
+def test_remove_rechecks_source_authorization_after_acquiring_output_lock(
+        home, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    from kernel_atlas import kernelsrc
+
+    index = home / "indexes" / "7.2.db"
+    managed = _fake_source(home, "7.2")
+    replacement_tree = home / "someone-elses-tree"
+
+    @contextmanager
+    def changed_while_waiting(path):
+        assert path == index
+        writer = sqlite3.connect(index)
+        writer.execute(
+            "UPDATE meta SET value=? WHERE key='tree_path'",
+            (str(replacement_tree),),
+        )
+        writer.commit()
+        writer.close()
+        yield
+
+    monkeypatch.setattr(kernelsrc, "output_lock", changed_while_waiting)
+
+    assert cli.main(["remove", "7.2", "--source"]) == 0
+    assert managed.is_dir()
+    assert not index.exists()
+    assert "index changed" in capsys.readouterr().out
+
+
+def test_remove_source_refuses_a_replacement_tree_at_the_recorded_path(
+        home, capsys):
+    index = home / "indexes" / "7.2.db"
+    replacement = _fake_source(home, "7.2", reports="9.9")
+    notes = replacement / "personal-notes"
+    notes.write_text("keep this\n")
+    config.set_default_version("7.2")
+
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+
+    assert notes.read_text() == "keep this\n"
+    assert index.is_file()
+    assert config.get_default_version() == "7.2"
+    error = capsys.readouterr().err
+    assert "not the pristine tool-owned source" in error
+    assert "index kept" in error
+
+
+def test_remove_source_refuses_same_version_replacement_with_new_identity(
+        home, capsys):
+    import shutil
+
+    index = home / "indexes" / "7.2.db"
+    original = _fake_source(home, "7.2")
+    shutil.rmtree(original)
+    replacement = _fake_source(home, "7.2", authorize=False)
+    notes = replacement / "personal-notes"
+    notes.write_text("keep this\n")
+
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+
+    assert notes.read_text() == "keep this\n"
+    assert index.is_file()
+    assert "not the pristine tool-owned source" in capsys.readouterr().err
+
+
+def test_partial_source_removal_can_resume_with_the_same_nonce(
+        home, monkeypatch, capsys):
+    import shutil
+
+    from kernel_atlas import cli_lifecycle
+
+    index = home / "indexes" / "7.2.db"
+    tree = _fake_source(home, "7.2")
+    original_rmtree = shutil.rmtree
+
+    def partial(path):
+        (path / "MAINTAINERS").unlink()
+        (path / "Makefile").unlink()
+        raise PermissionError("tree became busy")
+
+    monkeypatch.setattr(cli_lifecycle.shutil, "rmtree", partial)
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+    assert index.is_file() and not tree.exists()
+    marker = kernelsrc.source_identity_marker("7.2")
+    assert marker is not None and marker.removing
+    assert kernelsrc.source_quarantine_path(marker).is_dir()
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli_lifecycle.shutil, "rmtree", original_rmtree)
+    assert cli.main(["remove", "7.2", "--source"]) == 0
+    assert not index.exists() and not tree.exists()
+    assert kernelsrc.source_identity_marker("7.2") is None
+
+
+def test_source_retry_never_deletes_a_new_conventional_tree(
+        home, monkeypatch, capsys):
+    import shutil
+
+    from kernel_atlas import cli_lifecycle
+
+    index = home / "indexes" / "7.2.db"
+    tree = _fake_source(home, "7.2")
+    original_rmtree = shutil.rmtree
+    monkeypatch.setattr(
+        cli_lifecycle.shutil, "rmtree",
+        lambda path: (_ for _ in ()).throw(PermissionError("busy")),
+    )
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+    marker = kernelsrc.source_identity_marker("7.2")
+    assert marker is not None and marker.removing
+    assert kernelsrc.source_quarantine_path(marker).is_dir()
+
+    tree.mkdir()
+    notes = tree / "new-research.txt"
+    notes.write_text("created after the failed removal\n")
+    monkeypatch.setattr(cli_lifecycle.shutil, "rmtree", original_rmtree)
+    capsys.readouterr()
+
+    assert cli.main(["remove", "7.2", "--source"]) == 0
+    assert notes.read_text() == "created after the failed removal\n"
+    assert not index.exists()
+
+
+def test_source_entry_swap_before_quarantine_is_preserved(
+        home, monkeypatch, tmp_path, capsys):
+    tree = _fake_source(home, "7.2")
+    index = home / "indexes" / "7.2.db"
+    original_tree = tmp_path / "original-tool-tree"
+    victim = tmp_path / "personal-tree"
+    victim.mkdir()
+    (victim / "notes").write_text("keep this\n")
+    actual_rename = kernelsrc._rename_noreplace
+    raced = False
+
+    def swapping_rename(source, destination):
+        nonlocal raced
+        if Path(source) == tree and not raced:
+            tree.rename(original_tree)
+            victim.rename(tree)
+            raced = True
+        actual_rename(source, destination)
+
+    monkeypatch.setattr(kernelsrc, "_rename_noreplace", swapping_rename)
+
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+
+    assert raced
+    assert (tree / "notes").read_text() == "keep this\n"
+    assert original_tree.is_dir()
+    assert index.is_file()
+    assert "nothing was deleted" in capsys.readouterr().err
+
+
+def test_remove_source_preserves_a_replacement_symlink_and_its_target(
+        home, tmp_path, capsys):
+    index = home / "indexes" / "7.2.db"
+    link = home / "kernels" / "linux-7.2"
+    original = _fake_source(home, "7.2")
+    import shutil
+    shutil.rmtree(original)
+    victim = tmp_path / "personal-tree"
+    victim.mkdir()
+    notes = victim / "notes"
+    notes.write_text("keep this\n")
+    try:
+        link.symlink_to(victim, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(SystemExit):
+        cli.main(["remove", "7.2", "--source"])
+    assert link.is_symlink()
+    assert notes.read_text() == "keep this\n"
+    assert index.exists()
+    assert "index kept" in capsys.readouterr().err
+
+
+def test_remove_exact_dangling_index_alias_unlinks_the_alias(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    alias = config.index_path("dangling")
+    alias.parent.mkdir()
+    try:
+        alias.symlink_to(tmp_path / "missing" / "study.db")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    assert cli.main(["remove", "dangling"]) == 0
+    assert not alias.is_symlink()
+    assert "removed index" in capsys.readouterr().out
 
 
 def test_remove_source_uses_recorded_version_not_filename_alias(
@@ -242,8 +726,8 @@ def test_remove_source_uses_recorded_version_not_filename_alias(
     indexes.mkdir()
     alias_index = indexes / "alias.db"
     shutil.copy(mini_index, alias_index)
-    managed = tmp_path / "kernels" / "linux-6.12.104"
-    managed.mkdir(parents=True)
+    managed = _fake_source(
+        tmp_path, "6.12.104", authorize=False)
     unrelated = tmp_path / "kernels" / "linux-alias"
     unrelated.mkdir()
     conn = sqlite3.connect(alias_index)
@@ -254,6 +738,7 @@ def test_remove_source_uses_recorded_version_not_filename_alias(
     ])
     conn.commit()
     conn.close()
+    _authorize_source(tmp_path, "6.12.104", managed, index=alias_index)
 
     assert cli.main(["remove", "alias", "--source"]) == 0
     assert not alias_index.exists()
@@ -351,6 +836,40 @@ def test_negative_limit_is_rejected(capsys):
     assert ">= 0" in err or "invalid" in err.lower()
 
 
+@pytest.mark.parametrize("command", [
+    ["ls", "fs", "-n"],
+    ["find", "ext4", "-n"],
+    ["tree", "fs", "-d"],
+])
+def test_sqlite_bound_counts_reject_unreasonably_large_values_cleanly(
+        mini_index, capsys, command):
+    with pytest.raises(SystemExit):
+        cli.main([
+            "--db", str(mini_index), *command,
+            str(cli._MAX_CLI_COUNT + 1),
+        ])
+    error = capsys.readouterr().err
+    assert f"<= {cli._MAX_CLI_COUNT}" in error
+    assert "Traceback" not in error
+
+
+def test_build_jobs_have_a_rational_upper_bound(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["build", "--jobs", str(cli._MAX_JOBS + 1)])
+    assert f"<= {cli._MAX_JOBS}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("value", "message"), [
+    (",", "at least one"),
+    ("function,function", "duplicate symbol kind"),
+])
+def test_build_rejects_empty_or_duplicate_kind_lists_before_fetching(
+        value, message, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["build", "--kinds", value])
+    assert message in capsys.readouterr().err
+
+
 def test_huge_target_line_is_a_clean_error(mini_index, capsys):
     with pytest.raises(SystemExit):
         cli.main(["--db", str(mini_index), "info",
@@ -385,6 +904,19 @@ def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
     assert "MEMORY MANAGEMENT" in names
     assert "elixir.bootlin.com" in data["links"]["elixir"]
     assert "is_static" not in data["target"]
+
+
+def test_stats_and_check_expose_call_occurrence_totals(mini_index, capsys):
+    import json
+
+    assert cli.main(["--db", str(mini_index), "stats"]) == 0
+    assert "call sites" in capsys.readouterr().out
+
+    assert cli.main([
+        "--db", str(mini_index), "check", "--format", "json",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["call_occurrences"] >= payload["calls"] > 0
 
 
 def test_co_primary_file_owners_are_explicit_in_info_and_relationships(
@@ -847,6 +1379,38 @@ def test_web_and_docs_commands(mini_index, capsys):
     assert "using mm/" not in out
 
 
+def test_web_rejects_links_for_a_custom_source_index(
+        mini_index, tmp_path, capsys):
+    import shutil
+
+    copied = tmp_path / "custom-source.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute(
+        "UPDATE meta SET value=? WHERE key='source'",
+        (str(tmp_path / "vendor-linux"),),
+    )
+    writer.commit()
+    writer.close()
+
+    with pytest.raises(SystemExit):
+        cli.main([
+            "--db", str(copied), "web", "tcp_sendmsg", "--url", "elixir",
+        ])
+    error = capsys.readouterr().err
+    assert "no upstream release-reference URLs" in error
+    assert "use 'path' or 'show'" in error
+    assert "Traceback" not in error
+
+    for command in (
+            ["info", "tcp_sendmsg"],
+            ["struct", "ext4_sb_info"],
+            ["docs", "mm"]):
+        assert cli.main(["--db", str(copied), *command]) == 0
+        output = capsys.readouterr().out
+        assert f"{cli.PROG} --db {copied.resolve()} web " not in output
+
+
 def test_docs_bare_name_picks_the_area_directory_not_a_symbol(mini_index, capsys):
     """`mm` is both the top-level directory and arch/x86/mm/."""
     from kernel_atlas.cli import _resolve_area
@@ -984,6 +1548,30 @@ def test_locate_lists_every_built_index(mini_index, tmp_path, monkeypatch, capsy
     assert rows[1]["version"] == "6.12.104" and not rows[1]["active"]
 
 
+def test_locate_does_not_turn_a_failed_line_selector_into_a_file(
+        mini_index, capsys):
+    import json
+
+    target = "fs/ext4/inode.c:9999"
+    assert cli.main([
+        "--db", str(mini_index), "locate", target, "--format", "json",
+    ]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["found"] is False
+    assert "no symbol spans line 9999" in row["note"]
+
+    assert cli.main(["--db", str(mini_index), "locate", target]) == 0
+    output = capsys.readouterr().out
+    assert "no symbol spans line 9999" in output
+
+
+def test_locate_table_exposes_ambiguous_resolution_notes(mini_index, capsys):
+    assert cli.main(["--db", str(mini_index), "locate", "super.c"]) == 0
+    output = capsys.readouterr().out
+    assert "fs/ext4/super.c" in output
+    assert "2 files named 'super.c'" in output
+
+
 def test_pin_selects_index_source_tree_and_locate_home(
         mini_index, mini_tree, tmp_path, monkeypatch, capsys):
     """Index selection changes URLs, but source lines use the recorded tree.
@@ -1059,6 +1647,17 @@ def test_tree_wide_symbol_listing_requires_a_limit(mini_index, capsys):
     assert "-n" in capsys.readouterr().err
     assert cli.main(["--db", str(mini_index), "siblings", "mm",
                      "--level", "tree", "--kinds", "function", "-n", "5"]) == 0
+
+
+@pytest.mark.parametrize("target", [".", "Makefile"])
+def test_root_subtree_symbol_listing_requires_a_limit(
+        mini_index, target, capsys):
+    with pytest.raises(SystemExit):
+        cli.main([
+            "--db", str(mini_index), "siblings", target,
+            "--level", "subtree", "--kinds", "all",
+        ])
+    assert "needs -n N" in capsys.readouterr().err
 
 
 def test_include_self_is_in_addition_to_the_sibling_limit(mini_index, capsys):
@@ -1171,6 +1770,33 @@ def test_listing_json_columns_shape_each_row(mini_index, capsys):
     assert row["subsystem"] == "MEMORY MANAGEMENT"
 
 
+@pytest.mark.parametrize("extra", [
+    ["--format", "plain", "--columns", "name"],
+    ["--format", "names", "--with-subsystem"],
+    ["--format", "tree", "--columns", "subsystem"],
+])
+def test_fixed_shape_listing_formats_reject_column_controls(
+        mini_index, capsys, extra):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "find", "ext4", *extra])
+    error = capsys.readouterr().err
+    assert "does not apply" in error
+
+
+def test_plain_find_does_not_compute_invisible_subsystems(
+        mini_index, monkeypatch, capsys):
+    from kernel_atlas import query
+
+    monkeypatch.setattr(
+        query, "annotate_subsystems",
+        lambda *args, **kwargs: pytest.fail("invisible subsystem annotation"),
+    )
+    assert cli.main([
+        "--db", str(mini_index), "find", "ext4", "--format", "plain",
+    ]) == 0
+    assert "fs/ext4" in capsys.readouterr().out
+
+
 def test_empty_columns_is_a_clear_error(mini_index, capsys):
     with pytest.raises(SystemExit):
         cli.main(["--db", str(mini_index), "ls", "mm", "-c", ","])
@@ -1201,7 +1827,8 @@ def test_no_call_graph_rebuild_hints_target_the_selected_custom_database(
     writer = sqlite3.connect(copied)
     writer.execute("DELETE FROM calls")
     writer.execute(
-        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+        "UPDATE meta SET value='0' WHERE key='has_calls'"
+        " OR key LIKE 'n_calls%' OR key='n_call_occurrences'")
     writer.commit()
     tree = writer.execute(
         "SELECT value FROM meta WHERE key='tree_path'").fetchone()[0]
@@ -1231,7 +1858,8 @@ def test_no_call_graph_rebuild_hint_preserves_a_selected_filename_alias(
     writer = sqlite3.connect(selected)
     writer.execute("DELETE FROM calls")
     writer.execute(
-        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+        "UPDATE meta SET value='0' WHERE key='has_calls'"
+        " OR key LIKE 'n_calls%' OR key='n_call_occurrences'")
     tree = writer.execute(
         "SELECT value FROM meta WHERE key='tree_path'").fetchone()[0]
     writer.commit()
@@ -1265,7 +1893,8 @@ def test_no_call_graph_advice_does_not_replace_missing_custom_source(
     writer = sqlite3.connect(copied)
     writer.execute("DELETE FROM calls")
     writer.execute(
-        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+        "UPDATE meta SET value='0' WHERE key='has_calls'"
+        " OR key LIKE 'n_calls%' OR key='n_call_occurrences'")
     writer.executemany("UPDATE meta SET value=? WHERE key=?", [
         (str(missing), "tree_path"), (str(missing), "source")])
     writer.commit()
@@ -1287,7 +1916,8 @@ def test_no_call_graph_advice_can_refetch_missing_downloaded_source(
     writer = sqlite3.connect(copied)
     writer.execute("DELETE FROM calls")
     writer.execute(
-        "UPDATE meta SET value='0' WHERE key='has_calls' OR key LIKE 'n_calls%'")
+        "UPDATE meta SET value='0' WHERE key='has_calls'"
+        " OR key LIKE 'n_calls%' OR key='n_call_occurrences'")
     writer.execute("UPDATE meta SET value=? WHERE key='tree_path'",
                    (str(tmp_path / "removed-cache"),))
     writer.commit()
@@ -1318,6 +1948,184 @@ def test_source_identity_commands_reject_unmatched_line_selector(
         cli.main(["--db", str(mini_index), command,
                   "fs/ext4/inode.c:9999"])
     assert "no symbol spans line 9999" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [
+    ["path", "super.c"],
+    ["show", "super.c", "--bare"],
+    ["web", "super.c", "--url", "elixir"],
+])
+def test_source_identity_commands_reject_ambiguous_bare_files(
+        mini_index, command, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), *command])
+    error = capsys.readouterr().err
+    assert "2 files" in error
+    assert "fs/ext4/super.c" in error
+    assert "fs/btrfs/super.c" in error
+
+
+@pytest.mark.parametrize("line", ["1", "01", "+01"])
+@pytest.mark.parametrize("command", [
+    ["path"],
+    ["show", "--bare"],
+    ["web", "--url", "elixir"],
+    ["calls"],
+])
+def test_concrete_commands_reject_ambiguous_basename_line_selectors(
+        mini_index, line, command, capsys):
+    with pytest.raises(SystemExit):
+        cli.main([
+            "--db", str(mini_index), command[0], f"super.c:{line}",
+            *command[1:],
+        ])
+    error = capsys.readouterr().err
+    assert "2 files named 'super.c'" in error
+    assert "full indexed path:line" in error
+    assert f"fs/ext4/super.c:{line}" in error
+    assert f"fs/btrfs/super.c:{line}" in error
+
+
+def test_struct_rejects_an_ambiguous_basename_line_selector(
+        mini_index, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(mini_index), "struct", "super.c:20"])
+    error = capsys.readouterr().err
+    assert "2 files named 'super.c'" in error
+    assert "fs/ext4/super.c:20" in error
+    assert "fs/btrfs/super.c:20" in error
+
+
+def test_full_path_line_selectors_remain_exact_for_concrete_commands(
+        mini_index, capsys):
+    assert cli.main([
+        "--db", str(mini_index), "path", "fs/btrfs/super.c:1", "--line",
+    ]) == 0
+    assert "fs/btrfs/super.c:1" in capsys.readouterr().out
+
+    assert cli.main([
+        "--db", str(mini_index), "show", "fs/btrfs/super.c:1", "--bare",
+    ]) == 0
+    assert "btrfs_mount" in capsys.readouterr().out
+
+    assert cli.main([
+        "--db", str(mini_index), "web", "fs/btrfs/super.c:1",
+        "--url", "elixir",
+    ]) == 0
+    assert "fs/btrfs/super.c#L1" in capsys.readouterr().out
+
+    assert cli.main([
+        "--db", str(mini_index), "calls", "fs/btrfs/super.c:1",
+        "--format", "json",
+    ]) == 0
+    assert capsys.readouterr().out.strip() == "[]"
+
+    assert cli.main([
+        "--db", str(mini_index), "struct", "fs/ext4/super.c:20",
+        "--format", "json",
+    ]) == 0
+    assert '"name": "ext4_sb_info"' in capsys.readouterr().out
+
+
+def test_numeric_directory_name_is_never_mistaken_for_a_line_selector(
+        mini_index, mini_tree, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "numeric-directory.db"
+    copied_tree = tmp_path / "linux-6.12.104"
+    shutil.copy(mini_index, copied)
+    shutil.copytree(mini_tree, copied_tree)
+    (copied_tree / "drivers/8250").mkdir()
+
+    writer = sqlite3.connect(copied)
+    writer.execute(
+        "INSERT INTO dirs(path,name,parent_id,depth,n_files,n_subdirs,"
+        " n_files_recursive) VALUES ('drivers/8250','8250',"
+        " (SELECT id FROM dirs WHERE path='drivers'),2,0,0,0)"
+    )
+    writer.execute(
+        "UPDATE dirs SET n_subdirs=n_subdirs+1 WHERE path='drivers'"
+    )
+    writer.execute(
+        "UPDATE meta SET value=printf('%d',CAST(value AS INTEGER)+1)"
+        " WHERE key='n_dirs'"
+    )
+    writer.execute(
+        "UPDATE meta SET value=? WHERE key='tree_path'", (str(copied_tree),)
+    )
+    writer.commit()
+    writer.close()
+
+    assert cli.main(["--db", str(copied), "locate", "8250", "-f", "json"]) == 0
+    located = json.loads(capsys.readouterr().out)[0]
+    assert located["found"] is True
+    assert located["kind"] == "dir"
+    assert located["path"] == "drivers/8250"
+
+    assert cli.main(["--db", str(copied), "path", "8250"]) == 0
+    assert capsys.readouterr().out.strip().endswith("drivers/8250")
+
+    assert cli.main([
+        "--db", str(copied), "web", "8250", "--url", "elixir",
+    ]) == 0
+    assert "/source/drivers/8250" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        cli.main(["--db", str(copied), "show", "8250"])
+    error = capsys.readouterr().err
+    assert "is a directory" in error
+    assert "spans line 8250" not in error
+
+
+def test_calls_output_exposes_mixed_occurrence_counts(
+        mini_index, tmp_path, capsys):
+    import json
+    import shutil
+
+    copied = tmp_path / "mixed-call-output.db"
+    shutil.copy(mini_index, copied)
+    writer = sqlite3.connect(copied)
+    writer.execute(
+        "UPDATE calls SET direct_count=2,indirect_count=1,macro_count=1"
+        " WHERE callee='ext4_get_block'"
+    )
+    writer.execute(
+        "UPDATE meta SET value=(SELECT CAST(SUM(direct_count+indirect_count+"
+        " macro_count) AS TEXT) FROM calls) WHERE key='n_call_occurrences'"
+    )
+    writer.commit()
+    writer.close()
+
+    assert cli.main([
+        "--db", str(copied), "calls", "ext4_bmap", "--format", "json",
+    ]) == 0
+    outgoing = json.loads(capsys.readouterr().out)[0]
+    assert outgoing["direct_count"] == 2
+    assert outgoing["indirect_count"] == 1
+    assert outgoing["macro_count"] == 1
+
+    assert cli.main([
+        "--db", str(copied), "calls", "ext4_bmap",
+    ]) == 0
+    table = capsys.readouterr().out
+    assert "OCCURRENCES" in table
+    assert "2d 1i 1m" in table
+
+    assert cli.main([
+        "--db", str(copied), "calls", "ext4_get_block", "--callers",
+        "--format", "json",
+    ]) == 0
+    incoming = json.loads(capsys.readouterr().out)[0]
+    assert incoming["name"] == "ext4_bmap"
+    assert incoming["direct_count"] == 2
+    assert incoming["indirect_count"] == 1
+    assert incoming["macro_count"] == 1
+
+    assert cli.main([
+        "--db", str(copied), "calls", "ext4_get_block", "--callers",
+    ]) == 0
+    assert "2d 1i 1m" in capsys.readouterr().out
 
 
 def test_calls_ambiguity_recommends_line_for_same_file_definitions(
@@ -1585,6 +2393,180 @@ def test_build_reports_expected_indexer_failures_without_a_traceback(
     assert "Traceback" not in err
 
 
+def test_build_rechecks_output_existence_under_its_publication_lock(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    from kernel_atlas import kernelsrc
+
+    output = tmp_path / "study.db"
+
+    @contextmanager
+    def racing_output_lock(path):
+        assert path == output
+        path.write_bytes(b"published by another build")
+        yield
+
+    monkeypatch.setattr(kernelsrc, "output_lock", racing_output_lock)
+    monkeypatch.setattr(
+        cli.indexer, "build",
+        lambda *args, **kwargs: pytest.fail("existing output must not be rebuilt"),
+    )
+
+    with pytest.raises(SystemExit):
+        cli.main([
+            "build", "--src", str(mini_tree), "--output", str(output),
+            "--quiet",
+        ])
+
+    assert output.read_bytes() == b"published by another build"
+    assert "index already exists" in capsys.readouterr().err
+
+
+def test_managed_build_holds_source_then_output_locks_through_publication(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    from kernel_atlas import indexer, kernelsrc
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
+    output = tmp_path / "study.db"
+    source_url = "https://cdn.kernel.org/example/linux-6.12.104.tar.xz"
+    monkeypatch.setattr(
+        kernelsrc, "resolve_version",
+        lambda spec: kernelsrc.Release(
+            "longterm", "6.12.104", source_url, None),
+    )
+    state = {"source": False, "output": False}
+    events = []
+
+    @contextmanager
+    def source_lock(version):
+        assert version == "6.12.104"
+        assert not state["output"]
+        state["source"] = True
+        events.append("source+")
+        try:
+            yield
+        finally:
+            events.append("source-")
+            state["source"] = False
+
+    @contextmanager
+    def output_lock(path):
+        assert state["source"]
+        assert path == output
+        state["output"] = True
+        events.append("output+")
+        try:
+            yield
+        finally:
+            events.append("output-")
+            state["output"] = False
+
+    def ensure_source(version, **kwargs):
+        assert state == {"source": True, "output": True}
+        events.append("source-ready")
+        return mini_tree
+
+    def build(tree, out, version, **kwargs):
+        assert state == {"source": True, "output": True}
+        events.append("published")
+        out.write_bytes(b"index")
+        return indexer.BuildStats()
+
+    monkeypatch.setattr(kernelsrc, "source_lock", source_lock)
+    monkeypatch.setattr(kernelsrc, "output_lock", output_lock)
+    monkeypatch.setattr(kernelsrc, "ensure_source", ensure_source)
+    monkeypatch.setattr(cli.indexer, "build", build)
+
+    assert cli.main([
+        "build", "lts", "--output", str(output), "--quiet",
+    ]) == 0
+    capsys.readouterr()
+    assert events == [
+        "source+", "output+", "source-ready", "published", "output-", "source-",
+    ]
+
+
+def test_custom_build_of_a_managed_cache_path_also_holds_its_source_lock(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    import shutil
+    from contextlib import contextmanager
+
+    from kernel_atlas import indexer, kernelsrc
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
+    managed = config.source_path("6.12.104")
+    shutil.copytree(mini_tree, managed)
+    output = tmp_path / "study.db"
+    locked = False
+
+    @contextmanager
+    def source_lock(version):
+        nonlocal locked
+        assert version == "6.12.104"
+        locked = True
+        try:
+            yield
+        finally:
+            locked = False
+
+    def build(tree, out, version, **kwargs):
+        assert locked
+        out.write_bytes(b"index")
+        return indexer.BuildStats()
+
+    monkeypatch.setattr(kernelsrc, "source_lock", source_lock)
+    monkeypatch.setattr(cli.indexer, "build", build)
+
+    assert cli.main([
+        "build", "local-study", "--src", str(managed),
+        "--output", str(output), "--quiet",
+    ]) == 0
+    capsys.readouterr()
+    assert not locked
+
+
+def test_custom_build_symlink_alias_locks_the_canonical_managed_tree(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    import shutil
+    from contextlib import contextmanager
+
+    from kernel_atlas import indexer
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
+    managed = config.source_path("6.12.104")
+    shutil.copytree(mini_tree, managed)
+    alias = home / "kernels" / "linux-study"
+    try:
+        alias.symlink_to(managed, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    seen = []
+
+    @contextmanager
+    def source_lock(version):
+        seen.append(version)
+        yield
+
+    def build(tree, out, version, **kwargs):
+        out.write_bytes(b"index")
+        return indexer.BuildStats()
+
+    monkeypatch.setattr(kernelsrc, "source_lock", source_lock)
+    monkeypatch.setattr(cli.indexer, "build", build)
+    output = tmp_path / "study.db"
+    assert cli.main([
+        "build", "--src", str(alias), "--output", str(output), "--quiet",
+    ]) == 0
+    capsys.readouterr()
+    assert seen == ["6.12.104"]
+
+
 def test_check_reports_invalid_sqlite_value_types_without_a_traceback(
         mini_index, tmp_path, capsys):
     import shutil
@@ -1646,9 +2628,87 @@ def test_custom_build_output_is_not_blocked_by_the_managed_index(
     assert cli.main(["build", "lts", "--output", str(custom), "--quiet"]) == 0
     out = capsys.readouterr().out
     assert custom.read_bytes() == b"index"
-    assert seen == {"source_url": source_url, "metadata_source": source_url}
+    assert seen == {
+        "source_url": source_url,
+        "metadata_source": str(mini_tree),
+    }
     assert f"{cli.PROG} --db {custom} info mm" in out
     assert f"{cli.PROG} --db {custom} siblings mm/page_alloc.c" in out
+
+
+def test_modified_managed_cache_is_recorded_as_local_source(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    import shutil
+
+    from kernel_atlas import indexer
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
+    managed = config.source_path("6.12.104")
+    shutil.copytree(mini_tree, managed)
+    source_url = "https://cdn.kernel.org/example/linux-6.12.104.tar.xz"
+    kernelsrc._write_source_identity(
+        "6.12.104", managed, source_url, authoritative=True)
+    (managed / "README.local").write_text("study edit\n")
+    monkeypatch.setattr(
+        kernelsrc, "resolve_version",
+        lambda spec: kernelsrc.Release(
+            "longterm", "6.12.104", source_url, None),
+    )
+    monkeypatch.setattr(kernelsrc, "ensure_source", lambda *a, **kw: managed)
+    seen = {}
+
+    def build(tree, out, version, **kwargs):
+        seen.update(kwargs)
+        out.write_bytes(b"index")
+        return indexer.BuildStats()
+
+    monkeypatch.setattr(cli.indexer, "build", build)
+    output = tmp_path / "modified.db"
+    assert cli.main([
+        "build", "6.12.104", "--output", str(output), "--quiet",
+    ]) == 0
+    capsys.readouterr()
+    assert seen["source"] == str(managed)
+    assert seen["managed_tree_identity"] is None
+
+
+def test_managed_source_change_during_build_prevents_publication(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    import shutil
+
+    from kernel_atlas import indexer
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
+    managed = config.source_path("6.12.104")
+    shutil.copytree(mini_tree, managed)
+    source_url = "https://cdn.kernel.org/example/linux-6.12.104.tar.xz"
+    kernelsrc._write_source_identity(
+        "6.12.104", managed, source_url, authoritative=True)
+    monkeypatch.setattr(
+        kernelsrc, "resolve_version",
+        lambda spec: kernelsrc.Release(
+            "longterm", "6.12.104", source_url, None),
+    )
+    monkeypatch.setattr(kernelsrc, "ensure_source", lambda *a, **kw: managed)
+
+    def build(tree, out, version, **kwargs):
+        (tree / "README.changed").write_text("changed during build\n")
+        kwargs["pre_publish"]()
+        out.write_bytes(b"must not publish")
+        return indexer.BuildStats()
+
+    monkeypatch.setattr(cli.indexer, "build", build)
+    output = tmp_path / "changed.db"
+    with pytest.raises(SystemExit):
+        cli.main([
+            "build", "6.12.104", "--output", str(output), "--quiet",
+        ])
+
+    assert not output.exists()
+    assert "managed source changed while the index was built" in (
+        capsys.readouterr().err)
 
 
 def test_stale_recorded_source_is_not_replaced_by_same_version_tree(

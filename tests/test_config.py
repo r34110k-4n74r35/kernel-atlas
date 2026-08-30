@@ -60,12 +60,94 @@ def test_vendor_version_is_filename_safe(monkeypatch, tmp_path):
             == tmp_path / "indexes" / "6.6.12-acme+debug.db")
 
 
-def test_unsafe_hand_edited_pin_is_ignored(monkeypatch, tmp_path):
+def test_list_indexes_excludes_directories_and_dangling_symlinks(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    indexes = config.index_dir()
+    indexes.mkdir()
+    regular = indexes / "7.2.db"
+    regular.write_bytes(b"not necessarily valid SQLite")
+    (indexes / "directory.db").mkdir()
+    dangling = indexes / "dangling.db"
+    try:
+        dangling.symlink_to(tmp_path / "missing.db")
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    assert config.list_indexes() == [regular]
+
+
+def test_absent_pin_is_the_only_no_pin_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    assert config.get_default_version() is None
+
+
+@pytest.mark.parametrize("contents", ["", "\n", "/tmp/not-an-index\n"])
+def test_invalid_hand_edited_pin_is_reported(monkeypatch, tmp_path, contents):
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
     pin = config.default_version_file()
     pin.parent.mkdir(parents=True)
-    pin.write_text("/tmp/not-an-index\n", encoding="utf-8")
-    assert config.get_default_version() is None
+    pin.write_text(contents, encoding="utf-8")
+    with pytest.raises(ValueError, match="default version pin"):
+        config.get_default_version()
+
+
+def test_non_utf8_pin_is_reported_without_echoing_contents(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    pin = config.default_version_file()
+    pin.parent.mkdir(parents=True)
+    pin.write_bytes(b"sensitive-marker:\xff")
+
+    with pytest.raises(ValueError, match="not valid UTF-8") as raised:
+        config.get_default_version()
+    assert "sensitive-marker" not in str(raised.value)
+
+
+def test_pin_read_io_errors_are_not_treated_as_no_pin(monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    pin = config.default_version_file()
+    pin.mkdir(parents=True)
+
+    with pytest.raises(IsADirectoryError):
+        config.get_default_version()
+
+
+def test_set_default_version_replaces_a_leaf_symlink_without_writing_target(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "home"))
+    pin = config.default_version_file()
+    pin.parent.mkdir(parents=True)
+    victim = tmp_path / "personal-notes"
+    victim.write_text("do not overwrite\n", encoding="utf-8")
+    try:
+        pin.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    config.set_default_version("6.12.104")
+
+    assert victim.read_text(encoding="utf-8") == "do not overwrite\n"
+    assert not pin.is_symlink()
+    assert config.get_default_version() == "6.12.104"
+    assert not list(pin.parent.glob("..default-version.*.tmp"))
+
+
+def test_set_default_version_failure_preserves_complete_old_pin_and_cleans_temp(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    config.set_default_version("6.12.104")
+    pin = config.default_version_file()
+
+    def interrupted_replace(self, target):
+        assert target == pin
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(type(pin), "replace", interrupted_replace)
+    with pytest.raises(OSError, match="publication failure"):
+        config.set_default_version("7.2")
+
+    assert pin.read_text(encoding="utf-8") == "6.12.104\n"
+    assert not list(pin.parent.glob("..default-version.*.tmp"))
 
 
 def test_project_root_does_not_claim_an_unrelated_src_layout_project(

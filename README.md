@@ -14,10 +14,10 @@ file map, extracts the C symbols it can parse, and maps each path to a
 - Show me the source, an editor path, or the Elixir / docs.kernel.org page.
 - Did this symbol move between the LTS I am running and another release?
 
-Queries are local and offline. `ka web` only *prints* URLs (Bootlin Elixir,
-git.kernel.org, GitHub, docs.kernel.org).
+Queries are local and offline. `ka web` only *prints* upstream release-reference
+URLs (Bootlin Elixir, git.kernel.org, GitHub, docs.kernel.org).
 
-Examples below are from **Linux 6.18.46** (current LTS). Line numbers move
+Examples below are from **Linux 6.18.46**. Line numbers move
 between releases; `ka locate` is how you compare them.
 
 ```
@@ -65,11 +65,13 @@ net/ipv4/tcp.c:tcp_sendmsg
 
 ## Install
 
-Requires Python 3.10+ and roughly 2.5 GB of disk per kernel version (about
-1.6 GB of source plus a 0.7–1 GB index; `--with-calls` is the larger end).
+Requires Python 3.10+ and roughly 3.5 GB of free disk per kernel version. A
+recent kernel uses about 1.7 GB for source and 1.5 GB for a full call-enabled
+index; exact sizes vary by release and selected symbol kinds.
 
 ```bash
-git clone <this repo> && cd kernel-atlas
+git clone https://github.com/r34110k-4n74r35/kernel-atlas.git
+cd kernel-atlas
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
@@ -111,18 +113,22 @@ ka check                      # deep-check the active index
 dmesg | ka trace              # map a backtrace to subsystems
 ```
 
-Listing commands print `[Linux 6.18.46]` so the output always names the index
-that answered.
+Default human-readable listing output prints `[Linux 6.18.46]` so it names the
+index that answered. JSON rows carry an `index` field; the intentionally
+index-free `names`, `plain`, and CSV forms are described under
+[Controlling the output](#controlling-the-output).
 
 ## Where everything lives
 
-The kernel source and the index sit **inside the project directory**, not in a
-hidden cache, so the code you are studying is next to the tool:
+With the editable checkout installation above, the kernel source and index sit
+**inside the project directory**, so the code you are studying is next to the
+tool:
 
 ```
 kernel-atlas/
 ├── kernels/
-│   └── linux-6.18.46/      <- real kernel tree: open it, grep it
+│   ├── linux-6.18.46/              <- real kernel tree: open it, grep it
+│   └── .linux-6.18.46.source.json <- identity for a downloaded tree
 ├── indexes/
 │   ├── 6.18.46.db
 │   └── .default-version    <- written by `ka use`, gitignored
@@ -133,7 +139,12 @@ You can keep several versions at once (`kernels/linux-7.2/`, `indexes/7.2.db`,
 …). `kernels/` and `indexes/` are gitignored. Point an editor or `grep` at
 `kernels/linux-*/`, or let `ka path` hand you absolute paths into it.
 
-Set `KERNEL_ATLAS_HOME` if you want the data on another disk:
+The source-identity sidecar is created only for a tree downloaded and published
+by kernel-atlas; a custom `--src` build neither creates one nor records deletion
+authorization from one. A normal package installation that is not running from
+its checkout defaults to
+`~/.kernel-atlas/`. Set `KERNEL_ATLAS_HOME` to choose the data root explicitly,
+including when you want the data on another disk:
 
 ```bash
 export KERNEL_ATLAS_HOME=/mnt/big-disk/kernel-atlas
@@ -164,15 +175,16 @@ ka -K 7.2 info tcp_sendmsg       # another index, this command only
 ```
 
 `ka indexes` marks the default with `*`. A pin is the file
-`indexes/.default-version`. If you `ka remove` that version, the pin is
-cleared and commands fall back to the highest remaining index (with a warning
-the first time). The displayed version comes from the index metadata; if a
-custom database filename differs, `indexes` also shows that filename as the
-selection alias.
+`indexes/.default-version`. If you `ka remove` that version, the command reports
+that it cleared the pin and later commands use the highest remaining index. If
+the database was deleted outside kernel-atlas instead, the stale pin produces a
+warning until you run `ka use --clear` or pin another index. The displayed
+version comes from the index metadata; if a custom database filename differs,
+`indexes` also shows that filename as the selection alias.
 
 ```bash
 ka remove 6.18                # delete indexes/6.18.46.db; keep the source
-ka rm 6.18.46 --source        # also delete kernels/linux-6.18.46/  (~1.6 GB)
+ka rm 6.18.46 --source        # also delete kernels/linux-6.18.46/  (~1.7 GB)
 ```
 
 `remove` (alias `rm`) resolves every name *before* deleting, so
@@ -180,11 +192,22 @@ ka rm 6.18.46 --source        # also delete kernels/linux-6.18.46/  (~1.6 GB)
 sidecar files (`.db-wal`, `.db-shm`, `.db-journal`) go with the index.
 
 The kernel source is **kept by default**: rebuilding from a tree already on
-disk takes about a minute and no download. Pass `--source` only when you also
-want that disk back. This does not ask for confirmation — the version
-argument is the confirmation. Only the matching tool-managed tree recorded by
-the index can be removed; an arbitrary custom `--src` tree is always kept.
-`ka indexes` afterwards shows what is left.
+disk avoids another download. Pass `--source` only when you also want that disk
+back. This does not ask for confirmation — the version argument is the
+confirmation. Recursive removal requires the persistent identity recorded both
+in the index and in the downloaded tree's sidecar: its nonce, root device and
+inode, and content digest must agree. An arbitrary custom `--src` tree is always
+kept. Legacy/unmarked cached trees, and indexes that already recorded an edited
+cache as local source, carry no removal authorization; `--source` keeps that
+tree while removing the index.
+
+For an authorized tree, source removal is attempted before its index is
+deleted. A replacement or subsequently edited tree is refused, and an I/O
+failure leaves the index and default pin in place. An in-progress marker lets a
+partially completed removal be retried safely with the same command. Restore an
+edited tree to its indexed digest before retrying, or handle that tree manually
+and remove only the index without `--source`. `ka indexes` afterwards shows
+what is left.
 
 ## Building indexes
 
@@ -204,17 +227,31 @@ you explicitly pass `--no-verify`. Current release-candidate archives are the
 exception: kernel.org generates them from cgit without a published checksum,
 so `build mainline` uses the release feed's HTTPS URL and prints an explicit
 warning. Extraction and indexing use unique same-directory scratch paths that
-are renamed into place only on success, so interrupted and concurrent builds
-cannot publish one another's partial work.
+are renamed into place only on success. Per-source and per-output lifecycle
+locks serialize builds and removals through final publication, so a source
+cannot be removed under active parser workers and concurrent commands cannot
+overwrite one another's completed index.
+
+A downloaded extraction receives the identity sidecar shown above. While that
+sidecar and tree still match, the full tree digest is checked before indexing
+and again immediately before the completed database is published; on a large
+kernel, those two reads add noticeable storage I/O. A checksum-verified
+kernel.org archive (or the
+explicitly warned current-RC exception) records its archive URL and enables
+upstream release-reference links. A download accepted via `--no-verify`, a
+legacy/unmarked cache, or a cache edited before the build is recorded
+conservatively as local source, so `ka web` does not claim that it matches an
+upstream tag. Edits made after a completed build do not rewrite the index
+snapshot; rebuild after changing the tree.
 
 | `build` option | Effect |
 | --- | --- |
 | `--src PATH` | index a kernel tree you already have (version from its `Makefile`, unless an explicit positional version is supplied) |
 | `--kinds LIST` | symbol kinds to index (default: `function,syscall,struct,union,enum,typedef,macro,variable`; add `prototype` if wanted) |
 | `--with-calls` | also record the call graph (enables `ka calls`; a few hundred MB extra; requires the `macro` and `variable` kinds used to prevent false identities) |
-| `--jobs N` | parser processes (default: one per CPU, max 16) |
+| `--jobs N` | parser processes (automatic default: one per CPU, capped at 16; explicit range 1–256) |
 | `--output PATH` | write the index somewhere specific |
-| `--keep-tarball` | keep the `.tar.xz` after extraction |
+| `--keep-tarball` | keep the downloaded source archive after extraction |
 | `--no-verify` | skip the checksum (not recommended) |
 | `--force` | replace an existing index (reusing its source tree when present) |
 | `--quiet` | no progress output |
@@ -223,13 +260,18 @@ With `--src`, download aliases such as `lts` are not version labels: omit the
 positional argument to detect the tree's `Makefile` version, or supply an
 explicit literal version for a vendor/local tree.
 
-Linux 6.18.46 on a laptop is about 6,000 directories, 91,000 files, 4.05
-million symbols, 3,100 subsystems, a minute to index. Most of the size is the
-kernel's ~2.9 million macros; `--kinds function,syscall,struct,enum,typedef`
-is much smaller if you do not need them. The build summary and `ka stats`
-separately report files that were parsed, skipped, or failed. Before a completed
-index becomes active, the same deep structural and semantic audit exposed by
-`ka check` is run against it.
+An output outside `indexes/` is intentionally not discovered by `ka indexes`,
+`ka use`, `ka remove`, or `-K`; the build summary prints exact `--db PATH`
+commands for querying it, and you manage that database file yourself. A custom
+filename inside `indexes/` is discoverable and acts as its selection alias.
+
+A recent kernel is roughly 6,000 directories, 95,000 files, 4.2 million
+symbols, and 3,000 MAINTAINERS sections. A full call-enabled build can take
+several minutes depending on CPU and storage. Most of the symbol count is
+macros; `--kinds function,syscall,struct,enum,typedef` is much smaller if you do
+not need them. The build summary and `ka stats` separately report files that
+were parsed, skipped, or failed. Before a completed index becomes active, the
+same deep structural and semantic audit exposed by `ka check` is run against it.
 
 ## Naming a target
 
@@ -259,7 +301,9 @@ not, instead of guessing what the whole string might mean.
 Commands which act on one concrete source identity (`calls`, `show`, `path`,
 `web`, and `struct`) do not accept that ranking as proof. Use `path:symbol` when
 same-named definitions are in different files, or `path:line` when more than
-one definition occurs in the same file. An absolute target is accepted only
+one definition occurs in the same file. A basename-only line selector such as
+`super.c:20` is not exact when several indexed files are named `super.c`; use
+the full indexed path. An absolute target is accepted only
 when it is inside the exact
 recorded source tree for the selected index and that tree is still available;
 it is normalized to the indexed relative path and may retain a `:line` or
@@ -334,24 +378,28 @@ lists the kernel root.
 
 See [Building indexes](#building-indexes) and
 [Choosing a kernel version](#choosing-a-kernel-version). After a successful
-build, two first queries are printed. By default these commands only touch
-files under `indexes/` (and, with `--source`, `kernels/`). An explicit
-`build --output PATH` may write at that path. They never change your system
-`PATH`.
+build, two starter queries are printed. A normal build uses or creates its
+source tree under `kernels/` and writes its database under `indexes/`; `use` writes the pin,
+and `remove --source` may remove both managed objects. An explicit
+`build --output PATH` writes the database at that path. These commands never
+change your system `PATH`.
 
 ### `stats`
 
-Totals for the active index, symbols by kind, and the largest top-level
+Totals for the active index—including call records and their underlying
+source-level occurrence count—symbols by kind, and the largest top-level
 directories with a one-line description (`mm` → Memory management, `net` →
-Networking). Useful as a first orientation.
+Networking). One call record groups one caller and invocation spelling; only a
+record with a resolved callee identity is a concrete graph edge. Useful as a
+first orientation.
 
 ### `check` / `doctor`
 
 Runs the full row-level audit used before a completed build becomes active. It
 checks metadata and roll-up counts, value types and ranges, safe path topology,
 symbol/file compatibility, ownership ranks and co-primary ties, source-include
-records, call identities, and every reconstructible non-indirect resolution
-classification.
+records, call identities, occurrence counts, and every call-resolution
+classification, including parser-proven macro and indirect calls.
 Normal queries perform a faster schema/metadata check; use `ka check` after
 copying an index, receiving a custom `--db`, or when corruption is suspected.
 `-f json` provides a small machine-readable success result; a failed audit exits
@@ -362,9 +410,10 @@ with an error instead of treating the index as sound.
 The "what is this?" command. For a directory: how many files sit in it, the
 top-level *area* (plain English for `mm/`, `net/`, `kernel/`, …), its subsystem
 composition derived from descendant files, a walk of parent directories, the
-recorded on-disk path, and an Elixir URL. Composition rows are ranked by primary
-and claimed descendants and show both counts plus coverage; they do not pretend
-a mixed directory has one owner.
+recorded on-disk path, and—when the index records a matching authoritative
+kernel.org archive—upstream release-reference links. Composition rows are ranked by
+primary and claimed descendants and show both counts plus coverage; they do not
+pretend a mixed directory has one owner.
 
 For a file: size, line count, parse status, how many symbols of each kind it
 defines, and every non-catch-all `MAINTAINERS` match ordered by specificity.
@@ -372,8 +421,9 @@ Every section tied for the strongest evidence is marked primary, so equal
 claims remain visible as co-primary rather than being broken by name order.
 Catch-all-only and genuinely unmatched files are shown as **Unclassified**.
 
-For a symbol: kind, line span, signature, linkage (`EXPORT_SYMBOL` /
-`static` / global), plus Elixir's *ident* page (every use of that name).
+For a symbol: kind, line span, signature, and linkage (`EXPORT_SYMBOL` /
+`static` / global). When upstream release-reference links are available, it
+also includes Elixir's *ident* page (every use of that name).
 
 `-f json` dumps the same facts, including `links`, `source_path`,
 `source_exists`, and structured unclassified-ownership information.
@@ -488,16 +538,17 @@ ka find kthread --exact
 `path` prints the absolute path of a folder, file, or symbol on disk:
 
 ```bash
-vim   $(ka path tcp_sendmsg)
-code -g $(ka path tcp_sendmsg --line)    # /.../net/ipv4/tcp.c:1409
-grep -rn lock_sock $(ka path net/ipv4)
+vim   "$(ka path tcp_sendmsg)"
+code -g "$(ka path tcp_sendmsg --line)"    # /.../net/ipv4/tcp.c:1409
+grep -rn lock_sock "$(ka path net/ipv4)"
 ```
 
 `--line` appends `:LINE` for symbols. This needs the exact source tree recorded
 in the index (the managed tree under `kernels/` or the original `--src` tree);
 the requested indexed member must still exist there. `info`, `siblings`,
-`find`, `web`, `docs` and `locate` still work from the snapshot when source is
-missing (and `info` reports the recorded path as missing).
+`find`, `docs`, and `locate` still work from the snapshot when source is missing
+(and `info` reports the recorded path as missing). `web` also remains
+source-independent when the index records an upstream release reference.
 
 `show` prints source without leaving the terminal. Given a symbol, it prints
 exactly that symbol:
@@ -525,13 +576,20 @@ ka show tcp_sendmsg --bare               # no header, no line numbers
 ```
 
 Whole files larger than 2 MB (generated blobs, huge headers) need
-`--lines N:M` or `$EDITOR $(ka path …)`. Binary files are refused.
+`--lines N:M` or `$EDITOR "$(ka path …)"`. Binary files are refused.
 
 ### `web` / `docs`
 
-`web` prints URLs for the same target on Bootlin Elixir, git.kernel.org,
-GitHub, and — for `Documentation/*.rst` — docs.kernel.org. Nothing is
-opened; pipe into `open` / `xdg-open` if you want a browser.
+For an index built from a matching authoritative kernel.org archive, `web`
+prints version-reference URLs for the target on Bootlin Elixir,
+git.kernel.org, GitHub, and—for supported `Documentation/*.rst`, `*.txt`, and
+`*.md` files—docs.kernel.org. Nothing is opened; pipe into `open` / `xdg-open`
+if you want a browser. Local, vendor, `--no-verify`, and nonmatching archive
+sources do not claim upstream URLs merely because their version string looks
+familiar. The managed tree is content-checked when the index is built, but the
+links identify the recorded release tag rather than monitoring that tree
+afterward; later local edits can make current contents or line numbers differ
+from the index and upstream reference.
 
 ```
 $ ka web tcp_sendmsg
@@ -543,11 +601,16 @@ net/ipv4/tcp.c:1409  tcp_sendmsg   [Linux 6.18.46]
   github  https://github.com/gregkh/linux/blob/v6.18.46/net/ipv4/tcp.c#L1409
 ```
 
-`ident` is Elixir's cross-reference for the symbol name. `--url elixir|ident|git|github|docs` prints a single URL. Three-part versions (6.18.46) use the stable tree and `gregkh/linux`; two-part versions (7.2) use torvalds. docs.kernel.org is versioned by major.minor (`v6.18`), not the patch level.
+`ident` is Elixir's cross-reference for the symbol name.
+`--url elixir|ident|git|github|docs` prints a single URL. Three-part upstream
+versions (6.18.46) use the stable tree and `gregkh/linux`; two-part versions
+(7.2) use torvalds. docs.kernel.org is versioned by major.minor (`v6.18`), not
+the patch level. `ka web` reports that no upstream release-reference URL is
+available for a locally supplied or vendor source tree.
 
 ```bash
-open $(ka web tcp_sendmsg --url elixir)
-open $(ka web Documentation/mm/index.rst --url docs)
+open "$(ka web tcp_sendmsg --url elixir)"
+open "$(ka web Documentation/mm/index.rst --url docs)"
 ```
 
 `docs` lists `Documentation/` files that belong with a target. Ranking combines
@@ -641,30 +704,38 @@ ka calls tcp_sendmsg --callers
 
 Invocation names are resolved conservatively. A unique callable in the same
 translation unit wins: `same_file` means the definition is in the caller's
-file, while `included_source` means it came from a transitively quoted
-`#include "member.c"`. If one member is included by several top-level sources,
-every translation-unit instance must reach the same identity; the effective
-build domain comes from each root, not from the member's pathname. Otherwise,
-only one non-static callable in every compatible root context can become
-`unique_global`. Indexed macros, function-pointer
+file, while `included_source` means it came from a transitively included C
+member. Literal quoted includes and angle/quoted includes resolved through one
+exact Kbuild `-I` path are supported. If one member is included by several
+top-level sources, every translation-unit instance must reach the same
+identity; the effective build domain comes from each root, not from the
+member's pathname. Otherwise, only one non-static callable in every compatible
+root context can become `unique_global`. Indexed macros, function-pointer
 objects/variables, static header alternatives, architecture alternatives, and
 duplicate definitions block a guessed identity. Every row retains one of these
-outcomes in the `resolution` column:
+outcomes in the `resolution` column. `occurrences` summarizes the parser's
+source-level evidence as direct (`d`), indirect (`i`), and macro (`m`) counts;
+these can coexist for the same invocation name, while `resolution` describes
+the direct occurrences when any exist:
 
 | Resolution | Meaning |
 | --- | --- |
 | `same_file` | one callable identity in the caller's source file |
-| `included_source` | one callable identity in a quoted `.c` member of the translation unit |
+| `included_source` | one callable identity in an included `.c` member of the translation unit |
 | `unique_global` | one compatible non-static identity across files |
 | `ambiguous` | relevant definitions or blockers exist, but do not prove one identity |
-| `macro` | the invocation name is provided only by an indexed macro |
-| `indirect` | a local, parameter, or file-scope function-pointer/object binding is invoked |
+| `macro` | the invocation is an active in-file macro, or only indexed macro evidence exists |
+| `indirect` | a pointer/object binding, explicit dereference, or member/ops-table expression is invoked |
 | `unresolved` | no indexed identity or blocker establishes what the name denotes |
 
 Reverse lookup uses only the selected symbol's resolved identity, so unrelated
 static functions with the same name are not mixed together. If a target itself
 has several callable definitions, use `path:symbol` across files or `path:line`
 for duplicates within one file rather than accepting a guessed definition.
+Outgoing rows that have no concrete callee identity retain their invocation
+evidence with `kind` shown as `?`; the `macro`, `indirect`, `ambiguous`, and
+`unresolved` resolution labels explain why. The `--kinds` filter is restricted
+to the callable result identities `function` and `syscall`.
 
 Cross-file compatibility follows available build evidence. Kbuild
 `hostprogs`/`userprogs`/`tprogs-y` and their multi-object declarations form
@@ -676,18 +747,20 @@ architecture is never bound to another. Architecture code may use its own
 domain and generic kernel identities, subject to architecture alternatives
 blocking an unsafe choice. Common and architecture-header identities also
 block unsafe promotion inside separate images without making vmlinux globals
-linkable there. Literal or locally expanded Kbuild compile/link object lists
-preserve a standalone context for dual-use sources that are also included as
-`.c` members, and member definitions inherit each root object's domain.
+linkable there. Literal or locally expanded Kbuild compile/link object lists,
+plus conservative literal `target.o: source.c` and program-link rules, preserve
+a standalone context for dual-use sources that are also included as `.c`
+members. Member definitions inherit each root object's domain.
 
 This is intentionally a lower-bound graph, not a whole-program C analysis.
-Bare calls through local/parameter/file-scope pointer objects are retained as
-`indirect`, but the runtime target is not inferred; member/ops-table dispatch
-and code generated entirely by macros do not become concrete edges. A source
-object explicitly linked into several independent Kbuild programs is isolated,
-so some valid cross-file program edges can remain unresolved. These gaps stay
-visible in `ka stats` and `ka relationships` coverage instead of being promoted
-to plausible-looking targets.
+Calls through local/parameter/file-scope pointer objects, explicit
+dereferences, and member/ops-table expressions are retained as `indirect`, but
+their runtime targets are not inferred; code generated entirely by macros does
+not become concrete edges. A source object explicitly linked into several
+independent Kbuild programs is isolated, so some valid cross-file program edges
+can remain unresolved. These gaps stay visible in `ka stats` and
+`ka relationships` coverage instead of being promoted to plausible-looking
+targets.
 
 ### `relationships` (`rels`)
 
@@ -867,9 +940,9 @@ ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
 `ka subsystem 'INTEL ETHERNET'`.
 
 **I am reading code in the browser.**
-`open $(ka web tcp_sendmsg --url elixir)` (definition) or `--url ident`
+`open "$(ka web tcp_sendmsg --url elixir)"` (definition) or `--url ident`
 (every use of the name). For the handbook:
-`open $(ka web Documentation/mm/index.rst --url docs)`.
+`open "$(ka web Documentation/mm/index.rst --url docs)"`.
 
 **I want the docs that go with this code.** `ka docs mm`, `ka docs bpf`,
 `ka show Documentation/mm/index.rst`.
@@ -879,8 +952,8 @@ ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
 `ka struct`, then use the listed owner, Documentation files, and source links
 to connect the data representation to its subsystem.
 
-**Open it in an editor.** `vim $(ka path tcp_sendmsg)` or
-`code -g $(ka path tcp_sendmsg --line)`. `--line` appends `:LINE`.
+**Open it in an editor.** `vim "$(ka path tcp_sendmsg)"` or
+`code -g "$(ka path tcp_sendmsg --line)"`. `--line` appends `:LINE`.
 `path` / `show` need the exact source tree recorded in the index (normally
 under `kernels/`, or the original `--src` tree); most other commands do not.
 
@@ -891,11 +964,11 @@ Listing commands (`siblings`, `ls`, `find`, `calls`) share these controls:
 | Option | Values / meaning |
 | --- | --- |
 | `--format`, `-f` | `table` (default), `plain`, `names`, `json`, `csv`, `tree` |
-| `--columns`, `-c` | comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature,resolution` |
+| `--columns`, `-c` | table/JSON/CSV only; comma-separated, ordered: `kind,name,path,dir,line,span,lines,size,symbols,subdirs,files,flags,subsystem,signature,occurrences,resolution` |
 | `--limit`, `-n` | max rows; `0` = all (`find` defaults to 50, `calls` to 200) |
-| `--sort` | `name`, `path`, `kind`, `line`, `size`, `lines` (size/lines sort descending) |
+| `--sort` | `name`, `path`, `kind`, `line`, `size`, `lines` (size/lines sort descending; a symbol-only result rejects `size`, so use `lines` for definition span) |
 | `--grep`, `-g` | keep only names matching a regex (case-insensitive) |
-| `--with-subsystem`, `-S` | add a subsystem column |
+| `--with-subsystem`, `-S` | add a subsystem column to table/JSON/CSV output |
 | `--kinds`, `-k` | `dir,file,function,syscall,struct,union,enum,typedef,macro,variable,prototype` or shortcuts `all`, `symbols`, `paths`, `functions`, `types` |
 | `--exported` | only `EXPORT_SYMBOL`'d symbols |
 | `--static-only` / `--no-static` | keep only / drop `static` symbols |
@@ -904,7 +977,9 @@ Listing commands (`siblings`, `ls`, `find`, `calls`) share these controls:
 are not, and the three explicit matching modes are mutually exclusive. Listing
 JSON stays an array of objects so `jq '.[].name'` works; each row also has an
 `index` field naming the kernel version. With `--columns`, JSON is projected to
-those fields too. `--static-only` and `--no-static` are mutually exclusive.
+those fields too. `plain`, `names`, and `tree` have fixed shapes and reject
+column controls instead of silently ignoring them. `--static-only` and
+`--no-static` are mutually exclusive.
 
 For commands that read an index, global options work before **or** after the
 subcommand:
@@ -933,8 +1008,10 @@ ka ls mm/page_alloc.c --kinds function --grep 'alloc' -f plain
 
 Unknown `--columns` or `--kinds` values are rejected with the valid list,
 rather than silently ignored. A bad `--grep` regex is a one-line error, not a
-traceback. `resolution` is populated by `calls`; that command only lists
-function/syscall identities, so other requested result kinds are rejected.
+traceback. `resolution` is populated by `calls`; its `--kinds` filter accepts
+only resolved function/syscall result identities, while unfiltered outgoing
+results also retain `?` rows for macro, indirect, ambiguous, and unresolved
+invocation evidence.
 
 ## How subsystems are determined
 
@@ -1046,16 +1123,19 @@ Known limits:
 - Functions generated entirely by macros other than the ones above are missed.
 - Conditional/configuration-specific export wrappers are not marked exported;
   the index marks literal uses of the canonical `EXPORT*_SYMBOL*` family.
-- Quoted `.c` includes are recognized as translation-unit membership for call
-  identity, including source-tree-root spellings used by vDSO code. Computed
-  includes and build-generated source aggregation are not. A member used by
-  several roots yields a concrete edge only when all roots agree.
+- Literal quoted `.c` includes and angle/quoted `.c` includes reached through
+  one exact literal Kbuild `-I` path are recognized as translation-unit
+  membership, including source-tree-root spellings used by vDSO code. Ambiguous
+  or computed includes and build-generated aggregation are not guessed. A
+  member used by several roots yields a concrete edge only when all roots
+  agree.
 - Standalone evidence for a source that is also included comes from recognized
   Kbuild object-list families (`obj-*`, `lib-*`, and composite `*-y`/`*-m`/
   `*-objs` lists) in `Makefile`, `Kbuild`, and tools `Build` files. Local
   variables and pure `addprefix` object expansion are followed; arbitrary make
-  functions and custom compilation recipes are not, so unmodelled contexts
-  remain a lower-bound limitation.
+  functions are not. Conservative literal object compile and program-link
+  dependency rules are also recognized; custom recipes remain a lower-bound
+  limitation.
 - Header inclusion contexts are not modelled. Calls may resolve to identities
   in the same header, but cross-file candidates for a header-origin call remain
   ambiguous or unresolved rather than borrowing the header pathname's build
@@ -1063,11 +1143,12 @@ Known limits:
 - The call graph resolves direct identifiers by translation-unit or compatible
   domain-local unique-global identity. Macro, variable/function-pointer,
   static-header, cross-tools, and cross-architecture alternatives prevent a
-  guessed identity. Bare calls through local, parameter, or file-scope objects
-  are retained as `indirect`, without inventing their runtime target; ops/member
-  dispatch remains outside the concrete graph.
-- Only C is parsed. Assembly and Rust files appear as files, without symbols.
-- C/H files over 2 MiB are line-counted but not sent to tree-sitter, because
+  guessed identity. Calls through local, parameter, or file-scope objects,
+  explicit dereferences, and ops/member expressions are retained as `indirect`
+  evidence without inventing their runtime target.
+- C, headers, and shipped `.c_shipped`/`.h_shipped` inputs are parsed. Assembly
+  and Rust files appear as files, without symbols.
+- C/H inputs over 4 MiB are line-counted but not sent to tree-sitter, because
   generated headers can contain millions of definitions. Their status is
   recorded as `skipped_oversize` and included in build statistics.
 - Symlinks are represented in the file map but are not followed or parsed, so
@@ -1095,12 +1176,23 @@ tree recorded when the index was built. Other commands do not. `ka build X
 --force` uses the valid managed tree at `kernels/linux-X`, downloading it when
 absent; a removed custom `--src` tree must be restored or re-indexed.
 
+**"source destination … is not a complete Linux tree"** — an entry already
+occupies the managed source path, but it cannot be proven to belong to
+kernel-atlas. It is never deleted automatically. Inspect it, then move or
+remove that exact entry yourself before retrying the build.
+
+**"not the pristine tool-owned source recorded by this index"** — a downloaded
+tree that once matched the index has been edited, replaced, or lost its valid
+identity sidecar. `remove --source` keeps both the index and tree rather than
+risk deleting unrelated study work. Restore the exact indexed tree and retry,
+or manage the tree yourself and then remove only the index without `--source`.
+
 **"is this index internally consistent?"** — `ka check` (or the identical
 `ka doctor`) runs the deep count, topology, ownership, and call-identity audit.
 This is especially useful for a copied or custom `--db`.
 
 **"is N bytes; pass --lines"** — `show` will not dump a file bigger than 2 MB
-whole. Use `--lines N:M`, or open it with `$EDITOR $(ka path …)`.
+whole. Use `--lines N:M`, or open it with `$EDITOR "$(ka path …)"`.
 
 **"no Documentation/ files related to …"** — that area has no matching
 `Documentation/` path. Try `ka ls Documentation --kinds dir` or `ka docs mm`.
@@ -1113,25 +1205,28 @@ corrupt, or was built with an incompatible schema. Rebuild that version with
 `--force`. Completed builds are validated and moved into place atomically.
 
 **The index disagrees with the file I just edited** — the index is a snapshot.
-Rebuild with `--force` after editing its managed or custom source tree.
+Rebuild with `--force` after editing its managed or custom source tree. An
+edited managed cache is intentionally recorded as local source, so that rebuilt
+index does not claim upstream `web` links for content it can no longer attest.
 
 ## Development
 
 ```bash
 .venv/bin/pip install pytest
-.venv/bin/python -m pytest tests -q
+.venv/bin/python -m pytest -q
 ```
 
 The tests build a small synthetic kernel tree (`tests/fixture.py`) with its own
 `MAINTAINERS`, plus a throwaway `KERNEL_ATLAS_HOME` for `use` / `remove`, so
-they need no network and never touch your real indexes.
+they need no network and never touch your real indexes. Pytest discovery is
+confined to `tests/`; downloaded kernel selftests are never collected.
 
 ### Layout
 
 | File | Purpose |
 | --- | --- |
 | `config.py` | where kernels, indexes, and the `use` pin live |
-| `kernelsrc.py` | kernel.org release list, resumable download, checksum, atomic extract |
+| `kernelsrc.py` | kernel.org releases, resumable downloads, checksum policy, atomic extraction, lifecycle locks, and persistent source identity/digests |
 | `cparse.py` | tree-sitter ownership plus general function, call, declaration, and macro extraction |
 | `cparse_models.py` | parser symbol kinds and shared symbol/member records |
 | `cparse_shared.py` | kernel-C syntax tables and source/tree helpers shared by parsers |

@@ -26,6 +26,11 @@ class Entry:
     is_exported: bool | None = None
     subsystem: str | None = None
     resolution: str | None = None
+    # Source-level call occurrence evidence.  These remain optional because
+    # ordinary directory/file/symbol listings have no call-edge context.
+    direct_count: int | None = None
+    indirect_count: int | None = None
+    macro_count: int | None = None
     is_target: bool = False
     # Internal database identity.  It is deliberately not part of the default
     # machine output, but lets callers distinguish declarations which share a

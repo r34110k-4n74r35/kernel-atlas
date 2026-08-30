@@ -48,14 +48,12 @@ def drop_evidence(conn: sqlite3.Connection) -> None:
 def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> None:
     """Build expected outcomes for unresolved build rows or completed rows.
 
-    Parser-classified ``indirect`` calls are excluded during validation: the
-    schema intentionally does not persist whether that evidence was a local
-    parameter/object or a file-scope binding.  Every other outcome is fully
-    reconstructible from the indexed identities and compilation contexts.
+    Only edges with direct occurrences need contextual resolution. Parser
+    classifications for aggregate members, dereferences, and active in-file
+    macros are persisted as occurrence counts and validated separately.
     """
     drop_evidence(conn)
-    call_filter = "c.resolution!='indirect'" if validating \
-        else "c.resolution='unresolved'"
+    call_filter = "c.direct_count>0"
     conn.executescript(
         f"""
         CREATE TEMP TABLE file_domains AS
@@ -99,7 +97,7 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
         CREATE TEMP TABLE program_header_domains AS
         SELECT roots.domain, f.id AS file_id
         FROM program_roots roots
-        JOIN files f ON f.ext='.h' AND (
+        JOIN files f ON f.ext IN ('.h','.h_shipped') AND (
           roots.root='' OR
           substr(f.path, 1, length(roots.root) + 1)=roots.root || '/'
         )
@@ -185,14 +183,16 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
 
         CREATE TEMP TABLE unit_local_bindings AS
         SELECT contexts.caller_file_id, contexts.name, contexts.unit_id,
-               SUM(s.kind='macro') AS macro_n,
+               SUM(s.kind='macro'
+                   AND s.file_id!=contexts.caller_file_id) AS macro_n,
                SUM(s.kind='variable') AS variable_n
         FROM call_contexts contexts
         JOIN translation_unit_members members
           ON members.unit_id=contexts.unit_id
         JOIN symbols s
           ON s.file_id=members.member_file_id AND s.name=contexts.name
-        WHERE s.kind IN ('macro', 'variable')
+        WHERE s.kind='variable'
+           OR (s.kind='macro' AND s.file_id!=contexts.caller_file_id)
         GROUP BY contexts.caller_file_id, contexts.name, contexts.unit_id;
         CREATE UNIQUE INDEX temp.idx_unit_local_bindings
           ON unit_local_bindings(caller_file_id, name, unit_id);
@@ -214,7 +214,7 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
           JOIN files f ON f.id=s.file_id
           JOIN file_domains fd ON fd.file_id=s.file_id
           WHERE s.kind IN ('function', 'syscall') AND s.is_static=1
-            AND f.ext='.h'
+            AND f.ext IN ('.h','.h_shipped')
           UNION
           SELECT visible.domain, s.id AS symbol_id, s.name
           FROM program_header_domains visible
@@ -230,7 +230,7 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
           FROM symbols s
           JOIN files f ON f.id=s.file_id
           JOIN file_domains fd ON fd.file_id=s.file_id
-          WHERE s.kind='macro' AND f.ext='.h'
+          WHERE s.kind='macro' AND f.ext IN ('.h','.h_shipped')
           UNION
           SELECT visible.domain, s.id AS symbol_id, s.name
           FROM program_header_domains visible
@@ -246,7 +246,8 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
           FROM symbols s
           JOIN files f ON f.id=s.file_id
           JOIN effective_file_domains domains ON domains.file_id=s.file_id
-          WHERE s.kind='variable' AND (s.is_static=0 OR f.ext='.h')
+          WHERE s.kind='variable' AND (
+            s.is_static=0 OR f.ext IN ('.h','.h_shipped'))
           UNION
           SELECT visible.domain, s.id AS symbol_id, s.name
           FROM program_header_domains visible
@@ -262,7 +263,7 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
           FROM symbols s
           JOIN files f ON f.id=s.file_id
           JOIN effective_file_domains domains ON domains.file_id=s.file_id
-          WHERE s.kind='variable' AND f.ext='.h'
+          WHERE s.kind='variable' AND f.ext IN ('.h','.h_shipped')
           UNION
           SELECT visible.domain, s.id AS symbol_id, s.name
           FROM program_header_domains visible
@@ -311,9 +312,10 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
         JOIN effective_file_domains domains ON domains.file_id=s.file_id
         WHERE domains.domain LIKE 'arch:%' AND (
           (s.kind IN ('function','syscall')
-             AND (s.is_static=0 OR f.ext='.h'))
-          OR (s.kind='macro' AND f.ext='.h')
-          OR (s.kind='variable' AND (s.is_static=0 OR f.ext='.h'))
+             AND (s.is_static=0 OR f.ext IN ('.h','.h_shipped')))
+          OR (s.kind='macro' AND f.ext IN ('.h','.h_shipped'))
+          OR (s.kind='variable' AND (
+            s.is_static=0 OR f.ext IN ('.h','.h_shipped')))
         )
         GROUP BY s.name;
         CREATE UNIQUE INDEX temp.idx_arch_blockers_name
@@ -386,11 +388,11 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
             -- Header include contexts are not recorded.  Same-header evidence
             -- above is sound, but the header's path domain cannot establish
             -- which linked image instantiates an inline call site.
-            WHEN caller_file.ext='.h' AND (
+            WHEN caller_file.ext IN ('.h','.h_shipped') AND (
               names.global_n + names.header_n + names.macro_n
               + names.variable_n + names.arch_n > 0
             ) THEN 'ambiguous'
-            WHEN caller_file.ext='.h' THEN 'unresolved'
+            WHEN caller_file.ext IN ('.h','.h_shipped') THEN 'unresolved'
             WHEN names.global_n=1 AND names.header_n=0 AND names.macro_n=0
               AND names.variable_n=0 AND names.arch_n=0 THEN 'unique_global'
             WHEN names.macro_n>0 AND names.global_n=0 AND names.header_n=0
@@ -401,7 +403,7 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
           END AS resolution,
           CASE
             WHEN local.n=1 AND binding.name IS NULL THEN local.symbol_id
-            WHEN caller_file.ext!='.h'
+            WHEN caller_file.ext NOT IN ('.h','.h_shipped')
               AND local.name IS NULL AND binding.name IS NULL
               AND names.global_n=1 AND names.header_n=0 AND names.macro_n=0
               AND names.variable_n=0 AND names.arch_n=0 THEN names.global_id
@@ -468,7 +470,7 @@ def resolve(conn: sqlite3.Connection, *, keep_evidence: bool = False) \
                 AND expected.name=c.callee
               WHERE caller.id=c.caller_id
             )
-        WHERE c.resolution='unresolved' AND EXISTS (
+        WHERE c.direct_count>0 AND c.resolution='unresolved' AND EXISTS (
           SELECT 1 FROM symbols caller
           JOIN expected_call_outcomes expected
             ON expected.caller_file_id=caller.file_id

@@ -267,11 +267,13 @@ def cmd_info(args, support):
     next_lines = [f"\n  Next:  {prefix} siblings {target_arg}"]
     if t.kind == "symbol" and t.symbol_kind in {"struct", "union"}:
         next_lines.append(f"         {prefix} struct {target_arg}")
-    next_lines.append(f"         {prefix} web {target_arg}")
+    if lnks:
+        next_lines.append(f"         {prefix} web {target_arg}")
     print("\n".join(next_lines))
 
 
 def cmd_siblings(args, support):
+    support._validate_listing_output(args)
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target, meta)
     t = res.target
@@ -281,7 +283,11 @@ def cmd_siblings(args, support):
 
     kinds = support.symbol_filter_kinds(args, support.kinds_from_args(args, t))
     support._reject_symbol_size_sort(args, kinds)
-    if (args.level == "tree"
+    root_subtree = (
+        args.level == "subtree"
+        and not (t.path if t.kind == "dir" else query.parent_path(t.path))
+    )
+    if ((args.level == "tree" or root_subtree)
             and any(k in query.SYMBOL_KINDS for k in kinds)
             and not args.limit):
         support._die("listing symbols across the whole tree needs -n N "
@@ -314,8 +320,11 @@ def cmd_siblings(args, support):
             target_entry.is_target = True
             entries.append(target_entry)
             query.sort_entries(entries, args.sort)
-    want_subsystem = (args.with_subsystem
-                      or "subsystem" in support._split_list(args.columns))
+    want_subsystem = (
+        support._listing_has_columns(args)
+        and (args.with_subsystem
+             or "subsystem" in support._split_list(args.columns))
+    )
     if want_subsystem:
         query.annotate_subsystems(conn, entries)
 
@@ -332,6 +341,7 @@ def cmd_siblings(args, support):
 
 
 def cmd_ls(args, support):
+    support._validate_listing_output(args)
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target or "", meta)
     t = res.target
@@ -356,8 +366,11 @@ def cmd_ls(args, support):
     kinds = support.kinds_from_args(args, t) if support._split_list(args.kinds) else default
     kinds = support.symbol_filter_kinds(args, kinds)
     support._reject_symbol_size_sort(args, kinds)
-    want_subsystem = (args.with_subsystem
-                      or "subsystem" in support._split_list(args.columns))
+    want_subsystem = (
+        support._listing_has_columns(args)
+        and (args.with_subsystem
+             or "subsystem" in support._split_list(args.columns))
+    )
     entries = query.collect(conn, scope, kinds, limit=args.limit,
                             grep=support._checked_grep(args.grep),
                             exported_only=args.exported, static=support._static_mode(args),
@@ -367,6 +380,7 @@ def cmd_ls(args, support):
 
 
 def cmd_find(args, support):
+    support._validate_listing_output(args)
     conn, meta = support.open_index(args)
     mode = "exact" if args.exact else ("glob" if args.glob else
                                        ("prefix" if args.prefix else "substring"))
@@ -379,9 +393,11 @@ def cmd_find(args, support):
     support._reject_symbol_size_sort(args, kinds or query.SYMBOL_KINDS)
     grep = support._checked_grep(args.grep)
     explicit_columns = support._split_list(args.columns)
-    want_subsystem = (args.format != "names"
-                      and (args.with_subsystem or not explicit_columns
-                           or "subsystem" in explicit_columns))
+    want_subsystem = (
+        support._listing_has_columns(args)
+        and (args.with_subsystem or not explicit_columns
+             or "subsystem" in explicit_columns)
+    )
     entries = query.search(conn, args.pattern, kinds=kinds, mode=mode,
                            limit=args.limit,
                            exported_only=args.exported,
@@ -573,10 +589,10 @@ def cmd_tree(args, support):
 
 
 def cmd_path(args, support):
-    """Print the on-disk path, so `$EDITOR $(ka path tcp_sendmsg)` just works."""
+    """Print the on-disk path for use with `$EDITOR "$(ka path target)"`."""
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target, meta)
-    support._require_unique_symbol_identity(res, args.target)
+    support._require_unique_symbol_identity(res, args.target, conn)
     t = res.target
     if args.line and t.kind != "symbol":
         support._die("--line only applies to symbols")
@@ -593,7 +609,7 @@ def cmd_path(args, support):
 def cmd_show(args, support):
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target, meta)
-    support._require_unique_symbol_identity(res, args.target)
+    support._require_unique_symbol_identity(res, args.target, conn)
     t = res.target
     if t.kind == "dir":
         prefix = support._command_prefix(args, meta)
@@ -635,8 +651,9 @@ def cmd_show(args, support):
         size = full.stat().st_size
         if size > support._MAX_SHOW:
             prefix = support._command_prefix(args, meta)
-            support._die(f"{t.path} is {size:,} bytes; pass --lines N:M or open it with "
-                 f"$EDITOR $({prefix} path {shlex.quote(t.path)})")
+            support._die(
+                f"{t.path} is {size:,} bytes; pass --lines N:M or open it "
+                f'with $EDITOR "$({prefix} path {shlex.quote(t.path)})"')
         start, end = 1, None
 
     color = render.use_color(args.color)
