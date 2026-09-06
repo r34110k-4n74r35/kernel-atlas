@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from .build_output import clean, color_enabled, display_width, wrap_text
+from .terminal import clean, color_enabled, display_width, wrap_text
 from .render_format import paint
 
 

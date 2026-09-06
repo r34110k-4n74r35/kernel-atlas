@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .. import config, db, links, query, render
+from ..terminal import Console
 
 
 def cmd_web(args, support):
@@ -45,19 +46,20 @@ def cmd_web(args, support):
         }))
         return
 
-    color = render.use_color(args.color)
+    console = Console(args.color)
     location = target.path or "."
     if target.kind == "symbol" and target.line:
         location = f"{target.path}:{target.line}"
     label = (f"{location}  "
              f"{target.name if target.kind == 'symbol' else ''}").rstrip()
-    print(render.paint(label, "1;36", color)
-          + render.paint(f"   [Linux {version}]", "90", color))
+    console.heading(f"{label}   [Linux {version}]")
+    console.blank()
     order = ("elixir", "ident", "git", "github", "docs")
     width = max(len(key) for key in order if key in link_map)
     for key in order:
         if key in link_map:
-            print(f"  {key:<{width}}  {link_map[key]}")
+            # Leave each URL intact for copying, even in a narrow terminal.
+            console.text(f"{key:<{width}}  {link_map[key]}", wrap=False)
 
 
 def cmd_docs(args, support):
@@ -94,27 +96,30 @@ def cmd_docs(args, support):
             payload.append(item)
         sys.stdout.write(render.render_json(payload))
         return
-    color = render.use_color(args.color)
+    console = Console(args.color)
     heading = f"Documentation related to {target.display}"
     if label:
         heading += f"   [{label}]"
     heading += f"   [{support._linux(meta)}]"
-    print(render.paint(heading, "1", color))
+    console.heading(heading)
     if resolution.note:
-        print(render.paint(f"  ({resolution.note})", "33", color))
+        console.note(resolution.note)
+    console.blank()
     for match in matches:
-        print(f"  {match.entry.path}")
+        console.text(match.entry.path, tone="accent")
         if args.explain:
             for reason in match.reasons:
-                print(f"    - {reason}")
+                console.text(f"- {reason}", tone="muted", indent=4)
     prefix = support._command_prefix(args, meta)
     first = shlex.quote(entries[0].path)
-    summary = f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
+    console.blank()
+    console.text(f"{len(entries)} file{'s' if len(entries) != 1 else ''}",
+                 tone="muted")
     if links.links(version, entries[0].path, source=meta.get("source")):
-        summary += f"   Next: {prefix} web {first}"
+        next_command = f"{prefix} web {first}"
     else:
-        summary += f"   Next: {prefix} show {first}"
-    print(render.paint(summary, "90", color))
+        next_command = f"{prefix} show {first}"
+    console.commands([next_command])
 
 
 def cmd_locate(args, support):
@@ -208,28 +213,36 @@ def cmd_locate(args, support):
         sys.stdout.write(render.render_json(rows))
         return
 
-    color = render.use_color(args.color)
+    console = Console(args.color)
     active_name = next(
         (row["version"] for row in rows if row.get("active")), None)
-    note = (f"  * = {support._linux({'index_stem': active_name})}"
-            if active_name else "")
-    print(render.paint(
+    console.heading(
         f"{spec}  across {len(rows)} index"
-        f"{'es' if len(rows) != 1 else ''}{note}\n", "1", color))
-    version_width = max((len(row["version"]) for row in rows), default=8)
+        f"{'es' if len(rows) != 1 else ''}")
+    if active_name:
+        console.text(f"* = {support._linux({'index_stem': active_name})}",
+                     tone="muted")
+    console.blank()
+    table_rows = []
+    row_tones = []
+    notes = []
     for row in rows:
-        mark = "*" if row.get("active") else " "
-        version = row["version"].ljust(version_width)
-        prefix = f"  {mark} {version}"
+        mark = "*" if row.get("active") else "-"
         if not row.get("found"):
             why = row.get("error") or row.get("note") or "not in this index"
-            print(f"{prefix}  {render.paint(why, '90', color)}")
+            table_rows.append((mark, row["version"], "missing", why, "-"))
+            row_tones.append("error" if row.get("error") else "muted")
             continue
         location = row["path"]
         if row.get("line"):
             location = f"{row['path']}:{row['line']}"
         subsystem = row.get("subsystem") or "-"
-        print(f"{prefix}  {row['kind']:<10} {location:<42} "
-              f"{render.paint(subsystem, '35', color)}")
+        table_rows.append((mark, row["version"], row["kind"], location, subsystem))
+        row_tones.append(None)
         if row.get("note"):
-            print(render.paint(f"      note: {row['note']}", "33", color))
+            notes.append(f"{row['version']} note: {row['note']}")
+    console.table(("ACTIVE", "VERSION", "KIND", "LOCATION / STATUS", "SUBSYSTEM"),
+                  table_rows, tones={1: "success", 2: "muted", 4: "accent"},
+                  row_tones=row_tones)
+    for note in notes:
+        console.note(note)

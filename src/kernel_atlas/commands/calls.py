@@ -6,6 +6,7 @@ import csv
 import sys
 
 from .. import query, relationships, render
+from ..terminal import Console
 
 
 def cmd_trace(args, support):
@@ -56,24 +57,28 @@ def cmd_trace(args, support):
         sys.stdout.write(render.render_json(results))
         return
 
-    color = render.use_color(args.color)
-    print(render.paint(
-        f"Backtrace across {len(results)} frames ({support._linux(meta)})\n",
-        "1", color))
-    name_width = max((len(row["frame"]) for row in results), default=10)
+    console = Console(args.color)
+    console.heading(
+        f"Backtrace across {len(results)} frame"
+        f"{'s' if len(results) != 1 else ''} ({support._linux(meta)})")
+    console.blank()
+    table_rows = []
+    row_tones = []
     for index, row in enumerate(results):
-        index_label = render.paint(f"#{index:<2}", "90", color)
         if not row["found"]:
-            missing = render.paint("not in index", "90", color)
-            print(f"  {index_label} {row['frame']:<{name_width}}  {missing}")
+            table_rows.append((f"#{index}", row["frame"], "not in index", "-"))
+            row_tones.append("muted")
             continue
         location = f"{row['path']}:{row['line']}"
         subsystem = row["label"]
         ambiguity = (f"  (+{row['ambiguous']} more defs)"
                      if row["ambiguous"] else "")
-        frame = render.paint(row["frame"].ljust(name_width), "32", color)
-        print(f"  {index_label} {frame}  {location:<44} "
-              f"{render.paint(subsystem, '35', color)}{ambiguity}")
+        table_rows.append((f"#{index}", row["frame"], location,
+                           subsystem + ambiguity))
+        row_tones.append(None)
+    console.table(("FRAME", "FUNCTION", "LOCATION / STATUS", "SUBSYSTEM / AREA"),
+                  table_rows, tones={0: "muted", 1: "success", 3: "accent"},
+                  row_tones=row_tones)
 
     counts: dict[str, int] = {}
     for row in results:
@@ -81,10 +86,12 @@ def cmd_trace(args, support):
             key = row["area"] or row["subsystem"] or "?"
             counts[key] = counts.get(key, 0) + 1
     if counts:
-        print(render.paint("\n  Areas touched", "1", color))
-        for name, count in sorted(counts.items(), key=lambda item: -item[1]):
-            print(f"    {name:<24} {count} "
-                  f"frame{'s' if count != 1 else ''}")
+        console.blank()
+        console.heading("Areas touched")
+        console.table(("AREA", "FRAMES"), [
+            (name, f"{count:,}")
+            for name, count in sorted(counts.items(), key=lambda item: -item[1])
+        ], align_right=(1,), tones={0: "accent"})
 
 
 def cmd_calls(args, support):
@@ -293,51 +300,57 @@ def cmd_relationships(args, support):
             })
         return
 
-    color = render.use_color(args.color)
-    print(render.paint(
+    console = Console(args.color)
+    console.heading(
         f"{subsystem['name']} relationships  [{support._linux(meta)}]",
-        "1;35", color))
+        tone="accent")
     if note:
-        print(render.paint(f"  ({note})", "33", color))
-    print(f"  files  {subsystem['n_files']:,} claimed, "
-          f"{subsystem['n_primary_files']:,} primary")
+        console.note(note)
+    console.field("Files", f"{subsystem['n_files']:,} claimed, "
+                  f"{subsystem['n_primary_files']:,} primary")
 
     if args.via in {"all", "ownership"}:
-        print(render.paint("\n  Ownership overlap", "1", color))
+        console.blank()
+        console.heading("Ownership overlap")
         if overlaps:
-            print(f"    {'SHARED':>6} {'THIS':>7} {'OTHER':>7} "
-                  f"{'JACCARD':>8}  SUBSYSTEM")
-            for row in overlaps:
-                print(f"    {row.shared_files:>6,} "
-                      f"{row.selected_coverage:>7.1%} "
-                      f"{row.other_coverage:>7.1%} {row.jaccard:>8.1%}  "
-                      f"{row.subsystem}")
+            console.table(("SHARED", "THIS", "OTHER", "JACCARD", "SUBSYSTEM"), [
+                (f"{row.shared_files:,}", f"{row.selected_coverage:.1%}",
+                 f"{row.other_coverage:.1%}", f"{row.jaccard:.1%}", row.subsystem)
+                for row in overlaps
+            ], align_right=(0, 1, 2, 3), tones={4: "accent"})
         else:
-            print("    no overlap at this threshold")
+            console.text("no overlap at this threshold", tone="muted")
 
     if args.via in {"all", "calls"}:
-        print(render.paint("\n  Direct C invocation flow", "1", color))
+        console.blank()
+        console.heading("Direct C invocation flow")
         if not has_calls:
             advice = support._call_graph_rebuild_advice(args, meta)
-            print(f"    unavailable — {advice}")
+            console.text(f"unavailable — {advice}", tone="warning", wrap=False)
         elif flows:
-            print(f"    {'DIRECTION':<9} {'EDGES':>7} {'CALLERS':>7} "
-                  f"{'CALLEES':>7}  SUBSYSTEM")
+            table_rows = []
             for row in flows:
                 label = ("unclassified (MAINTAINERS catch-all)"
                          if row.unclassified else (row.subsystem or "?"))
                 if row.internal:
                     label += " (internal)"
-                print(f"    {row.direction:<9} {row.edges:>7,} "
-                      f"{row.callers:>7,} {row.callees:>7,}  {label}")
+                table_rows.append((row.direction, f"{row.edges:,}",
+                                   f"{row.callers:,}", f"{row.callees:,}", label))
+            console.table(("DIRECTION", "EDGES", "CALLERS", "CALLEES", "SUBSYSTEM"),
+                          table_rows, align_right=(1, 2, 3),
+                          tones={0: "info", 4: "accent"})
         else:
-            print("    no resolved cross-subsystem calls at this threshold")
+            console.text("no resolved cross-subsystem calls at this threshold",
+                         tone="muted")
         if coverage is not None:
             excluded = (
                 coverage["ambiguous"] + coverage["macro"]
                 + coverage["indirect"] + coverage["unresolved"])
-            print(render.paint(
-                f"\n    outgoing resolution: {coverage['resolved']:,}/"
-                f"{coverage['total']:,} edges resolved; {excluded:,} retained "
-                "only as ambiguity/macro/indirect/unresolved coverage",
-                "90", color))
+            console.blank()
+            console.heading("Outgoing resolution")
+            console.field("Resolved", f"{coverage['resolved']:,}/"
+                          f"{coverage['total']:,} edges", tone="success")
+            console.field("Other outcomes", f"{excluded:,} records",
+                          tone="warning" if excluded else "muted")
+            console.text("Ambiguous, macro, indirect, and unresolved records "
+                         "remain coverage evidence.", tone="muted")

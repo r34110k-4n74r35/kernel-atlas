@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .. import build_output, config, cparse, db, indexer, kernelsrc, maintainers, render
 from ..progress import Progress
+from ..terminal import Console, format_size
 
 
 def cmd_versions(args, support):
@@ -24,19 +25,24 @@ def cmd_versions(args, support):
         releases = kernelsrc.list_releases()
     except (OSError, ValueError) as exc:
         support._die(f"could not reach kernel.org ({exc})")
-    color = render.use_color(args.color)
     if args.format == "json":
         sys.stdout.write(render.render_json([r.__dict__ for r in releases]))
         return
-    print(render.paint("Current kernel.org releases", "1", color))
-    print(f"  {'MONIKER':<12} {'VERSION':<16} {'RELEASED':<12}")
-    for release in releases:
-        note = "  <- good default for learning" if release.is_lts else ""
-        print(f"  {release.moniker:<12} {release.version:<16} "
-              f"{release.released or '-':<12}"
-              + render.paint(note, "32", color))
-    print(f"\nBuild one with:  {support.PROG} "
-          "build <version|lts|stable|mainline>")
+    console = Console(args.color)
+    console.heading("Current kernel.org releases")
+    console.table(
+        ("Release", "Version", "Released", "Notes"),
+        [(release.moniker, release.version, release.released or "—",
+          "Good default for learning" if release.is_lts else "")
+         for release in releases],
+        tones={1: "accent"},
+        row_tones=["success" if release.is_lts else None
+                   for release in releases],
+    )
+    console.blank()
+    console.heading("Build an index")
+    console.text("Choose lts, stable, mainline, or a version from the table.", tone="muted")
+    console.commands([f"{support.PROG} build lts"])
 
 
 def cmd_build(args, support):
@@ -226,10 +232,13 @@ def _build(args, support):
 def cmd_indexes(args, support):
     paths = config.list_indexes()
     if not paths and args.format != "json":
-        print(f"no indexes yet — run '{support.PROG} build lts'")
+        console = Console(args.color)
+        console.note("no indexes yet")
+        console.commands([f"{support.PROG} build lts"])
         return
     active = support.default_index() if paths else None
     rows = []
+    sizes = {}
     for path in paths:
         conn = None
         error = None
@@ -248,6 +257,8 @@ def cmd_indexes(args, support):
             "tree_path": meta.get("tree_path"),
         }) is not None
         version = meta.get("kernel_version") or path.stem
+        size = path.stat().st_size
+        sizes[str(path)] = size
         rows.append({
             "version": version,
             "alias": path.stem,
@@ -256,7 +267,7 @@ def cmd_indexes(args, support):
             "calls": meta.get("has_calls") == "1",
             "source": source_here,
             "built_at": meta.get("built_at", "?"),
-            "size": f"{path.stat().st_size / 1048576:.0f} MB",
+            "size": f"{size / 1048576:.0f} MB",
             "default": support._same_path(path, active),
             "path": str(path),
             "error": error,
@@ -268,34 +279,53 @@ def cmd_indexes(args, support):
     if args.format == "json":
         sys.stdout.write(render.render_json(rows))
         return
-    color = render.use_color(args.color)
+    console = Console(args.color)
+    console.heading("Built indexes")
     show_alias = any(row["alias"] != row["version"] for row in rows)
-    alias_head = f" {'INDEX':<12}" if show_alias else ""
-    print(f"    {'VERSION':<12}{alias_head} {'STATE':<7} {'FILES':>8} "
-          f"{'SYMBOLS':>10} {'CALLS':<6} {'SOURCE':<7} {'BUILT':<20} "
-          f"{'SIZE':>8}")
+    headers = ["Default", "Version"]
+    if show_alias:
+        headers.append("Index")
+    headers += ["State", "Files", "Symbols", "Calls", "Source", "Built", "Size"]
+    display_rows = []
     for row in rows:
-        mark = "*" if row["default"] else " "
-        alias = f" {row['alias']:<12}" if show_alias else ""
+        values = ["*" if row["default"] else "—", row["version"]]
+        if show_alias:
+            values.append(row["alias"])
         state = "broken" if row["error"] else "ok"
-        line = (f"  {mark} {row['version']:<12}{alias} {state:<7} "
-                f"{row['files']:>8} {row['symbols']:>10} "
-                f"{'yes' if row['calls'] else '-':<6} "
-                f"{'yes' if row['source'] else '-':<7} "
-                f"{row['built_at']:<20} {row['size']:>8}")
-        print(render.paint(line, "1", color) if row["default"] else line)
+        values += [state, _count(row["files"]), _count(row["symbols"]),
+                   "yes" if row["calls"] else "no",
+                   "yes" if row["source"] else "no", row["built_at"],
+                   format_size(sizes[row["path"]])]
+        display_rows.append(values)
+    console.table(
+        headers, display_rows,
+        align_right=tuple(headers.index(name) for name in ("Files", "Symbols", "Size")),
+        tones={1: "accent"},
+        row_tones=["error" if row["error"] else "success" if row["default"] else None
+                   for row in rows],
+    )
+    for row in rows:
         if row["error"]:
-            print(render.paint(
-                f"      unusable: {row['error']} (rebuild this index)",
-                "31", color))
+            console.note(f"{row['alias']} unusable: {row['error']} (rebuild this index)",
+                         tone="error")
     pinned = support._default_version_pin()
     note = (f"pinned with '{support.PROG} use {pinned}'" if pinned
             else f"highest version (pin one with "
                  f"'{support.PROG} use <version>')")
-    print(render.paint(f"\n  * = default index — {note}", "90", color))
+    console.blank()
+    console.text(f"* = default index — {note}", tone="muted")
+
+
+def _count(value):
+    """Group known numeric counts without hiding unavailable metadata."""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def cmd_use(args, support):
+    console = Console(args.color)
     if args.clear and args.version:
         support._die("pass a version or --clear, not both")
     if args.clear:
@@ -313,31 +343,33 @@ def cmd_use(args, support):
         except OSError as exc:
             support._die(f"could not clear the default pin: {exc}")
         if was:
-            print(f"cleared pin on {was}; the highest built version is the "
-                  "default again")
+            console.note(f"cleared pin on {was}; the highest built version is the "
+                         "default again", tone="success")
         elif invalid_pin:
-            print("cleared invalid default pin")
+            console.note("cleared invalid default pin", tone="success")
         else:
-            print("nothing was pinned")
+            console.note("nothing was pinned", tone="muted")
         return
     if not args.version:
         available = config.list_indexes()
         pinned = support._default_version_pin()
         if not available:
-            print("no indexes built yet — run "
-                  f"'{support.PROG} build lts', then "
-                  f"'{support.PROG} use <version>'")
+            console.note("no indexes built yet")
+            console.commands([f"{support.PROG} build lts",
+                              f"{support.PROG} use <version>"])
             return
+        console.heading("Default index")
         if pinned:
             pin_path = config.index_path(pinned)
             if pin_path.is_file():
-                print(f"pinned: {pinned}")
+                console.field("Pinned", pinned, tone="accent")
             else:
-                print(f"pinned: {pinned}  (index is gone — "
-                      f"'{support.PROG} use --clear' or "
-                      f"'{support.PROG} use <version>')")
+                console.field("Pinned", pinned, tone="warning")
+                console.note("The pinned index is gone; clear the pin or select an index.")
+                console.commands([f"{support.PROG} use --clear",
+                                  f"{support.PROG} use <version>"])
         else:
-            print("nothing pinned; defaulting to the highest built version")
+            console.field("Selection", "Highest built version (nothing pinned)")
         active = support.default_index(warn=False)
         conn = None
         try:
@@ -350,7 +382,8 @@ def cmd_use(args, support):
         finally:
             if conn is not None:
                 conn.close()
-        print(f"active index: {active.stem}  ({active})")
+        console.field("Active index", active.stem, tone="success")
+        console.field("Path", active)
         return
     path = support.resolve_index_spec(args.version)
     conn = None
@@ -370,12 +403,17 @@ def cmd_use(args, support):
     finally:
         if conn is not None:
             conn.close()
-    print(f"default index is now {path.stem}\n"
-          "  every command without -K/--db will use it; "
-          f"undo with '{support.PROG} use --clear'")
+    console.heading(f"Default index is now {path.stem}", tone="success")
+    console.field("Path", path)
+    console.text("Every command without -K/--db will use this index.", tone="muted")
+    console.blank()
+    console.heading("Clear the selection")
+    console.commands([f"{support.PROG} use --clear"])
 
 
 def cmd_remove(args, support):
+    console = Console(args.color)
+    errors = Console(args.color, stream=sys.stderr)
     unique: list[Path] = []
     for spec in args.versions:
         path = support.resolve_index_spec(spec)
@@ -395,6 +433,7 @@ def cmd_remove(args, support):
     failures = 0
     completed_sources: dict[
         tuple[str, str], kernelsrc.ManagedSourceIdentity] = {}
+    console.heading("Removing indexes")
     for path in unique:
         alias = path.stem
         record = managed_sources[path]
@@ -429,18 +468,18 @@ def cmd_remove(args, support):
                 if args.source:
                     current = support._managed_source_record(path)
                     if tree is None:
-                        print(
-                            "  source kept (the index does not identify a "
+                        console.note(
+                            "source kept (the index does not identify a "
                             "matching managed source tree)")
                     elif (current is None
                           or not support._same_path(current[0], tree)
                           or current[1] != recorded_identity):
-                        print(
-                            "  source kept (the index changed while removal "
+                        console.note(
+                            "source kept (the index changed while removal "
                             "was waiting for its lifecycle lock)")
                     elif source_key in completed_sources:
                         marker_to_clear = completed_sources[source_key]
-                        print(f"source already removed at {tree}")
+                        console.text(f"source already removed at {tree}", tone="muted")
                     else:
                         identity = kernelsrc.source_identity_marker(
                             managed_version)
@@ -456,12 +495,12 @@ def cmd_remove(args, support):
                             == expected.get("managed_tree_digest")
                         )
                         if not matches_index:
-                            print(
-                                f"  could not remove source {tree}: the current "
+                            errors.note(
+                                f"could not remove source {tree}: the current "
                                 "tree/ownership marker is not the pristine "
                                 "tool-owned source "
                                 "recorded by this index; index kept",
-                                file=sys.stderr,
+                                tone="error",
                             )
                             failures += 1
                             continue
@@ -469,45 +508,46 @@ def cmd_remove(args, support):
                             removal = kernelsrc.prepare_source_removal(
                                 managed_version, identity)
                         except (OSError, RuntimeError, ValueError) as exc:
-                            print(
-                                f"  could not remove source {tree}: {exc}; "
+                            errors.note(
+                                f"could not remove source {tree}: {exc}; "
                                 "index kept",
-                                file=sys.stderr,
+                                tone="error",
                             )
                             failures += 1
                             continue
                         if removal is None:
-                            print(
-                                f"  could not remove source {tree}: its "
+                            errors.note(
+                                f"could not remove source {tree}: its "
                                 "ownership marker changed; index kept",
-                                file=sys.stderr,
+                                tone="error",
                             )
                             failures += 1
                             continue
                         identity = removal.identity
                         if removal.already_absent:
                             if tree.exists() or tree.is_symlink():
-                                print(
+                                console.note(
                                     "recorded source is already removed; "
                                     f"current entry kept at {tree}")
                             else:
-                                print(f"source is already absent at {tree}")
+                                console.text(f"source is already absent at {tree}",
+                                             tone="muted")
                         else:
                             try:
                                 shutil.rmtree(config.require_project_path(
                                     removal.quarantine))
                             except (OSError, ValueError) as exc:
-                                print(
-                                    f"  could not remove source {tree} from "
+                                errors.note(
+                                    f"could not remove source {tree} from "
                                     f"quarantine {removal.quarantine}: {exc}; "
                                     f"anything at {tree} is untouched",
-                                    file=sys.stderr,
+                                    tone="error",
                                 )
                                 failures += 1
                                 # The nonce-derived quarantine and index retain
                                 # authorization for an exact later retry.
                                 continue
-                            print(f"removed source  {tree}")
+                            console.field("removed source", tree, tone="success")
                         assert source_key is not None
                         completed_sources[source_key] = identity
                         marker_to_clear = identity
@@ -515,37 +555,35 @@ def cmd_remove(args, support):
                 try:
                     size = support._unlink_index(path)
                 except OSError as exc:
-                    print(f"  could not remove index {path}: {exc}",
-                          file=sys.stderr)
+                    errors.note(f"could not remove index {path}: {exc}", tone="error")
                     failures += 1
                     continue
                 freed += size
-                print(f"removed index   {path}  ({size / 1048576:.0f} MB)")
+                console.field("removed index", f"{path}  ({format_size(size)})",
+                              tone="success")
 
                 if marker_to_clear is not None:
                     try:
                         kernelsrc.clear_source_identity(
                             managed_version, marker_to_clear.token)
                     except OSError as exc:
-                        print(
-                            "  source and index were removed, but could not "
-                            f"clear ownership marker: {exc}", file=sys.stderr)
+                        errors.note(
+                            "source and index were removed, but could not "
+                            f"clear ownership marker: {exc}", tone="error")
                         failures += 1
 
                 try:
                     with kernelsrc.pin_lock():
                         if config.get_default_version() == alias:
                             config.clear_default_version()
-                            print(
-                                "  (it was the pinned default; the pin has been "
-                                "cleared)")
+                            console.text(
+                                "The pinned default was removed; the pin has been cleared.",
+                                tone="muted")
                 except (OSError, ValueError) as exc:
-                    print(f"  could not clear the default pin: {exc}",
-                          file=sys.stderr)
+                    errors.note(f"could not clear the default pin: {exc}", tone="error")
                     failures += 1
         except (OSError, RuntimeError, ValueError) as exc:
-            print(f"  could not lock lifecycle for {path}: {exc}",
-                  file=sys.stderr)
+            errors.note(f"could not lock lifecycle for {path}: {exc}", tone="error")
             failures += 1
             continue
 
@@ -555,10 +593,13 @@ def cmd_remove(args, support):
             except ValueError:
                 kept_tree = None
             if kept_tree is not None and kept_tree.is_dir():
-                print(f"  (source kept at {kept_tree}; remove it too with "
-                      "--source)")
-    print(f"\nfreed {freed / 1048576:.0f} MB of index files"
-          + (" (source trees not counted)" if args.source else ""))
+                console.text(f"source kept at {kept_tree}; remove it too with --source",
+                             tone="muted")
+    console.blank()
+    console.heading("Removal summary", tone="warning" if failures else "success")
+    console.field("Freed", f"{format_size(freed)} of index files")
+    if args.source:
+        console.text("Source tree sizes are not counted.", tone="muted")
     if failures:
         support._die(
             f"remove did not complete for {failures} item"
@@ -583,36 +624,48 @@ def cmd_stats(args, support):
             "symbols_by_kind": extra,
         }))
         return
-    color = render.use_color(args.color)
-    print(render.paint(f"{support._linux(meta)} index", "1", color))
-    print(f"  built        {meta.get('built_at', '?')}")
-    print(f"  source       {meta.get('source', '?')}")
-    print(f"  directories  {int(meta.get('n_dirs', 0)):,}")
-    print(f"  files        {int(meta.get('n_files', 0)):,}")
-    print(f"  subsystems   {int(meta.get('n_subsystems', 0)):,}")
-    print(f"  symbols      {int(meta.get('n_symbols', 0)):,}")
-    if meta.get("has_calls") == "1":
-        total_calls = int(meta.get("n_calls", 0))
-        resolved_calls = int(meta.get("n_calls_resolved", 0))
-        print(f"  call records {total_calls:,} "
-              f"({resolved_calls:,} resolved identities)")
-        print(f"  call sites   "
-              f"{int(meta.get('n_call_occurrences', 0)):,} occurrences")
-        print(f"  call gaps    {int(meta.get('n_calls_ambiguous', 0)):,} "
-              f"ambiguous, {int(meta.get('n_calls_macro', 0)):,} macro-only, "
-              f"{int(meta.get('n_calls_indirect', 0)):,} indirect, "
-              f"{int(meta.get('n_calls_unresolved', 0)):,} unresolved")
-    print(f"  parse inputs {parse_inputs['parsed']:,} parsed, "
-          f"{parse_inputs['skipped']:,} skipped, "
-          f"{parse_inputs['failed']:,} failed "
-          f"({parse_inputs['oversized']:,} oversized)")
+    console = Console(args.color)
+    console.heading(f"{support._linux(meta)} index")
+    console.field("Built", meta.get("built_at", "?"))
+    console.field("Source", meta.get("source", "?"))
+    console.blank()
+    console.heading("Contents")
+    for label, key in (("Directories", "n_dirs"), ("Files", "n_files"),
+                       ("Subsystems", "n_subsystems"), ("Symbols", "n_symbols")):
+        console.field(label, f"{int(meta.get(key, 0)):,}")
     if int(meta.get("n_symlinks", 0)):
-        print(f"  symlinks     {int(meta['n_symlinks']):,}")
-    for row in conn.execute(
-            "SELECT kind, COUNT(*) n FROM symbols GROUP BY kind"
-            " ORDER BY n DESC"):
-        print(f"      {row['kind']:<12} {row['n']:>9,}")
-    print(render.paint("\n  largest top-level areas", "1", color))
+        console.field("Symlinks", f"{int(meta['n_symlinks']):,}")
+    console.blank()
+    console.heading("Parsing")
+    console.field("Parsed C/H", f"{parse_inputs['parsed']:,}")
+    console.field("Skipped", f"{parse_inputs['skipped']:,}",
+                  tone="warning" if parse_inputs["skipped"] else None)
+    console.field("Failed", f"{parse_inputs['failed']:,}",
+                  tone="error" if parse_inputs["failed"] else None)
+    console.field("Oversized", f"{parse_inputs['oversized']:,}",
+                  tone="warning" if parse_inputs["oversized"] else None)
+    if meta.get("has_calls") == "1":
+        console.blank()
+        console.heading("Call graph")
+        console.field("Call records", f"{int(meta.get('n_calls', 0)):,}")
+        console.field("Call sites", f"{int(meta.get('n_call_occurrences', 0)):,} occurrences")
+        console.field("Resolved", f"{int(meta.get('n_calls_resolved', 0)):,} identities")
+        for label, key in (("Ambiguous", "n_calls_ambiguous"),
+                           ("Macro-only", "n_calls_macro"),
+                           ("Indirect", "n_calls_indirect"),
+                           ("Unresolved", "n_calls_unresolved")):
+            console.field(label, f"{int(meta.get(key, 0)):,}")
+    console.blank()
+    console.heading("Symbols by kind")
+    console.table(
+        ("Kind", "Symbols"),
+        [(row["kind"], f"{row['n']:,}") for row in conn.execute(
+            "SELECT kind, COUNT(*) n FROM symbols GROUP BY kind ORDER BY n DESC")],
+        align_right=(1,), tones={0: "accent"},
+    )
+    console.blank()
+    console.heading("Largest top-level areas")
+    areas = []
     for row in conn.execute(
         "SELECT d.name, COUNT(f.id) n FROM dirs d JOIN files f"
         " ON substr(f.path, 1, length(d.path) + 1) = d.path || '/'"
@@ -620,8 +673,9 @@ def cmd_stats(args, support):
         " GROUP BY d.id ORDER BY n DESC LIMIT 8"
     ):
         area = maintainers.TOP_LEVEL_AREAS.get(row["name"])
-        label = f"{area[0]}" if area else ""
-        print(f"      {row['name']:<14} {row['n']:>7,} files   {label}")
+        areas.append((row["name"], f"{row['n']:,}", area[0] if area else ""))
+    console.table(("Area", "Files", "Description"), areas,
+                  align_right=(1,), tones={0: "accent"})
 
 
 def cmd_check(args, support):
@@ -642,8 +696,11 @@ def cmd_check(args, support):
     if args.format == "json":
         sys.stdout.write(render.render_json(payload))
         return
-    print(f"{support._linux(meta)} index is structurally and semantically "
-          "consistent")
-    print(f"  {payload['files']:,} files, {payload['symbols']:,} symbols, "
-          f"{payload['calls']:,} call records / "
-          f"{payload['call_occurrences']:,} occurrences checked")
+    console = Console(args.color)
+    console.heading(f"{support._linux(meta)} index check passed", tone="success")
+    console.text("The index is structurally and semantically consistent.")
+    console.blank()
+    console.heading("Checked")
+    for label, key in (("Files", "files"), ("Symbols", "symbols"),
+                       ("Call records", "calls"), ("Occurrences", "call_occurrences")):
+        console.field(label, f"{payload[key]:,}")

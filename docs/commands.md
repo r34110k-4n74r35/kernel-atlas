@@ -468,6 +468,18 @@ flow requires an index built with `--with-calls`.
 
 ## Controlling the output
 
+Human-readable reports share colored headings, aligned fields and tables, and
+separate warning and summary sections. Tables adapt to terminal width without
+discarding values. Green highlights successful results, yellow highlights
+warnings, and red marks errors; text labels also convey the meaning without
+color. Suggested shell commands and `ka web` URLs remain intact for copying.
+
+Color defaults to `auto`: each stream uses ANSI color only when connected to a
+terminal, unless `NO_COLOR` is set or `TERM=dumb`. Use `--color never` for plain
+output, or `--color always` to force color in human-readable reports. JSON,
+CSV, `names`, and `plain` formats remain undecorated in every color mode, as do
+`path`, `web --url`, and `show --bare`.
+
 Listing commands (`siblings`, `ls`, `find`, `calls`) share these controls:
 
 | Option | Values / meaning |

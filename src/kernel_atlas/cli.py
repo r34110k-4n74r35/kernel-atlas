@@ -10,7 +10,7 @@ import stat
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from . import config, db, links, query, render
+from . import config, db, links, query, render, terminal
 from . import indexer  # noqa: F401 - public monkeypatch seam for build tests
 from .commands import (
     aggregate as cli_aggregate,
@@ -34,7 +34,7 @@ PROG = "kernel-atlas"
 # --------------------------------------------------------------------------
 
 def _die(msg: str, code: int = 1):
-    print(f"{PROG}: {msg}", file=sys.stderr)
+    terminal.Console(stream=sys.stderr).text(f"{PROG}: {msg}", tone="error", indent=0)
     raise SystemExit(code)
 
 
@@ -143,10 +143,10 @@ def default_index(*, warn: bool = True) -> Path:
         if path.is_file():
             return path
         if warn:
-            print(f"{PROG}: pinned version {pinned} has no index any more; "
-                  f"falling back to the highest built version "
-                  f"(fix with '{PROG} use <version>' or '{PROG} use --clear')",
-                  file=sys.stderr)
+            terminal.Console(stream=sys.stderr).note(
+                f"{PROG}: pinned version {pinned} has no index any more; "
+                f"falling back to the highest built version "
+                f"(fix with '{PROG} use <version>' or '{PROG} use --clear')")
     return max(available, key=_index_version_key)
 
 
@@ -350,7 +350,7 @@ def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: boo
     if not explicit_columns and default_columns:
         cols = list(default_columns)
     if not machine and header:
-        print(render.paint(header, "1", color))
+        terminal.Console(args.color).heading(header)
     if fmt == "json":
         rows = [render.entry_dict(e, cols if explicit_columns else None)
                 for e in entries]
@@ -363,7 +363,9 @@ def emit(entries: list[Entry], args, kinds_listed: set[str], with_subsystem: boo
     sys.stdout.write(text)
     if not machine:
         n = len(entries)
-        print(render.paint(f"\n{n} result{'s' if n != 1 else ''}", "90", color))
+        console = terminal.Console(args.color)
+        console.blank()
+        console.text(f"{n} result{'s' if n != 1 else ''}", tone="muted", indent=0)
 
 
 def _entry_is_target(e: Entry, t: query.Target) -> bool:
@@ -1081,6 +1083,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    with terminal.color_mode(args.color):
+        return _run(args)
+
+
+def _run(args) -> int:
     db_arg = getattr(args, "db", None)
     kernel_arg = getattr(args, "kernel", None)
     if db_arg and kernel_arg:
@@ -1100,7 +1107,9 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         _die(str(exc))
     except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
+        console = terminal.Console(stream=sys.stderr)
+        console.blank()
+        console.text("interrupted", tone="warning", indent=0)
         return 130
     finally:
         _close_indexes()

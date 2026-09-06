@@ -6,12 +6,75 @@ Handlers are supplied by the entry point so this module never imports it.
 from __future__ import annotations
 
 import argparse
+import re
+import sys
 
-from .. import __version__, cparse, query, render
+from .. import __version__, cparse, query, render, terminal
 from ..documentation_query import documentation_scope
 
 _MAX_CLI_COUNT = 2**31 - 1
 _MAX_JOBS = 256
+
+
+class _Parser(argparse.ArgumentParser):
+    """Keep help and usage errors consistent with the CLI's color preference."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Python 3.14 added its own color policy; apply ours after layout so
+        # --color, NO_COLOR, and TERM behave alike on every supported Python.
+        if hasattr(self, "color"):
+            self.color = False
+
+    @staticmethod
+    def _color_choice(values):
+        choice = None
+        for i, value in enumerate(values):
+            if value == "--":
+                break
+            candidate = (values[i + 1] if value == "--color" and i + 1 < len(values)
+                         else value.removeprefix("--color=")
+                         if value.startswith("--color=") else None)
+            if candidate in {"auto", "always", "never"}:
+                choice = candidate
+        return choice
+
+    def parse_args(self, args=None, namespace=None):
+        values = list(sys.argv[1:] if args is None else args)
+        choice = self._color_choice(values)
+        if choice is None:
+            return super().parse_args(values, namespace)
+        with terminal.color_mode(choice):
+            return super().parse_args(values, namespace)
+
+    def parse_known_args(self, args=None, namespace=None):
+        values = list(sys.argv[1:] if args is None else args)
+        choice = self._color_choice(values)
+        if choice is None:
+            return super().parse_known_args(values, namespace)
+        with terminal.color_mode(choice):
+            return super().parse_known_args(values, namespace)
+
+    def _print_message(self, message, file=None):
+        if not message:
+            return
+        stream = sys.stderr if file is None else file
+        color = terminal.color_enabled(stream)
+        lines = []
+        for raw in message.splitlines(keepends=True):
+            end = "\n" if raw.endswith("\n") else ""
+            line = terminal.clean(raw.removesuffix("\n"))
+            if ": error:" in line:
+                line = render.paint(line, "1;31", color)
+            elif line and not line.startswith(" ") and line.endswith(":"):
+                line = render.paint(line, "1;36", color)
+            else:
+                line = re.sub(r"(?<!\w)--?[A-Za-z][A-Za-z0-9_-]*",
+                              lambda m: render.paint(m[0], "36", color), line)
+                if line.startswith("usage:"):
+                    line = render.paint("usage:", "1;36", color) + line[6:]
+            lines.append(line + end)
+        super()._print_message("".join(lines), stream)
 
 
 def _nonempty_arg(value: str) -> str:
@@ -100,7 +163,7 @@ def _global_opts(parser, suppress: bool):
 
 
 def build_parser(support) -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog=support.PROG,
         description="Index a Linux kernel tree and explore its structure, "
                     "symbols and subsystems.",

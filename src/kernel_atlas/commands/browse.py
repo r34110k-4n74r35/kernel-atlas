@@ -9,13 +9,13 @@ from dataclasses import replace
 
 from .. import query, render
 from ..query import Entry
+from ..terminal import Console, clean
 
 
 def cmd_info(args, support):
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target, meta)
     t = res.target
-    color = render.use_color(args.color)
 
     composition = query.all_subsystems(
         conn, "dir" if t.kind == "dir" else "file",
@@ -150,14 +150,15 @@ def cmd_info(args, support):
         sys.stdout.write(render.render_json(payload))
         return
 
-    print(render.paint(t.display, "1;36", color))
+    console = Console(args.color)
+    console.heading(t.display)
     if res.note:
-        print(render.paint(f"  ({res.note})", "33", color))
-    print()
+        console.note(res.note)
+    console.blank()
 
-    def field(k, v):
+    def field(k, v, tone=None):
         if v is not None and v != "":
-            print(f"  {k:<12} {v}")
+            console.field(k, v, tone=tone)
 
     if t.kind == "symbol":
         field("kind", t.symbol_kind)
@@ -179,10 +180,11 @@ def cmd_info(args, support):
         elif path_row is not None:
             field("size", f"{path_row['size']:,} bytes, "
                           f"{path_row['lines']:,} lines")
-            field("index status", path_row["index_status"])
+            field("index status", path_row["index_status"],
+                  "error" if path_row["index_error"] else None)
             if path_row["is_symlink"]:
                 field("symlink to", path_row["link_target"] or "unknown")
-            field("index error", path_row["index_error"])
+            field("index error", path_row["index_error"], "error")
             if symbols_by_kind:
                 field("defines", ", ".join(
                     f"{count} {kind}" for kind, count in symbols_by_kind.items()))
@@ -190,7 +192,7 @@ def cmd_info(args, support):
     if source_exists:
         field("on disk", on_disk)
     elif on_disk is not None:
-        field("source path", f"{on_disk} (missing)")
+        field("source path", f"{on_disk} (missing)", "warning")
     field("index", support._linux(meta))
     field("elixir", lnks.get("elixir"))
     if lnks.get("docs"):
@@ -199,77 +201,81 @@ def cmd_info(args, support):
         field("ident", lnks["ident"])
 
     if area:
-        print()
-        print(render.paint(f"  Area: {area[0]}", "1;32", color))
-        print(f"    {area[1]}")
+        console.blank()
+        console.heading(f"Area: {area[0]}", tone="success")
+        console.text(area[1])
 
     if subs or unclassified is not None or unmatched_files:
-        print()
-        heading = ("  Subsystem composition (from descendant files)"
-                   if t.kind == "dir" else "  Subsystem (from MAINTAINERS)")
-        print(render.paint(heading, "1;35", color))
+        console.blank()
+        heading = ("Subsystem composition (from descendant files)"
+                   if t.kind == "dir" else "Subsystem (from MAINTAINERS)")
+        console.heading(heading, tone="accent")
         for i, s in enumerate(subs[:args.max_subsystems]):
-            marker = "*" if (i == 0 if t.kind == "dir"
-                               else bool(s["is_primary"])) else " "
+            primary = i == 0 if t.kind == "dir" else bool(s["is_primary"])
+            marker = "*" if primary else "-"
             if t.kind == "dir":
                 detail = (f"{s['n_primary']:,} primary / {s['n_claimed']:,} "
                           f"claimed descendant files ({s['coverage']:.0%})")
             else:
                 detail = f"{s['n_files']:,} claimed files"
-            print(f"   {marker} {render.paint(s['name'], '1', color)}"
-                  f"   [{s['status'] or 'unknown'}]  {detail}")
+            if i:
+                console.blank()
+            console.text(f"{marker} {s['name']}", tone="bold")
+            console.field("status", s["status"] or "unknown")
+            console.field("ownership", detail)
             f = query.subsystem_json_fields(s)
             for who in f["maintainers"][:3]:
-                print(f"       maintainer  {who}")
+                console.field("maintainer", who)
             for lst in f["lists"][:2]:
-                print(f"       list        {lst}")
+                console.field("list", lst)
         if unclassified is not None:
             if t.kind == "dir":
                 detail = (f"{unclassified['n_primary']:,} primary descendant "
                           f"files ({unclassified['coverage']:.0%})")
             else:
                 detail = "the only primary ownership match for this file"
-            print("     " + render.paint("Unclassified", "1", color)
-                  + f"   {detail}; represented only by the "
-                    f"{unclassified['name']} catch-all")
+            console.note(f"Unclassified: {detail}; represented only by the "
+                         f"{unclassified['name']} catch-all")
         if unmatched_files:
             if t.kind == "dir":
                 detail = (f"{unmatched_files:,} descendant file"
                           f"{'s have' if unmatched_files != 1 else ' has'}")
             else:
                 detail = "the containing file has"
-            print("     " + render.paint("Unclassified", "1", color)
-                  + f"   {detail} no primary MAINTAINERS match")
+            console.note(f"Unclassified: {detail} no primary MAINTAINERS match")
         if len(subs) > args.max_subsystems:
-            print(f"     ... and {len(subs) - args.max_subsystems} more "
-                  f"(--max-subsystems to show)")
+            console.text(f"... and {len(subs) - args.max_subsystems} more "
+                         "(--max-subsystems to show)", tone="muted")
     elif not area:
-        print("\n  No MAINTAINERS section claims this path.")
+        console.blank()
+        console.note("No MAINTAINERS section claims this path.")
 
     anc = query.ancestry(conn, t.path)
     if anc:
-        print()
-        print(render.paint("  Path breakdown", "1", color))
-        for p, s in anc:
-            print(f"    {p + '/':<38} {s or '-'}")
+        console.blank()
+        console.heading("Path breakdown")
+        console.table(["PATH", "SUBSYSTEM"],
+                      [(p + "/", s or "-") for p, s in anc],
+                      tones={0: "info", 1: "accent"})
 
     if res.candidates:
-        print()
-        print(render.paint(f"  {len(res.candidates)} other candidate(s) "
-                           f"for this name", "33", color))
+        console.blank()
+        console.heading(f"{len(res.candidates)} other candidate(s) "
+                        "for this name", tone="warning")
         for c in res.candidates[:args.max_candidates]:
-            print(f"    {c.display}  ({c.symbol_kind or c.kind})")
+            console.text(f"{c.display}  ({c.symbol_kind or c.kind})")
         if len(res.candidates) > args.max_candidates:
-            print(f"    ... and {len(res.candidates) - args.max_candidates} more")
+            console.text(f"... and {len(res.candidates) - args.max_candidates} more",
+                         tone="muted")
 
     prefix = support._command_prefix(args, meta)
     target_arg = shlex.quote(support._target_spec(t))
-    next_lines = [f"\n  Next:  {prefix} siblings {target_arg}"]
+    next_lines = [f"{prefix} siblings {target_arg}"]
     if t.kind == "symbol" and t.symbol_kind in {"struct", "union"}:
-        next_lines.append(f"         {prefix} struct {target_arg}")
+        next_lines.append(f"{prefix} struct {target_arg}")
     if lnks:
-        next_lines.append(f"         {prefix} web {target_arg}")
-    print("\n".join(next_lines))
+        next_lines.append(f"{prefix} web {target_arg}")
+    console.commands(next_lines)
 
 
 def cmd_siblings(args, support):
@@ -433,12 +439,16 @@ def cmd_subsystems(args, support):
             payload.append(item)
         sys.stdout.write(render.render_json(payload))
         return
-    color = render.use_color(args.color)
-    print(render.paint(f"{len(rows)} subsystems  [{support._linux(meta)}]", "1", color))
-    print(f"  {'CLAIMED':>7} {'PRIMARY':>7}  {'STATUS':<16} NAME")
-    for r in rows:
-        print(f"  {r['n_files']:>7,} {r['n_primary_files']:>7,}  "
-              f"{r['status'] or '?':<16} {r['name']}")
+    console = Console(args.color)
+    console.heading(f"{len(rows)} subsystems  [{support._linux(meta)}]")
+    console.table(
+        ["CLAIMED", "PRIMARY", "STATUS", "NAME"],
+        [(f"{r['n_files']:,}", f"{r['n_primary_files']:,}",
+          r["status"] or "?", r["name"]) for r in rows],
+        align_right=(0, 1), tones={0: "bold", 1: "bold", 3: "accent"},
+    )
+    if not rows:
+        console.note("No subsystems match the requested filters.")
 
 
 def cmd_subsystem(args, support):
@@ -460,11 +470,17 @@ def cmd_subsystem(args, support):
                 "index": support.index_version(meta),
             }))
             return
-        color = render.use_color(args.color)
-        print(render.paint(f"{len(rows)} subsystems match {args.name!r}:", "1", color))
-        for r in rows:
-            print(f"  {r['n_files']:>6,} claimed  "
-                  f"{r['n_primary_files']:>6,} primary  {r['name']}")
+        console = Console(args.color)
+        console.heading(f"{len(rows)} subsystems match {args.name!r}:",
+                        tone="warning")
+        console.table(
+            ["CLAIMED", "PRIMARY", "NAME"],
+            [(f"{r['n_files']:,}", f"{r['n_primary_files']:,}", r["name"])
+             for r in rows],
+            align_right=(0, 1), tones={0: "bold", 1: "bold", 2: "accent"},
+        )
+        console.text("Use the complete subsystem name to see its details.",
+                     tone="muted")
         return
     s = rows[0]
     f = query.subsystem_json_fields(s)
@@ -495,45 +511,52 @@ def cmd_subsystem(args, support):
                 (s["id"],))]
         sys.stdout.write(render.render_json(payload))
         return
-    color = render.use_color(args.color)
-    print(render.paint(s["name"], "1;35", color))
-    print(f"  index        {support._linux(meta)}")
-    print(f"  status       {s['status'] or 'unknown'}")
+    console = Console(args.color)
+    console.heading(s["name"], tone="accent")
+    console.field("index", support._linux(meta))
+    console.field("status", s["status"] or "unknown")
     for who in f["maintainers"]:
-        print(f"  maintainer   {who}")
+        console.field("maintainer", who)
     for who in f["reviewers"][:5]:
-        print(f"  reviewer     {who}")
+        console.field("reviewer", who)
     for lst in f["lists"]:
-        print(f"  list         {lst}")
+        console.field("list", lst)
     for tree in f["trees"][:3]:
-        print(f"  git          {tree}")
+        console.field("git", tree)
     for website in f["websites"]:
-        print(f"  web          {website}")
+        console.field("web", website)
     for url in f["patchwork"]:
-        print(f"  patchwork    {url}")
+        console.field("patchwork", url)
     for url in f["bugs"]:
-        print(f"  bugs         {url}")
+        console.field("bugs", url)
     for chat in f["chats"]:
-        print(f"  chat         {chat}")
+        console.field("chat", chat)
     for profile in f["profiles"]:
-        print(f"  profile      {profile}")
+        console.field("profile", profile)
     if f["keywords"]:
-        print(f"  keywords     {', '.join(f['keywords'])}")
-    print(f"  files        {s['n_files']:,} claimed, "
-          f"{s['n_primary_files']:,} primary")
+        console.field("keywords", ", ".join(f["keywords"]))
+    console.field("files", f"{s['n_files']:,} claimed, "
+                  f"{s['n_primary_files']:,} primary")
 
-    print(render.paint("\n  Directory composition", "1", color))
-    for r in directory_rows:
-        print(f"    {r['path'] + '/':<48} {r['n_primary']:>5} primary  "
-              f"{r['n_claimed']:>5} claimed  {r['coverage']:>6.1%}")
+    console.blank()
+    console.heading("Directory composition")
+    console.table(
+        ["DIRECTORY", "PRIMARY", "CLAIMED", "COVERAGE"],
+        [(r["path"] + "/", f"{r['n_primary']:,}", f"{r['n_claimed']:,}",
+          f"{r['coverage']:.1%}") for r in directory_rows],
+        align_right=(1, 2, 3), tones={0: "info", 1: "bold", 3: "success"},
+    )
+    if not directory_rows:
+        console.text("No indexed subdirectories.", tone="muted")
 
     if args.files:
-        print(render.paint("\n  Files", "1", color))
+        console.blank()
+        console.heading("Files")
         for r in conn.execute(
             "SELECT f.path FROM files f JOIN path_subsys p ON p.ref_kind='file'"
             " AND p.ref_id=f.id WHERE p.subsystem_id=? ORDER BY f.path", (s["id"],)
         ):
-            print(f"    {r['path']}")
+            console.text(r["path"], tone="info")
 
 
 def cmd_tree(args, support):
@@ -582,10 +605,12 @@ def cmd_tree(args, support):
     # the ancestors of the directory the user asked about.
     prefix = f"{base}/" if base else ""
     relative = [replace(e, path=e.path[len(prefix):]) for e in entries]
-    print(render.paint(f"{base or 'kernel root'}/", "1;34", color))
+    console = Console(args.color)
+    console.heading(f"{base or 'kernel root'}/")
     sys.stdout.write(render.render_tree(relative, color))
-    print(render.paint(f"\n{len(entries)} entries (depth {max_depth})  [{support._linux(meta)}]",
-                       "90", color))
+    console.blank()
+    console.text(f"{len(entries)} entries (depth {max_depth})  [{support._linux(meta)}]",
+                 tone="muted", indent=0)
 
 
 def cmd_path(args, support):
@@ -658,14 +683,17 @@ def cmd_show(args, support):
 
     color = render.use_color(args.color)
     if not args.bare:
+        console = Console(args.color)
         sub = query.subsystem_for_target(conn, t)
         head = f"{t.path}:{start}" + (f"-{end}" if end else "")
         if t.kind == "symbol":
             head = f"{t.path}:{t.line}  {t.name}"
         label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
-        print(render.paint(head, "1;36", color)
-              + (render.paint(f"   [{label}]", "35", color) if label else "")
-              + render.paint(f"   [{support._linux(meta)}]", "90", color))
+        console.heading(head)
+        console.field("index", support._linux(meta), tone="muted")
+        if label:
+            console.field("subsystem", label, tone="accent")
+        console.blank()
     printed = 0
     try:
         with full.open(encoding="utf-8", errors="replace") as fh:
@@ -674,8 +702,13 @@ def cmd_show(args, support):
                     continue
                 if end is not None and i > end:
                     break
-                prefix = "" if args.bare else render.paint(f"{i:6} ", "90", color)
-                print(prefix + line.rstrip("\n"))
+                prefix = "" if args.bare else render.paint(f"{i:6} | ", "90", color)
+                # Keep --bare source untouched. In the numbered view retain tabs
+                # for code indentation, but do not let source text inject ANSI.
+                content = line.rstrip("\n")
+                if not args.bare:
+                    content = "\t".join(clean(part) for part in content.split("\t"))
+                print(prefix + content)
                 printed += 1
     except OSError as exc:
         support._die(f"cannot read {full}: {exc}")

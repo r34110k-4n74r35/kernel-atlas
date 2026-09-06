@@ -5,13 +5,13 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
 import sys
 from collections import Counter
 
 from .query import Entry
 from .render_format import paint
 from .structure_render import render_structure as _render_structure
+from .terminal import clean, color_enabled, table_text, terminal_width
 
 COLUMNS = ("kind", "name", "path", "dir", "line", "span", "lines", "size",
            "symbols", "subdirs", "files", "flags", "subsystem", "signature",
@@ -31,11 +31,7 @@ _KIND_COLOR = {
 
 
 def use_color(choice: str = "auto") -> bool:
-    if choice == "never":
-        return False
-    if choice == "always":
-        return True
-    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    return color_enabled(sys.stdout, choice)
 
 
 def human_size(n: int | None) -> str:
@@ -115,36 +111,14 @@ def render_table(entries: list[Entry], columns, color: bool,
     if not entries:
         return ""
     rows = [[cell(e, c) for c in columns] for e in entries]
-    headers = [c.upper() for c in columns]
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, v in enumerate(row):
-            widths[i] = max(widths[i], len(v))
-
-    # Let the last column soak up remaining terminal width instead of wrapping.
-    if max_width:
-        fixed = sum(widths[:-1]) + 2 * (len(columns) - 1)
-        widths[-1] = max(12, min(widths[-1], max_width - fixed))
-
-    out = io.StringIO()
-    head = "  ".join(
-        h.ljust(widths[i]) if columns[i] not in _NUMERIC else h.rjust(widths[i])
-        for i, h in enumerate(headers))
-    out.write(paint("  " + head.rstrip(), "1;90", color) + "\n")
-
-    for e, row in zip(entries, rows):
-        cells = []
-        for i, v in enumerate(row):
-            if len(v) > widths[i]:
-                v = v[:widths[i] - 1] + "…"
-            v = v.rjust(widths[i]) if columns[i] in _NUMERIC else v.ljust(widths[i])
-            if columns[i] in ("kind", "name"):
-                v = paint(v, _KIND_COLOR.get(e.kind, "0"), color)
-            cells.append(v)
-        line = "  ".join(cells).rstrip()
-        line = (paint("> ", "1;33", color) if e.is_target else "  ") + line
-        out.write(line + "\n")
-    return out.getvalue()
+    codes = [[_KIND_COLOR.get(e.kind, "") if c in ("kind", "name")
+              else ("35" if c == "subsystem" else "36" if c in ("path", "dir")
+                    else "90" if c in ("flags", "resolution") else "")
+              for c in columns] for e in entries]
+    return table_text([c.upper() for c in columns], rows, color=color,
+                      width=max_width, cell_codes=codes,
+                      align_right={i for i, c in enumerate(columns) if c in _NUMERIC},
+                      markers=[e.is_target for e in entries])
 
 
 def render_plain(entries: list[Entry]) -> str:
@@ -270,7 +244,7 @@ def render_tree(entries: list[Entry], color: bool) -> str:
                     leaf_seen[(e.name, e.line, e.kind)] += 1
                     if leaf_seen[(e.name, e.line, e.kind)] > 1:
                         label += f" #{leaf_seen[(e.name, e.line, e.kind)]}"
-                label = paint(label, _KIND_COLOR.get(e.kind, "0"), color)
+                label = paint(clean(label), _KIND_COLOR.get(e.kind, "0"), color)
                 out.write(f"{prefix}{'└── ' if last else '├── '}{label}\n")
                 continue
 
@@ -278,7 +252,9 @@ def render_tree(entries: list[Entry], color: bool) -> str:
             e = child.get("__entry__")
             label = key + ("/" if e is not None and e.kind == "dir" else "")
             if e is not None:
-                label = paint(label, _KIND_COLOR.get(e.kind, "0"), color)
+                label = paint(clean(label), _KIND_COLOR.get(e.kind, "0"), color)
+            else:
+                label = clean(label)
             out.write(f"{prefix}{'└── ' if last else '├── '}{label}\n")
             walk(child, prefix + ("    " if last else "│   "))
 
@@ -302,7 +278,5 @@ def render(entries: list[Entry], columns, fmt: str, color: bool,
 
 
 def term_width(default: int = 120) -> int:
-    try:
-        return os.get_terminal_size().columns
-    except OSError:
-        return default
+    # Pipes retain full values, independent of an unrelated terminal's width.
+    return terminal_width(sys.stdout) if sys.stdout.isatty() else 0

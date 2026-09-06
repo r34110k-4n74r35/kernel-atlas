@@ -2,124 +2,20 @@
 
 from __future__ import annotations
 
-import os
-import re
-import shutil
 import sys
-import unicodedata
-from contextlib import contextmanager
-from contextvars import ContextVar
 from pathlib import Path
 
 from .render_format import paint
-
-_COLOR_MODE = ContextVar("kernel_atlas_build_color", default="auto")
-_TONES = {"info": "36", "success": "32", "warning": "33", "error": "31"}
-
-
-@contextmanager
-def color_mode(choice: str):
-    """Scope a CLI color preference without changing subsequent library calls."""
-    token = _COLOR_MODE.set(choice)
-    try:
-        yield
-    finally:
-        _COLOR_MODE.reset(token)
-
-
-def color_enabled(stream, choice: str | None = None) -> bool:
-    choice = _COLOR_MODE.get() if choice is None else choice
-    if choice == "never":
-        return False
-    if choice == "always":
-        return True
-    return (stream.isatty() and "NO_COLOR" not in os.environ
-            and os.environ.get("TERM") != "dumb")
-
-
-def clean(value) -> str:
-    """Keep paths and other user-controlled text from injecting terminal codes."""
-    return "".join(c if c.isprintable() else "?" for c in str(value))
-
-
-def _character_width(char: str) -> int:
-    if unicodedata.combining(char) or unicodedata.category(char) in {"Mn", "Me"}:
-        return 0
-    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
-
-
-def display_width(text: str) -> int:
-    """Count terminal cells in plain text, including wide and combining glyphs."""
-    return sum(_character_width(char) for char in text)
-
-
-def wrap_text(text: str, width: int, *, subsequent_indent: str = "") -> list[str]:
-    """Wrap plain text by display cells, preserving words and internal spaces.
-
-    Long words split only when necessary. Indentation gives way on very narrow
-    terminals; a two-cell glyph becomes ``?`` only when the entire row is one
-    cell wide. Callers apply ANSI styles after wrapping.
-    """
-    width = max(1, width)
-    lines = []
-    line = ""
-    used = 0
-    spaces = ""
-
-    def flush():
-        nonlocal line, used
-        if line.strip():
-            lines.append(line.rstrip())
-        line = subsequent_indent
-        used = display_width(line)
-
-    for token in re.findall(r" +|[^ ]+", text):
-        if token.startswith(" "):
-            spaces = token
-            continue
-        if line.strip() and used + len(spaces) + display_width(token) > width:
-            flush()
-            spaces = ""
-        if spaces and (line.strip() or not lines):
-            line += spaces
-            used += len(spaces)
-        spaces = ""
-        for char in token:
-            cells = _character_width(char)
-            if cells > width:
-                char, cells = "?", 1
-            if used + cells > width:
-                if line.strip():
-                    flush()
-                # Leave room for the next glyph, even if leading whitespace
-                # contains wide spaces rather than ordinary indentation.
-                if used + cells > width:
-                    trimmed = []
-                    used = 0
-                    for space in line:
-                        space_width = _character_width(space)
-                        if used + space_width > width - cells:
-                            break
-                        trimmed.append(space)
-                        used += space_width
-                    line = "".join(trimmed)
-            line += char
-            used += cells
-    if line.strip():
-        lines.append(line.rstrip())
-    return lines
-
-
-def terminal_width(stream) -> int:
-    if not stream.isatty():
-        return 100
-    try:
-        columns = os.get_terminal_size(stream.fileno()).columns
-    except (OSError, ValueError, AttributeError):
-        columns = 0
-    if columns <= 0:
-        columns = shutil.get_terminal_size(fallback=(100, 24)).columns
-    return max(1, columns - 1)
+from .terminal import (
+    TONES as _TONES,
+    clean as clean,
+    color_enabled as color_enabled,
+    color_mode as color_mode,
+    display_width as display_width,
+    format_size as _size,
+    terminal_width as terminal_width,
+    wrap_text as wrap_text,
+)
 
 
 def _field(label, value, *, stream, tone: str | None = None,
@@ -175,15 +71,6 @@ def header(version: str, source, output, *, calls: bool, workers: int | None,
                          ("Workers", workers if workers is not None else "automatic")):
         _field(label, value, stream=stream)
     print(file=stream)
-
-
-def _size(size: int) -> str:
-    value = float(size)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
-            return f"{value:,.1f} {unit}" if unit != "B" else f"{size:,} B"
-        value /= 1024
-    raise AssertionError("unreachable")
 
 
 def _elapsed(seconds: float) -> str:

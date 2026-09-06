@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import shlex
-import shutil
 import sys
 from pathlib import Path
 
 from .. import links, query, render
+from ..terminal import Console, terminal_width
 
 
 def cmd_struct(args, support):
@@ -139,7 +139,7 @@ def cmd_struct(args, support):
         return
 
     color = render.use_color(args.color)
-    width = shutil.get_terminal_size((100, 24)).columns
+    width = terminal_width(sys.stdout)
     for index, detail in enumerate(definitions):
         if index:
             print()
@@ -148,9 +148,9 @@ def cmd_struct(args, support):
         f"{definitions[0]['path']}:{definitions[0]['line']}")
     prefix = support._command_prefix(args, meta)
     next_lines = [
-        f"\n  Next:  {prefix} show {target_spec}",
-        f"         {prefix} docs {target_spec}",
+        f"{prefix} show {target_spec}",
+        f"{prefix} docs {target_spec}",
     ]
     if definitions[0]["links"]:
-        next_lines.append(f"         {prefix} web {target_spec}")
-    print("\n".join(next_lines))
+        next_lines.append(f"{prefix} web {target_spec}")
+    Console(args.color).commands(next_lines)

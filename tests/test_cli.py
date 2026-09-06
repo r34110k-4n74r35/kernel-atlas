@@ -137,8 +137,8 @@ def test_remove_does_not_clear_a_concurrently_selected_different_pin(
 
     assert cli.main(["use"]) == 0
     out = capsys.readouterr().out
-    assert "pinned: 6.18.45" in out
-    assert "active index: 6.18.45" in out
+    assert "Pinned 6.18.45" in " ".join(out.split())
+    assert "Active index 6.18.45" in " ".join(out.split())
 
 
 def test_use_clear_and_both_args_rejected(home, capsys):
@@ -255,8 +255,9 @@ def test_stats_reports_parse_input_outcomes(mini_index, capsys):
     conn.close()
 
     assert cli.main(["--db", str(mini_index), "stats"]) == 0
-    assert f"parse inputs {parsed:,} parsed, 0 skipped, 0 failed" in (
-        capsys.readouterr().out)
+    report = " ".join(capsys.readouterr().out.split())
+    for field in (f"Parsed C/H {parsed:,}", "Skipped 0", "Failed 0", "Oversized 0"):
+        assert field in report
 
     assert cli.main([
         "--db", str(mini_index), "stats", "--format", "json",
@@ -910,7 +911,7 @@ def test_stats_and_check_expose_call_occurrence_totals(mini_index, capsys):
     import json
 
     assert cli.main(["--db", str(mini_index), "stats"]) == 0
-    assert "call sites" in capsys.readouterr().out
+    assert "Call sites" in capsys.readouterr().out
 
     assert cli.main([
         "--db", str(mini_index), "check", "--format", "json",

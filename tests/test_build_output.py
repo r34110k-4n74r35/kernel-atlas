@@ -9,7 +9,7 @@ import warnings
 
 import pytest
 
-from kernel_atlas import build_output, cli, indexer, kernelsrc
+from kernel_atlas import build_output, cli, indexer, kernelsrc, terminal
 from kernel_atlas.commands.lifecycle import _source_warning_style
 
 
@@ -123,7 +123,7 @@ def test_header_wraps_wide_paths_to_terminal_columns(tmp_path, monkeypatch, widt
     monkeypatch.chdir(tmp_path)
     stream = Terminal()
     monkeypatch.setattr(build_output.sys, "stderr", stream)
-    monkeypatch.setattr(build_output.shutil, "get_terminal_size",
+    monkeypatch.setattr(terminal.shutil, "get_terminal_size",
                         lambda **kwargs: os.terminal_size((width, 80)))
     with build_output.color_mode("always"):
         build_output.header("9.9", tmp_path / ("资料" * 15),

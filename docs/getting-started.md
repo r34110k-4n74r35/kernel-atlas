@@ -71,6 +71,12 @@ index that answered. JSON rows carry an `index` field; the intentionally
 index-free `names`, `plain`, and CSV forms are described under
 [Controlling the output](commands.md#controlling-the-output).
 
+Human-readable commands use consistent colored headings, aligned tables and
+fields, and separate warnings and next steps. Color is automatic in terminals;
+redirected output stays plain. Use `--color never` to disable it or `--color
+always` to force it. JSON, CSV, `names`, `plain`, `path`, `web --url`, and
+`show --bare` retain their undecorated output for scripts and editors.
+
 ## Where everything lives
 
 With the editable checkout installation above, the kernel source and index sit
@@ -260,11 +266,11 @@ parsing warnings, and commands to try next. `--quiet` suppresses progress and
 routine acquisition messages while keeping the summary, errors, and source
 verification warnings.
 
-`--color auto` is the default: each output stream uses color only when it is a
-terminal, unless `NO_COLOR` is set or `TERM=dumb`. Redirected output is therefore
-plain by default. Use `--color never` to disable color, or `--color always` to
-force ANSI colors, including in redirected output. Status words remain visible
-with every color mode:
+As with other commands, `--color auto` is the default: each output stream uses
+color only when it is a terminal, unless `NO_COLOR` is set or `TERM=dumb`.
+Redirected output is therefore plain by default. Use `--color never` to disable
+color, or `--color always` to force ANSI colors in human-readable output,
+including when redirected. Status words remain visible with every color mode:
 
 ```bash
 ka build --src /path/to/linux --with-calls --jobs 8
