@@ -1,14 +1,10 @@
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
+from kernel_atlas import config as storage, db, indexer
 
-from fixture import make_mini_kernel  # noqa: E402
-
-from kernel_atlas import config as storage, db, indexer  # noqa: E402
+from tests.support.kernel_tree import make_mini_kernel
 
 
 @pytest.hookimpl(tryfirst=True)

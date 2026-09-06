@@ -16,22 +16,22 @@ import re
 import sqlite3
 
 from . import maintainers
-from .documentation_query import DocumentationMatch, rank_documentation
-from .query_models import Entry, Resolution, Scope, Target
-from .query_paths import (
+from .queries.documentation import DocumentationMatch, rank_documentation
+from .queries.models import Entry, Resolution, Scope, Target
+from .queries.paths import (
     glob_under as glob_under,
     like_escape as like_escape,
     like_under as like_under,
     parent_path as parent_path,
 )
-from .query_targeting import (
+from .queries.targeting import (
     is_copy_path as _is_copy_path,
     normalize_spec as _norm,
     path_rank as _path_rank,
     rank_candidate as _rank_candidate,
     symbol_target as _target_from_symbol_row,
 )
-from .structure_query import (
+from .queries.structures import (
     resolve_structure as _resolve_structure,
     structure_detail as _structure_detail,
     structure_selector as _structure_selector,

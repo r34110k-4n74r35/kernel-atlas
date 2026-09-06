@@ -7,8 +7,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .. import config, db, links, query, render
-from ..terminal import Console
+from .. import config, db, query, render
+from ..queries import links
+from ..presentation.terminal import Console
 
 
 def cmd_web(args, support):

@@ -3,10 +3,56 @@
 from __future__ import annotations
 
 import csv
+import re
 import sys
 
-from .. import query, relationships, render
-from ..terminal import Console
+from .. import query, render
+from ..queries import relationships
+from ..presentation.terminal import Console
+
+
+_FRAME_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_0-9]+)*\s*\+\s*0x")
+
+
+_CLONE_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_0-9]+)+")
+
+
+_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _frames_from_text(text: str) -> list[str]:
+    """Pull symbol names out of an oops / ftrace / gdb style backtrace."""
+    frames: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Kernel oops section delimiters are metadata, not frames.  Once bare
+        # uppercase identifiers are accepted, <TASK>/</TASK> must be excluded
+        # explicitly rather than accidentally becoming symbol names.
+        if re.fullmatch(r"</?[A-Za-z_][A-Za-z0-9_]*>", line):
+            continue
+        m = _FRAME_RE.findall(line)
+        if m:
+            frames.extend(m)
+            continue
+        clone = _CLONE_RE.fullmatch(line)
+        if clone:
+            frames.append(clone.group(1))
+            continue
+        # 'tcp_sendmsg' or '#3  0x... in tcp_sendmsg (...)' or a bare name per line
+        if " in " in line:
+            tail = line.split(" in ", 1)[1]
+            cand = _IDENT_RE.findall(tail)
+            if cand:
+                frames.append(cand[0])
+                continue
+        cand = _IDENT_RE.findall(line)
+        if len(cand) == 1:
+            frames.append(cand[0])
+    return frames
 
 
 def cmd_trace(args, support):

@@ -9,8 +9,9 @@ import argparse
 import re
 import sys
 
-from .. import __version__, cparse, query, render, terminal
-from ..documentation_query import documentation_scope
+from .. import __version__, cparse, query, render
+from ..presentation import terminal
+from ..queries.documentation import documentation_scope
 
 _MAX_CLI_COUNT = 2**31 - 1
 _MAX_JOBS = 256

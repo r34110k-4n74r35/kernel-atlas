@@ -6,8 +6,9 @@ import shlex
 import sys
 from pathlib import Path
 
-from .. import links, query, render
-from ..terminal import Console, terminal_width
+from ..queries import links
+from .. import query, render
+from ..presentation.terminal import Console, terminal_width
 
 
 def cmd_struct(args, support):

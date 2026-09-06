@@ -9,9 +9,9 @@ import sys
 from collections import Counter
 
 from .query import Entry
-from .render_format import paint
-from .structure_render import render_structure as _render_structure
-from .terminal import clean, color_enabled, table_text, terminal_width
+from .presentation.terminal import paint as paint
+from .presentation.structure import render_structure as _render_structure
+from .presentation.terminal import clean, color_enabled, table_text, terminal_width
 
 COLUMNS = ("kind", "name", "path", "dir", "line", "span", "lines", "size",
            "symbols", "subdirs", "files", "flags", "subsystem", "signature",

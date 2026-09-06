@@ -8,18 +8,30 @@ plain grammar:
     ``compound_statement``.  We rebuild ``sys_open`` from that shape.
   * ``EXPORT_SYMBOL(foo)`` marks ``foo`` as available to modules, which is one
     of the more useful things to know about a kernel function.
+
+This facade owns tree-sitter initialization, capture dispatch, and symbol
+merging. Call evidence, source recovery, and aggregate parsing are implemented
+in dedicated feature modules with shared syntax helpers and record types.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 import tree_sitter_c
 from tree_sitter import Language, Parser, Query, QueryCursor, QueryError
 
-from . import aggregate_parse as _aggregate_parse
-from .cparse_models import (
+from .parsing import aggregates as _aggregate_parse
+from .parsing.calls import (
+    _EMPTY_MACRO_TRANSITIONS,
+    _call_site,
+    _collect_call_details,
+    _local_object_bindings,
+    _macro_is_active,
+    _macro_transitions,
+    _summarize_call_sites,
+)
+from .parsing.models import (
     ALL_KINDS as ALL_KINDS,
     DEFAULT_KINDS as DEFAULT_KINDS,
     ENUM,
@@ -35,17 +47,31 @@ from .cparse_models import (
     Symbol as Symbol,
     TypeMember as TypeMember,
 )
-from .cparse_shared import (
+from .parsing.recovery import (
+    _RECOVERED_DECL_PREFIX,
+    _head_call_candidates,
+    _is_file_scope,
+    _recovered_declarations,
+    _recovered_function_ends,
+    _recovered_function_name,
+    _recovery_gaps,
+    _source_exported_symbols,
+    _source_exports,
+    _starts_recovered_toplevel,
+)
+from .parsing.syntax import (
     ATTRIBUTE_MACROS as _ATTRIBUTE_MACROS,
     C_TYPE_KEYWORDS as _C_TYPE_KEYWORDS,
-    IDENTIFIERS as _IDENTIFIERS,
+    INLINE_SPECIFIERS as _INLINE_SPECIFIERS,
     MAX_SIGNATURE as MAX_SIGNATURE,
     NAME_WRAPPING_DECL_MACROS as _NAME_WRAPPING_DECL_MACROS,
     declarator_name as _declarator_name,
+    function_signature as _function_signature,
+    is_function_prototype as _is_function_prototype,
     lines as _lines,
     matching_delimiter as _matching_delimiter,
     safe_declarators as _safe_declarators,
-    source_code_leaf as _source_code_leaf,
+    source_sorted_nodes as _source_sorted_nodes,
     split_macro_args as _split_macro_args,
     squash as _squash,
     text as _text,
@@ -65,11 +91,6 @@ def validate_max_file_bytes(value: int) -> int:
 _SYSCALL_MACRO = re.compile(r"^(COMPAT_)?SYSCALL_DEFINE(\d)$")
 _EXPORT_MACRO = re.compile(
     r"^EXPORT(_PER_CPU)?_SYMBOL(_GPL|_NS|_NS_GPL|_FOR_MODULES)?$")
-_SOURCE_EXPORT_RE = re.compile(
-    rb"(?m)(?:^[ \t]*|}[ \t]*)EXPORT(?:_PER_CPU)?_SYMBOL"
-    rb"(?:_GPL|_NS|_NS_GPL|_FOR_MODULES)?[ \t]*\([ \t\r\n]*"
-    rb"([A-Za-z_]\w*)[ \t\r\n]*(?=[,)])")
-
 # Declaration-like macros whose expansion creates one file-scope object.  Keep
 # this list semantic rather than accepting every shouting-case call: annotations
 # such as ``__flag(BPF_F_ANY_ALIGNMENT)`` and registration helpers also look like
@@ -111,11 +132,6 @@ _INTERESTING_MACRO_QUERY_RE = (
     rf"{_ATTRIBUTE_MACRO_QUERY_RE})$")
 _LOOP_MACRO_HEAD = re.compile(
     r"^(?:(?:[A-Za-z_]\w*_)?for_each\w*|endfor_\w*)\s*\(")
-_RECOVERED_DECL_PREFIX = re.compile(
-    r"(?:[A-Za-z_]\w*|\*+)(?:[ \t]+(?:[A-Za-z_]\w*|\*+))*[ \t]*$")
-_INLINE_SPECIFIERS = frozenset({
-    "inline", "__inline", "__inline__", "__always_inline",
-})
 _GENERATED_ATTRIBUTE_MACROS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(
         r"^DEVICE_(?:ATTR(?:_(?:RW|RO|WO|ADMIN_RW|ADMIN_RO|RW_NAMED|"
@@ -181,19 +197,6 @@ _PATTERNS: list[str] = [
     "(ERROR (declaration) @decl)",
 ]
 _CALL_PATTERN = "(call_expression) @call"
-_ConditionalPath = tuple[tuple[int, int], ...]
-_MacroEvent = tuple[int, bool, _ConditionalPath]
-
-
-@dataclass(frozen=True, slots=True)
-class _MacroTransitions:
-    events: dict[str, tuple[_MacroEvent, ...]]
-    # A conditional group chooses exactly one explicit branch. ``None`` is the
-    # implicit fall-through choice of a group which has no final ``#else``.
-    choices: dict[int, tuple[int | None, ...]]
-
-
-_EMPTY_MACRO_TRANSITIONS = _MacroTransitions({}, {})
 _SYMBOL_KIND_ORDER = {
     kind: position for position, kind in enumerate(ALL_KINDS)
 }
@@ -222,100 +225,6 @@ def _ensure_parser() -> None:
         usable.append(pat)
     _QUERY = Query(_LANG, "\n".join(usable))
     _CALL_QUERY = Query(_LANG, _CALL_PATTERN)
-
-
-def _function_signature(s: str) -> str:
-    """Normalize a function head without leaking conditional directives."""
-    return _squash(re.sub(r"(?m)^[ \t]*#[^\n]*(?:\n|$)", " ", s))
-
-
-def _is_function_prototype(node) -> bool:
-    """Distinguish a function declaration from a function-pointer object.
-
-    Walk *outward from the identifier*.  In ``int (*fp)(void)`` a pointer (and
-    possibly an array) is encountered before the first function declarator.  In
-    ``int (*factory(void))(int)`` the inner function declarator comes first, so
-    this is a prototype for a function returning a function pointer.
-    """
-    name = _declarator_name(node)
-    cur = name.parent if name is not None else None
-    indirect = False
-    for _ in range(64):
-        if cur is None:
-            return False
-        if cur.type == "function_declarator":
-            return not indirect
-        if cur.type in ("pointer_declarator", "array_declarator"):
-            indirect = True
-        if cur is node:
-            return False
-        cur = cur.parent
-    return False
-
-
-def _starts_recovered_toplevel(src: bytes, node) -> bool:
-    """Whether a nested recovery node begins like a top-level definition."""
-    if node.start_point[1] == 0:
-        return True
-    line_start = src.rfind(b"\n", 0, node.start_byte) + 1
-    prefix = src[line_start:node.start_byte].decode("utf-8", "replace")
-    # Tree-sitter may start the function node after unfamiliar attributes or a
-    # tag keyword: ``static __always_inline struct <node starts here>``.  Real
-    # top-level prefixes start in column zero and consist solely of declaration
-    # words/pointers; statement macros and locals are indented or punctuated.
-    return bool(prefix and not prefix[0].isspace()
-                and _RECOVERED_DECL_PREFIX.fullmatch(prefix))
-
-
-def _is_file_scope(src: bytes, node) -> bool:
-    """True for real or error-recovered file-scope syntax.
-
-    Tree-sitter occasionally lets one macro-heavy function consume the rest of
-    a translation unit.  The later, genuine top-level definitions then have a
-    ``compound_statement``/``function_definition`` ancestor even though their
-    source lines start in column zero.  Admit that specific recovery shape, but
-    keep rejecting ordinary indented locals and nodes in a valid function.
-    """
-    cur = node.parent
-    inside_function = False
-    recovered_function = False
-    recovery_container = False
-    function_ancestor = None
-    while cur is not None:
-        if cur.type == "function_definition":
-            inside_function = True
-            recovered_function = recovered_function or cur.has_error
-            function_ancestor = cur
-        elif cur.type in ("compound_statement", "ERROR"):
-            recovery_container = True
-        elif cur.type in ("preproc_def", "preproc_function_def"):
-            return False
-        if cur.type == "translation_unit":
-            if inside_function:
-                body = (function_ancestor.child_by_field_name("body")
-                        if function_ancestor is not None else None)
-                closing = (_matching_delimiter(
-                    src, body.start_byte, ord("{"), ord("}"))
-                    if body is not None else None)
-                if closing is not None and node.start_byte < closing:
-                    return False
-                return _starts_recovered_toplevel(src, node) \
-                    and recovered_function
-            return not recovery_container or _starts_recovered_toplevel(src, node)
-        cur = cur.parent
-    # A severely malformed file can have ERROR as its root rather than a
-    # translation_unit.  Do not let that exceptional root turn nested locals
-    # back into file-scope symbols.
-    if inside_function:
-        body = (function_ancestor.child_by_field_name("body")
-                if function_ancestor is not None else None)
-        closing = (_matching_delimiter(
-            src, body.start_byte, ord("{"), ord("}"))
-            if body is not None else None)
-        if closing is not None and node.start_byte < closing:
-            return False
-        return _starts_recovered_toplevel(src, node) and recovered_function
-    return not recovery_container or _starts_recovered_toplevel(src, node)
 
 
 def _in_preprocessor_continuation(src: bytes, node) -> bool:
@@ -398,21 +307,6 @@ def _generated_attribute_decl(text: str) -> str | None:
             name = args[0].strip()
             return prefix + name if name.isidentifier() else None
     return None
-
-
-def _source_exports(src: bytes, root) -> set[str]:
-    """Canonical source-level exports, independent of recovery node shape.
-
-    Some ERROR trees bury a whole run of exports below type descriptors, where
-    no useful query capture exists.  The line-anchored spelling is unambiguous;
-    checking its smallest AST ancestor excludes comments, strings, and macro
-    definitions/continuations.
-    """
-    exported: set[str] = set()
-    for match in _SOURCE_EXPORT_RE.finditer(src):
-        if _source_code_leaf(root, match.start(1)) is not None:
-            exported.add(match.group(1).decode("ascii"))
-    return exported
 
 
 def _has_trailing_attribute_terminator(src: bytes, node) -> bool:
@@ -502,528 +396,6 @@ def _following_compound(node):
     return None
 
 
-def _head_call_candidates(head: bytes) -> list[tuple[str, int, bytes]]:
-    """Top-level ``name(args)`` spellings before the first opening brace."""
-    out: list[tuple[str, int, bytes]] = []
-    i = 0
-    while i < len(head):
-        if head.startswith(b"//", i):
-            newline = head.find(b"\n", i + 2)
-            i = len(head) if newline < 0 else newline + 1
-            continue
-        if head.startswith(b"/*", i):
-            close = head.find(b"*/", i + 2)
-            i = len(head) if close < 0 else close + 2
-            continue
-        if head[i:i + 1] in (b'"', b"'"):
-            quote = head[i]
-            i += 1
-            while i < len(head):
-                if head[i] == ord("\\"):
-                    i += 2
-                elif head[i] == quote:
-                    i += 1
-                    break
-                else:
-                    i += 1
-            continue
-        if head[i:i + 1] == b";":
-            # Calls before a completed declaration cannot name the function
-            # whose body follows later in this recovered head.
-            out.clear()
-            i += 1
-            continue
-        if head[i:i + 1] == b"{":
-            close = _matching_delimiter(head, i, ord("{"), ord("}"))
-            if close is None:
-                break
-            i = close + 1
-            continue
-        if not (head[i:i + 1].isalpha() or head[i:i + 1] == b"_"):
-            i += 1
-            continue
-
-        start = i
-        i += 1
-        while i < len(head) and (head[i:i + 1].isalnum()
-                                 or head[i:i + 1] == b"_"):
-            i += 1
-        name = head[start:i].decode("ascii")
-        opening = i
-        while opening < len(head) and head[opening:opening + 1].isspace():
-            opening += 1
-        if opening >= len(head) or head[opening:opening + 1] != b"(":
-            continue
-
-        depth = 1
-        j = opening + 1
-        quote = 0
-        while j < len(head) and depth:
-            if quote:
-                if head[j] == ord("\\"):
-                    j += 2
-                    continue
-                if head[j] == quote:
-                    quote = 0
-            elif head.startswith(b"//", j):
-                newline = head.find(b"\n", j + 2)
-                j = len(head) if newline < 0 else newline
-                continue
-            elif head.startswith(b"/*", j):
-                close = head.find(b"*/", j + 2)
-                j = len(head) if close < 0 else close + 1
-            elif head[j:j + 1] in (b'"', b"'"):
-                quote = head[j]
-            elif head[j:j + 1] == b"(":
-                depth += 1
-            elif head[j:j + 1] == b")":
-                depth -= 1
-            j += 1
-        if depth == 0:
-            out.append((name, start, head[opening + 1:j - 1]))
-            i = j
-    return out
-
-
-def _recovered_function_name(head: bytes, current: str) \
-        -> tuple[str, int] | None:
-    """Choose the real declarator after leading annotation/macro calls.
-
-    Error recovery sometimes labels ``__printf(2, 3) real_fn(...)`` as a
-    function named ``__printf``.  Real parameter lists and declaration prefixes
-    carry type syntax; annotation and registration macro arguments do not.
-    """
-    best: tuple[int, bool, int, str, int] | None = None
-    type_words = re.compile(
-        rb"\b(?:void|char|short|int|long|float|double|bool|const|volatile|"
-        rb"signed|unsigned|struct|union|enum|[us](?:8|16|32|64)|"
-        rb"[A-Za-z_]\w*_t)\b")
-    for name, start, args in _head_call_candidates(head):
-        parameter_score = 0
-        stripped = args.strip()
-        if stripped in (b"", b"void"):
-            parameter_score += 3
-        if b"*" in args or b"..." in args:
-            parameter_score += 3
-        if type_words.search(args):
-            parameter_score += 2
-        if re.search(rb"\b[A-Za-z_]\w*\s+[A-Za-z_*]", args):
-            parameter_score += 2
-        score = parameter_score
-
-        line_start = head.rfind(b"\n", 0, start) + 1
-        line_prefix = head[line_start:start].decode("utf-8", "replace")
-        if line_prefix and not line_prefix[0].isspace() \
-                and _RECOVERED_DECL_PREFIX.fullmatch(line_prefix):
-            score += 3
-        elif start == line_start and line_start:
-            previous_start = head.rfind(b"\n", 0, line_start - 1) + 1
-            previous = head[previous_start:line_start - 1] \
-                .decode("utf-8", "replace").strip()
-            if previous and _RECOVERED_DECL_PREFIX.fullmatch(previous):
-                score += 2
-
-        candidate = (score, name == current, parameter_score, name, start)
-        if best is None or candidate[:2] > best[:2]:
-            best = candidate
-    if best is None or best[0] < 3 or best[2] == 0:
-        return None
-    return best[3], best[4]
-
-
-def _canonical_export_follows(src: bytes, offset: int, name: str) -> bool:
-    """Whether only whitespace/comments separate an item from its export."""
-    trivia = rb"(?:[ \t\r\n]|//[^\n]*(?:\n|$)|/\*[\s\S]*?\*/)*"
-    export = (rb"EXPORT(?:_PER_CPU)?_SYMBOL"
-              rb"(?:_GPL|_NS|_NS_GPL|_FOR_MODULES)?\s*\(\s*"
-              + re.escape(name.encode("ascii")) + rb"\s*(?:,|\))")
-    return re.match(trivia + export, src[offset:]) is not None
-
-
-def _declaration_prefix_words(text: str) -> list[str] | None:
-    """Words in a direct declaration prefix, ignoring known annotations."""
-    stripped = text.rstrip()
-    attrs = "|".join(re.escape(name) for name in _ATTRIBUTE_MACROS)
-    stripped = re.sub(
-        rf"\b(?:{attrs})\b(?:\s*\([^)]*\))?", " ", stripped)
-    if not stripped.strip() or _RECOVERED_DECL_PREFIX.fullmatch(
-            stripped.strip()) is None:
-        return None
-    return re.findall(r"[A-Za-z_]\w*", text)
-
-
-def _source_exported_symbols(src: bytes, exported: set[str], existing: set[str],
-                             want_fn: bool, want_var: bool,
-                             call_nodes: list | None = None,
-                             transitions: _MacroTransitions | None = None,
-                             ) -> list[Symbol]:
-    """Conservative fallback for literal, exported top-level definitions.
-
-    This is deliberately export-guided: root-level ERROR recovery can erase an
-    otherwise ordinary definition, but a canonical export gives us a bounded
-    list of names to probe.  A declaration-word prefix plus balanced body is a
-    function; a one-line direct declarator with only attributes/initializer is
-    a variable.  Macro-generated names have no such source spelling and remain
-    omitted.
-    """
-    out: list[Symbol] = []
-    for name in sorted(exported - existing):
-        encoded = re.escape(name.encode("ascii"))
-        if want_fn:
-            pattern = re.compile(
-                rb"(?m)^(?P<prefix>[^\n#;{}()]*)\b" + encoded + rb"\s*\(")
-            for match in pattern.finditer(src):
-                prefix = match.group("prefix").decode("utf-8", "replace")
-                definition_start = match.start()
-                words = None
-                if prefix:
-                    if prefix[0].isspace():
-                        continue
-                    words = _declaration_prefix_words(prefix)
-                elif match.start():
-                    previous_end = match.start() - 1
-                    previous_start = src.rfind(b"\n", 0, previous_end) + 1
-                    previous_raw = src[previous_start:previous_end]
-                    if not previous_raw or previous_raw[:1].isspace():
-                        continue
-                    previous = previous_raw.decode("utf-8", "replace")
-                    words = _declaration_prefix_words(previous)
-                    if words is not None:
-                        definition_start = previous_start
-                if words is None:
-                    continue
-                params_end = _matching_delimiter(
-                    src, match.end() - 1, ord("("), ord(")"))
-                if params_end is None:
-                    continue
-                opening = params_end + 1
-                while opening < len(src) and src[opening:opening + 1].isspace():
-                    opening += 1
-                conditional_head = False
-                if src.startswith(b"#else", opening):
-                    endif = re.search(
-                        rb"(?m)^#endif[^\n]*(?:\n|$)", src[opening:])
-                    if endif is None:
-                        continue
-                    opening += endif.end()
-                    while opening < len(src) \
-                            and src[opening:opening + 1].isspace():
-                        opening += 1
-                    conditional_head = True
-                elif src.startswith(b"#endif", opening):
-                    endif = re.match(rb"#endif[^\n]*(?:\n|$)", src[opening:])
-                    if endif is None:
-                        continue
-                    opening += endif.end()
-                    while opening < len(src) \
-                            and src[opening:opening + 1].isspace():
-                        opening += 1
-                    conditional_head = True
-                if opening >= len(src) or src[opening] != ord("{"):
-                    continue
-                closing = _matching_delimiter(
-                    src, opening, ord("{"), ord("}"))
-                if closing is None:
-                    # Preprocessor alternatives can make raw brace balancing
-                    # impossible (two conditional openings, one shared close).
-                    # Kernel top-level closing braces are column zero; this
-                    # fallback remains constrained to the exact exported name.
-                    close_match = re.search(rb"(?m)^}", src[opening + 1:])
-                    if close_match is None:
-                        continue
-                    closing = opening + 1 + close_match.start()
-                    if not _canonical_export_follows(src, closing + 1, name):
-                        continue
-                if not conditional_head and not _canonical_export_follows(
-                        src, closing + 1, name):
-                    continue
-                start = src.count(b"\n", 0, definition_start) + 1
-                end = src.count(b"\n", 0, closing) + 1
-                calls: tuple[str, ...] = ()
-                indirect_calls: tuple[str, ...] = ()
-                call_sites: tuple[CallSite, ...] = ()
-                if call_nodes is not None:
-                    sites = tuple(
-                        site
-                        for node in _source_sorted_nodes(call_nodes)
-                        if opening < node.start_byte < closing
-                        if (site := _call_site(
-                            src, node, {},
-                            transitions or _EMPTY_MACRO_TRANSITIONS)) is not None
-                    )
-                    calls, indirect_calls, call_sites = \
-                        _summarize_call_sites(sites)
-                out.append(Symbol(
-                    name=name, kind=FUNCTION, start_line=start, end_line=end,
-                    signature=_function_signature(
-                        src[definition_start:params_end + 1].decode(
-                            "utf-8", "replace")),
-                    is_static="static" in words,
-                    is_inline=any(word in _INLINE_SPECIFIERS for word in words),
-                    is_exported=True, calls=calls,
-                    indirect_calls=indirect_calls, call_sites=call_sites,
-                ))
-
-        if want_var and not any(symbol.name == name for symbol in out):
-            initializer = re.compile(
-                rb"(?m)^(?P<prefix>[^\n#;{}(),=]*)\b" + encoded
-                + rb"\b(?P<tail>[^\n;=]*)=\s*\{")
-            for match in initializer.finditer(src):
-                prefix = match.group("prefix").decode("utf-8", "replace")
-                tail = match.group("tail").decode("utf-8", "replace")
-                words = prefix.split()
-                if not prefix or prefix[0].isspace() or "extern" in words \
-                        or _RECOVERED_DECL_PREFIX.fullmatch(prefix) is None:
-                    continue
-                if re.fullmatch(
-                        r"(?:\s*\[[^]]*\])*"
-                        r"(?:\s+_+[A-Za-z_]\w*(?:\s*\([^;]*\))?)*\s*",
-                        tail) is None:
-                    continue
-                opening = match.end() - 1
-                closing = _matching_delimiter(
-                    src, opening, ord("{"), ord("}"))
-                if closing is None:
-                    close_match = re.search(rb"(?m)^}", src[opening + 1:])
-                    if close_match is None:
-                        continue
-                    closing = opening + 1 + close_match.start()
-                semicolon = closing + 1
-                while semicolon < len(src) \
-                        and src[semicolon:semicolon + 1].isspace():
-                    semicolon += 1
-                if semicolon >= len(src) or src[semicolon] != ord(";") \
-                        or not _canonical_export_follows(
-                            src, semicolon + 1, name):
-                    continue
-                start = src.count(b"\n", 0, match.start()) + 1
-                end = src.count(b"\n", 0, closing) + 1
-                out.append(Symbol(
-                    name=name, kind=VARIABLE, start_line=start, end_line=end,
-                    signature=_squash(
-                        src[match.start():opening].decode("utf-8", "replace")),
-                    is_static="static" in words, is_exported=True,
-                ))
-                break
-
-        if want_var and not any(symbol.name == name for symbol in out):
-            pattern = re.compile(
-                rb"(?m)^(?P<prefix>[^\n#;{}(),=]*)\b" + encoded
-                + rb"\b(?P<tail>[^;{}]*);")
-            for match in pattern.finditer(src):
-                prefix = match.group("prefix").decode("utf-8", "replace")
-                tail = match.group("tail").decode("utf-8", "replace")
-                words = _declaration_prefix_words(prefix)
-                if not prefix or prefix[0].isspace() or words is None \
-                        or "extern" in words:
-                    continue
-                if re.fullmatch(
-                        r"(?:\s*\[[^]]*\])*"
-                        r"(?:\s+(?:_+[A-Za-z_]\w*|[A-Z][A-Z0-9_]*)"
-                        r"(?:\s*\([^;{}]*\))?)*"
-                        r"(?:\s*=\s*[^;]*)?\s*", tail) is None:
-                    continue
-                if not _canonical_export_follows(src, match.end(), name):
-                    continue
-                start = src.count(b"\n", 0, match.start()) + 1
-                end = src.count(b"\n", 0, match.end() - 1) + 1
-                out.append(Symbol(
-                    name=name, kind=VARIABLE, start_line=start, end_line=end,
-                    signature=_squash(
-                        src[match.start():match.end()].decode("utf-8", "replace")),
-                    is_static="static" in words, is_exported=True,
-                ))
-                break
-    return out
-
-
-def _recovered_function_ends(src: bytes, functions: list) -> dict[tuple[int, int], int]:
-    """Effective closing braces for overextended recovered function bodies.
-
-    Kernel style keeps the function's closing brace in column zero while inner
-    block braces are indented.  If tree-sitter continues a body past that brace
-    (sometimes swallowing exports, declarations, and later functions), clamp
-    its symbol/call extent to the source-level boundary.
-    """
-    ends: dict[tuple[int, int], int] = {}
-    for function in functions:
-        if not function.has_error:
-            continue
-        body = function.child_by_field_name("body")
-        if body is None:
-            continue
-        region = src[body.start_byte + 1:body.end_byte]
-        close = re.search(rb"(?m)^}", region)
-        if close is None:
-            continue
-        end_byte = body.start_byte + 1 + close.start() + 1
-        if end_byte >= body.end_byte:
-            continue
-        # A parse error alone is insufficient: valid conditional branches can
-        # put a column-zero brace inside an otherwise correctly bounded body.
-        # Require proof that file-scope syntax was swallowed after the brace.
-        swallowed_function = any(
-            other is not function and end_byte <= other.start_byte < body.end_byte
-            and _starts_recovered_toplevel(src, other)
-            for other in functions)
-        swallowed_export = _SOURCE_EXPORT_RE.search(
-            src[end_byte:body.end_byte]) is not None
-        if swallowed_function or swallowed_export:
-            ends[(function.start_byte, function.end_byte)] = end_byte
-    return ends
-
-
-def _recovered_declarations(functions: list,
-                            ends: dict[tuple[int, int], int]) -> list:
-    """Column-zero declarations hidden after a recovered function boundary."""
-    out = []
-    seen: set[tuple[int, int]] = set()
-
-    def visit(node, boundary: int) -> None:
-        for child in node.named_children:
-            if child.end_byte <= boundary:
-                continue
-            if child.type == "function_definition":
-                # A later recovered top-level function is handled by the
-                # function capture; none of its locals belongs here.
-                continue
-            if child.type == "declaration" and child.start_byte >= boundary \
-                    and child.start_point[1] == 0:
-                key = (child.start_byte, child.end_byte)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(child)
-                continue
-            visit(child, boundary)
-
-    for function in functions:
-        boundary = ends.get((function.start_byte, function.end_byte))
-        body = function.child_by_field_name("body")
-        if boundary is not None and body is not None:
-            visit(body, boundary)
-    return out
-
-
-def _recovery_gaps(src: bytes, functions: list,
-                   ends: dict[tuple[int, int], int]) -> list[tuple[int, int]]:
-    """Source ranges hidden inside an overextended function recovery node."""
-    candidates = sorted(
-        function.start_byte for function in functions
-        if _starts_recovered_toplevel(src, function))
-    gaps: list[tuple[int, int]] = []
-    for function in functions:
-        start = ends.get((function.start_byte, function.end_byte))
-        if start is None or not function.has_error:
-            continue
-        end = next((byte for byte in candidates if byte > start),
-                   function.end_byte)
-        if end > start and src[start:end].strip():
-            gaps.append((start, end))
-
-    # Nested recovery nodes can describe the same source range.  Parsing the
-    # earliest enclosing gap once is enough and avoids quadratic rescans.
-    unique: list[tuple[int, int]] = []
-    for start, end in sorted(set(gaps)):
-        if unique and start < unique[-1][1]:
-            continue
-        unique.append((start, end))
-    return unique
-
-
-def _parameter_names(src: bytes, function) -> set[str]:
-    """Named parameters belonging to a function definition's outer list."""
-    if function.type != "function_definition":
-        return set()
-    declarator = function.child_by_field_name("declarator")
-    name = _declarator_name(declarator)
-    cur = name
-    function_declarator = None
-    for _ in range(64):
-        if cur is None:
-            break
-        if cur.type == "function_declarator":
-            function_declarator = cur
-            break
-        if cur is declarator:
-            break
-        cur = cur.parent
-    if function_declarator is None:
-        return set()
-    parameters = function_declarator.child_by_field_name("parameters")
-    if parameters is None:
-        return set()
-
-    names: set[str] = set()
-    for parameter in parameters.named_children:
-        if parameter.type in _IDENTIFIERS:
-            names.add(_text(src, parameter))
-            continue
-        if parameter.type != "parameter_declaration":
-            continue
-        declarators = parameter.children_by_field_name("declarator")
-        if not declarators:
-            declarator = parameter.child_by_field_name("declarator")
-            declarators = [declarator] if declarator is not None else []
-        for declarator in declarators:
-            name_node = _declarator_name(declarator)
-            if name_node is not None:
-                names.add(_text(src, name_node))
-    return names
-
-
-def _local_object_bindings(src: bytes, function, body,
-                           end_byte: int | None) -> dict[str, list[tuple[int, int]]]:
-    """Byte ranges where parameters or block-scope objects shadow functions.
-
-    A block-scope function prototype is deliberately excluded: it still names
-    a function.  Ordinary objects and function-pointer objects are blockers.
-    The range model also respects nested compounds and ``for`` initializer
-    scope, avoiding the common mistake of treating a later/sibling declaration
-    as if it shadowed the whole function.
-    """
-    limit = min(body.end_byte, end_byte) if end_byte is not None else body.end_byte
-    bindings: dict[str, list[tuple[int, int]]] = {}
-    for name in _parameter_names(src, function):
-        bindings.setdefault(name, []).append((body.start_byte, limit))
-
-    stack = list(reversed(body.named_children))
-    while stack:
-        current = stack.pop()
-        if current.start_byte >= limit:
-            continue
-        # Malformed input can place a recovered top-level function inside the
-        # preceding body.  Its declarations are not locals of this function.
-        if current.type == "function_definition":
-            continue
-        if current.type == "declaration":
-            for declarator in _safe_declarators(src, current):
-                if _is_function_prototype(declarator):
-                    continue
-                name_node = _declarator_name(declarator)
-                if name_node is None:
-                    continue
-                scope = current.parent
-                while scope is not None and scope is not body:
-                    if scope.type in ("for_statement", "compound_statement"):
-                        break
-                    scope = scope.parent
-                if scope is None:
-                    scope = body
-                scope_end = min(scope.end_byte, limit)
-                if name_node.end_byte < scope_end:
-                    bindings.setdefault(_text(src, name_node), []).append(
-                        (name_node.end_byte, scope_end))
-        stack.extend(reversed(current.named_children))
-    return bindings
-
-
-def _source_sorted_nodes(nodes) -> list:
-    """Return query captures in deterministic source-byte order."""
-    return sorted(nodes, key=lambda node: (
-        node.start_byte, node.end_byte, node.type,
-    ))
-
-
 def source_include_directives(src: bytes) -> tuple[tuple[str, str, int], ...]:
     """Real quoted/angle ``#include`` directives whose operand ends in ``.c``.
 
@@ -1059,269 +431,6 @@ def source_include_directives(src: bytes) -> tuple[tuple[str, str, int], ...]:
         if token.endswith(".c"):
             directives.append((delimiter, token, node.start_point[0] + 1))
     return tuple(directives)
-
-
-def _macro_transitions(src: bytes, root) \
-        -> _MacroTransitions:
-    """Return guarded source-order changes for in-file macro state.
-
-    Each guard maps a conditional node to the branch containing the directive.
-    This distinguishes mutually exclusive ``#if``/``#else`` bodies while still
-    treating state observed after ``#endif`` as configuration-dependent.
-    """
-    transitions: dict[str, list[_MacroEvent]] = {}
-    choices: dict[int, tuple[int | None, ...]] = {}
-
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        if current.type in {"preproc_if", "preproc_ifdef"}:
-            branches: list[int | None] = [current.start_byte]
-            branch = next((
-                child for child in current.named_children
-                if child.type in {"preproc_elif", "preproc_else"}
-            ), None)
-            while branch is not None:
-                branches.append(branch.start_byte)
-                if branch.type == "preproc_else":
-                    break
-                branch = next((
-                    child for child in branch.named_children
-                    if child.type in {"preproc_elif", "preproc_else"}
-                ), None)
-            else:
-                # No final #else: the group can select no explicit body.
-                branches.append(None)
-            choices[current.start_byte] = tuple(branches)
-        if current.type in {"preproc_def", "preproc_function_def"}:
-            name_node = current.child_by_field_name("name")
-            if name_node is None:
-                name_node = next((child for child in current.named_children
-                                  if child.type == "identifier"), None)
-            if name_node is not None:
-                transitions.setdefault(_text(src, name_node), []).append((
-                    current.end_byte, True, _conditional_path(current),
-                ))
-            continue
-        if current.type == "preproc_call":
-            directive = next((child for child in current.named_children
-                              if child.type == "preproc_directive"), None)
-            argument = next((child for child in current.named_children
-                             if child.type == "preproc_arg"), None)
-            if directive is not None and argument is not None \
-                    and _text(src, directive).strip() == "#undef":
-                match = re.match(r"[A-Za-z_]\w*", _text(src, argument).lstrip())
-                if match is not None:
-                    transitions.setdefault(match.group(), []).append((
-                        current.end_byte, False, _conditional_path(current),
-                    ))
-            continue
-        stack.extend(reversed(current.named_children))
-    return _MacroTransitions(
-        {name: tuple(sorted(events)) for name, events in transitions.items()},
-        choices,
-    )
-
-
-def _conditional_group(branch):
-    """Root ``#if`` node for one tree-sitter ``#elif``/``#else`` node."""
-    group = branch.parent
-    while group is not None and group.type == "preproc_elif":
-        group = group.parent
-    return group if group is not None and group.type in {
-        "preproc_if", "preproc_ifdef",
-    } else None
-
-
-def _conditional_path(node) -> _ConditionalPath:
-    """Conditional-group/branch identities enclosing one syntax node."""
-    branches: dict[int, int] = {}
-    current = node
-    parent = node.parent
-    while parent is not None:
-        if parent.type.startswith(("preproc_else", "preproc_elif")):
-            group = _conditional_group(parent)
-            if group is not None:
-                # An #else after one or more #elif nodes is nested below those
-                # nodes in tree-sitter's AST. Preserve the nearest branch rather
-                # than overwriting it while walking through the chain.
-                branches.setdefault(group.start_byte, parent.start_byte)
-        elif parent.type.startswith("preproc_if") \
-                and not current.type.startswith((
-                    "preproc_else", "preproc_elif")):
-            branches.setdefault(parent.start_byte, parent.start_byte)
-        current, parent = parent, parent.parent
-    return tuple(sorted(branches.items()))
-
-
-def _macro_is_active_overapprox(
-        events: tuple[_MacroEvent, ...], offset: int,
-        call_branches: dict[int, int]) -> bool:
-    """Sound fallback when exact conditional enumeration would be excessive."""
-    states = {False}
-    for event_offset, defined, event_path in events:
-        if event_offset > offset:
-            break
-        if any(group in call_branches and call_branches[group] != branch
-               for group, branch in event_path):
-            continue
-        mandatory = all(call_branches.get(group) == branch
-                        for group, branch in event_path)
-        if mandatory:
-            states = {defined}
-        else:
-            states.add(defined)
-    return True in states
-
-
-def _macro_is_active(
-        transitions: _MacroTransitions,
-        name: str, offset: int,
-        call_path: tuple[tuple[int, int], ...] = ()) -> bool:
-    """Whether ``name`` can be defined in a configuration reaching a call."""
-    events = transitions.events.get(name, ())
-    call_branches = dict(call_path)
-    relevant_events = tuple(
-        event for event in events if event[0] <= offset and not any(
-            group in call_branches and call_branches[group] != branch
-            for group, branch in event[2]
-        )
-    )
-    if not relevant_events:
-        return False
-
-    groups = sorted({
-        group for _, _, event_path in relevant_events
-        for group, _ in event_path if group not in call_branches
-    })
-    assignments: list[dict[int, int | None]] = [dict(call_branches)]
-    for group in groups:
-        group_choices = transitions.choices.get(group)
-        if group_choices is None:
-            # Malformed/recovered preprocessor syntax: keep an implicit branch
-            # as well as every observed branch so this remains conservative.
-            group_choices = tuple(dict.fromkeys((
-                *(branch for _, _, path in relevant_events
-                  for candidate_group, branch in path
-                  if candidate_group == group),
-                None,
-            )))
-        if len(assignments) * len(group_choices) > 4096:
-            return _macro_is_active_overapprox(
-                relevant_events, offset, call_branches)
-        assignments = [
-            {**assignment, group: branch}
-            for assignment in assignments for branch in group_choices
-        ]
-
-    for assignment in assignments:
-        defined = False
-        for _, event_defined, event_path in relevant_events:
-            if all(assignment.get(group) == branch
-                   for group, branch in event_path):
-                defined = event_defined
-        if defined:
-            return True
-    return False
-
-
-def _call_target(src: bytes, node) -> tuple[str, bool] | None:
-    """Return a stable display name and whether syntax is inherently indirect."""
-    current = node.child_by_field_name("function") \
-        if node.type == "call_expression" else node
-    indirect = False
-    for _ in range(32):
-        if current is None:
-            return None
-        if current.type == "identifier":
-            return _text(src, current), indirect
-        if current.type == "field_expression":
-            raw = _squash(_text(src, current), 200)
-            raw = re.sub(r"\s*(->|\.)\s*", r"\1", raw)
-            return raw, True
-        if current.type == "pointer_expression":
-            argument = current.child_by_field_name("argument")
-            operand = argument or next(iter(current.named_children), None)
-            if operand is None:
-                return None
-            raw = re.sub(r"\s+", "", _text(src, current))
-            return raw[:200], True
-        if current.type in {
-                "subscript_expression", "conditional_expression",
-                "cast_expression"}:
-            raw = _squash(_text(src, current), 200)
-            raw = re.sub(r"\s*([\[\]])\s*", r"\1", raw)
-            return raw, True
-        if current.type in {"parenthesized_expression", "attributed_expression"}:
-            current = next(iter(current.named_children), None)
-            continue
-        return None
-    return None
-
-
-def _call_site(
-        src: bytes, node, bindings: dict[str, list[tuple[int, int]]],
-        transitions: _MacroTransitions) -> CallSite | None:
-    target = _call_target(src, node)
-    if target is None:
-        return None
-    name, syntactic_indirect = target
-    if not name or "\0" in name:
-        return None
-    function_node = node.child_by_field_name("function")
-    bare_identifier = function_node is not None \
-        and function_node.type == "identifier"
-    macro_active = bare_identifier and _macro_is_active(
-        transitions, name, node.start_byte, _conditional_path(node))
-    if macro_active:
-        kind = "macro"
-    elif syntactic_indirect or any(
-            start <= node.start_byte < end
-            for start, end in bindings.get(name, ())):
-        kind = "indirect"
-    else:
-        kind = "direct"
-    return CallSite(
-        name=name, kind=kind, start_line=node.start_point[0] + 1,
-        start_byte=node.start_byte,
-    )
-
-
-def _summarize_call_sites(
-        sites: tuple[CallSite, ...]
-        ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[CallSite, ...]]:
-    calls = tuple(dict.fromkeys(site.name for site in sites))
-    indirect = tuple(dict.fromkeys(
-        site.name for site in sites if site.kind == "indirect"))
-    return calls, indirect, sites
-
-
-def _collect_call_details(
-        src: bytes, node, end_byte: int | None = None,
-        transitions: _MacroTransitions | None = None,
-        ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[CallSite, ...]]:
-    """Callee names, indirect names, and source-level occurrence evidence.
-
-    Accepts either a function_definition or a bare compound_statement — the
-    latter is what SYSCALL_DEFINEn leaves us with, where the body is a sibling
-    of the macro call rather than a child of anything function-shaped.
-    """
-    body = node if node.type == "compound_statement" else \
-        node.child_by_field_name("body")
-    if body is None:
-        return (), (), ()
-    cursor = QueryCursor(_CALL_QUERY)
-    caps = cursor.captures(body)
-    bindings = _local_object_bindings(src, node, body, end_byte)
-    transitions = transitions or _EMPTY_MACRO_TRANSITIONS
-    sites: list[CallSite] = []
-    for call in _source_sorted_nodes(caps.get("call", [])):
-        if end_byte is not None and call.start_byte >= end_byte:
-            continue
-        site = _call_site(src, call, bindings, transitions)
-        if site is not None:
-            sites.append(site)
-    return _summarize_call_sites(tuple(sites))
 
 
 def _parse_aggregate_fragment(
@@ -1407,7 +516,7 @@ def parse_source(
         if m:
             if want_sys and name.isidentifier():
                 calls, indirect_calls, call_sites = _collect_call_details(
-                    src, node, effective_end, macro_states
+                    src, node, _CALL_QUERY, effective_end, macro_states
                 ) if want_calls else ((), (), ())
                 symbols.append(Symbol(
                     name=_syscall_name(m, name), kind=SYSCALL,
@@ -1494,7 +603,7 @@ def parse_source(
                     _summarize_call_sites(sites)
             else:
                 calls, indirect_calls, call_sites = _collect_call_details(
-                    src, node, effective_end, macro_states)
+                    src, node, _CALL_QUERY, effective_end, macro_states)
         symbols.append(Symbol(
             name=name,
             kind=FUNCTION,
@@ -1534,7 +643,7 @@ def parse_source(
             end = body.end_point[0] + 1 if body is not None and \
                 body.type == "compound_statement" else node.end_point[0] + 1
             calls, indirect_calls, call_sites = _collect_call_details(
-                src, body, transitions=macro_states
+                src, body, _CALL_QUERY, transitions=macro_states
             ) if want_calls and body is not None else ((), (), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, arg),
@@ -1586,7 +695,7 @@ def parse_source(
             start = node.start_point[0] + 1
             end = body.end_point[0] + 1 if body is not None else node.end_point[0] + 1
             calls, indirect_calls, call_sites = _collect_call_details(
-                src, body, transitions=macro_states
+                src, body, _CALL_QUERY, transitions=macro_states
             ) if want_calls and body is not None else ((), (), ())
             symbols.append(Symbol(
                 name=_syscall_name(m, args[0]), kind=SYSCALL,

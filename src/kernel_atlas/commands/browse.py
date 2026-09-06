@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from .. import query, render
 from ..query import Entry
-from ..terminal import Console, clean
+from ..presentation.terminal import Console
 
 
 def cmd_info(args, support):
@@ -611,106 +611,3 @@ def cmd_tree(args, support):
     console.blank()
     console.text(f"{len(entries)} entries (depth {max_depth})  [{support._linux(meta)}]",
                  tone="muted", indent=0)
-
-
-def cmd_path(args, support):
-    """Print the on-disk path for use with `$EDITOR "$(ka path target)"`."""
-    conn, meta = support.open_index(args)
-    res = support.resolve_or_die(conn, args.target, meta)
-    support._require_unique_symbol_identity(res, args.target, conn)
-    t = res.target
-    if args.line and t.kind != "symbol":
-        support._die("--line only applies to symbols")
-    tree = support.source_tree(meta)
-    full = support.source_member(tree, t.path)
-    if not full.exists() and not full.is_symlink():
-        support._die(f"{full} is missing from the source tree")
-    if args.line and t.kind == "symbol":
-        print(f"{full}:{t.line}")
-    else:
-        print(full)
-
-
-def cmd_show(args, support):
-    conn, meta = support.open_index(args)
-    res = support.resolve_or_die(conn, args.target, meta)
-    support._require_unique_symbol_identity(res, args.target, conn)
-    t = res.target
-    if t.kind == "dir":
-        prefix = support._command_prefix(args, meta)
-        target = shlex.quote(support._target_spec(t))
-        support._die(f"{t.path} is a directory; try '{prefix} ls {target}'")
-    if t.kind == "symbol" and args.lines:
-        support._die("--lines applies to files; use --context for a symbol")
-    if t.kind != "symbol" and args.context:
-        support._die("--context applies to symbols; use --lines for a file")
-    tree = support.source_tree(meta)
-    full = support.source_member(tree, t.path)
-    if not full.is_file():
-        support._die(f"{full} is missing from the source tree")
-    try:
-        with full.open("rb") as fh:
-            head = fh.read(8192)
-        if b"\0" in head:
-            support._die(f"{t.path} looks like a binary file")
-    except OSError as exc:
-        support._die(f"cannot read {full}: {exc}")
-
-    if t.kind == "symbol":
-        start = max(1, (t.line or 1) - args.context)
-        end: int | None = (t.end_line or t.line or 1) + args.context
-    elif args.lines:
-        m = re.fullmatch(r"(\d+)(?:[:-](\d+))?", args.lines)
-        if not m:
-            support._die(f"--lines wants N or N:M, not {args.lines!r}")
-        try:
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else start
-        except ValueError:
-            support._die("--lines contains a line number that is too large")
-        if start < 1 or end < 1:
-            support._die("--lines line numbers must be >= 1")
-        if end < start:
-            support._die(f"--lines {args.lines!r}: end is before start")
-    else:
-        size = full.stat().st_size
-        if size > support._MAX_SHOW:
-            prefix = support._command_prefix(args, meta)
-            support._die(
-                f"{t.path} is {size:,} bytes; pass --lines N:M or open it "
-                f'with $EDITOR "$({prefix} path {shlex.quote(t.path)})"')
-        start, end = 1, None
-
-    color = render.use_color(args.color)
-    if not args.bare:
-        console = Console(args.color)
-        sub = query.subsystem_for_target(conn, t)
-        head = f"{t.path}:{start}" + (f"-{end}" if end else "")
-        if t.kind == "symbol":
-            head = f"{t.path}:{t.line}  {t.name}"
-        label = sub["name"] if sub and sub["name"] not in query.CATCH_ALL else None
-        console.heading(head)
-        console.field("index", support._linux(meta), tone="muted")
-        if label:
-            console.field("subsystem", label, tone="accent")
-        console.blank()
-    printed = 0
-    try:
-        with full.open(encoding="utf-8", errors="replace") as fh:
-            for i, line in enumerate(fh, 1):
-                if i < start:
-                    continue
-                if end is not None and i > end:
-                    break
-                prefix = "" if args.bare else render.paint(f"{i:6} | ", "90", color)
-                # Keep --bare source untouched. In the numbered view retain tabs
-                # for code indentation, but do not let source text inject ANSI.
-                content = line.rstrip("\n")
-                if not args.bare:
-                    content = "\t".join(clean(part) for part in content.split("\t"))
-                print(prefix + content)
-                printed += 1
-    except OSError as exc:
-        support._die(f"cannot read {full}: {exc}")
-    if printed == 0:
-        support._die(f"{t.path} has no line {start}")
