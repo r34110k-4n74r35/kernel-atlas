@@ -1,8 +1,8 @@
 """Where kernel trees and built indexes live.
 
-An editable checkout keeps study data beside the project; a normal installed
-copy falls back to ``~/.kernel-atlas``.  In either case the data root can be
-overridden with ``KERNEL_ATLAS_HOME``:
+Study data stays inside the source checkout. ``KERNEL_ATLAS_HOME`` can select
+a subdirectory within that checkout; it cannot redirect application data to
+another location. Python and third-party caches retain their normal behavior.
 
     kernel-atlas/
       kernels/linux-6.18.45/   <- the actual kernel source, browsable
@@ -62,22 +62,44 @@ def project_root() -> Path | None:
     return None
 
 
-def data_root() -> Path:
-    if env := os.environ.get("KERNEL_ATLAS_HOME"):
-        return Path(env).expanduser()
+def require_project_path(path: Path | str, *, follow_leaf: bool = True) -> Path:
+    """Check application storage without changing Python or tool cache policy.
+
+    Resolve parent links before checking containment. Atomic replacement and
+    unlink may use ``follow_leaf=False``: they change the local directory entry
+    without writing to a leaf symlink's target. These checks assume directories
+    are not being maliciously replaced by another process during an operation.
+    """
     root = project_root()
-    if root is not None:
-        return root
-    # Installed as a plain package with no checkout to sit beside.
-    return Path.home() / ".kernel-atlas"
+    if root is None:
+        raise ValueError(
+            "application storage requires a source checkout; install this "
+            "project in editable mode (python -m pip install -e .)")
+    path = Path(path).expanduser()
+    try:
+        lexical = Path(os.path.abspath(path.parent.resolve() / path.name))
+        resolved = lexical.resolve() if follow_leaf else lexical
+        resolved.relative_to(root.resolve())
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"path {path} is outside the project or cannot be safely resolved; "
+            f"choose a location inside {root}") from exc
+    return lexical
+
+
+def data_root() -> Path:
+    root = project_root()
+    # require_project_path fails before any write when no checkout is present.
+    return require_project_path(
+        os.environ.get("KERNEL_ATLAS_HOME") or root or Path.cwd())
 
 
 def sources_dir() -> Path:
-    return data_root() / SOURCES_DIRNAME
+    return require_project_path(data_root() / SOURCES_DIRNAME)
 
 
 def index_dir() -> Path:
-    return data_root() / INDEX_DIRNAME
+    return require_project_path(data_root() / INDEX_DIRNAME)
 
 
 def source_path(version: str) -> Path:
@@ -134,7 +156,7 @@ def get_default_version() -> str | None:
 def set_default_version(version: str) -> None:
     """Atomically pin ``version`` without following a hostile leaf symlink."""
     version = validate_version(version)
-    f = default_version_file()
+    f = require_project_path(default_version_file(), follow_leaf=False)
     f.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{f.name}.", suffix=".tmp", dir=f.parent)
@@ -154,7 +176,8 @@ def set_default_version(version: str) -> None:
 
 
 def clear_default_version() -> None:
-    default_version_file().unlink(missing_ok=True)
+    require_project_path(default_version_file(), follow_leaf=False).unlink(
+        missing_ok=True)
 
 
 def tree_for(version: str, recorded: str | None = None) -> Path | None:

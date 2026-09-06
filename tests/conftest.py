@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -7,7 +8,30 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from fixture import make_mini_kernel  # noqa: E402
 
-from kernel_atlas import db, indexer  # noqa: E402
+from kernel_atlas import config as storage, db, indexer  # noqa: E402
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Keep generated kernel fixtures/indexes local, with numbered pytest runs."""
+    try:
+        root = storage.project_root()
+        assert root is not None
+        temporary = storage.require_project_path(root / ".pytest_cache" / "tmp")
+        if config.option.basetemp:
+            # Pytest deletes --basetemp recursively. Only its dedicated scratch
+            # subtree can be used, never application data or source directories.
+            storage.require_project_path(config.option.basetemp).relative_to(temporary)
+        temporary.mkdir(parents=True, exist_ok=True)
+        os.environ["PYTEST_DEBUG_TEMPROOT"] = str(temporary)
+    except (ValueError, OSError) as exc:
+        raise pytest.UsageError(f"invalid project test temporary directory: {exc}") from exc
+
+
+@pytest.fixture(autouse=True)
+def isolated_application_home(tmp_path, monkeypatch):
+    """Tests must not create application locks or metadata in the user's data."""
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path / "app-data"))
 
 
 @pytest.fixture(scope="session")

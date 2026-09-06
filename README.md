@@ -106,8 +106,12 @@ behind these results.
 | [Troubleshooting](docs/troubleshooting.md) | Ambiguity, source availability, index and pin problems |
 | [Development](docs/development.md) | Module responsibilities, tests, compatibility |
 
-An editable checkout keeps downloaded source in `kernels/` and indexes in
-`indexes/`. Other installations use `~/.kernel-atlas`; `KERNEL_ATLAS_HOME`
-overrides the location. Generated data is Git-ignored. Index metadata and local
-Python environments retain absolute workspace paths, so review them before
-sharing a workspace archive.
+Application data stays inside the source checkout: downloaded source in
+`kernels/`, indexes in `indexes/`, and their supporting metadata alongside them.
+`KERNEL_ATLAS_HOME` may select another directory inside the checkout; custom
+`--output` and `--db` paths must also remain inside it. There is no home-directory
+data fallback. Normal Python and tool caches keep their usual locations; see
+[storage and cleanup](docs/getting-started.md#where-everything-lives) for details.
+The default data directories are Git-ignored; add ignore rules for any custom
+locations. Index metadata and local Python environments retain absolute workspace
+paths, so review them before sharing a workspace archive.

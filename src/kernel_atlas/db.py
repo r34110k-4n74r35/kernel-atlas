@@ -218,11 +218,30 @@ CREATE INDEX idx_sym_file_name  ON symbols(file_id, name, kind);
 """
 
 
+def _require_safe_sidecars(path: Path) -> None:
+    """Keep SQLite's adjacent files within the project too.
+
+    Read-only SQLite connections can still touch WAL shared-memory files.
+    Hard links cannot be traced back to all their aliases, so refuse them for
+    files SQLite may update instead of risking an alias outside the project.
+    """
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = config.require_project_path(Path(f"{path}{suffix}"))
+        if sidecar.exists() and sidecar.stat().st_nlink > 1:
+            raise ValueError(f"SQLite sidecar has multiple hard links: {sidecar}")
+
+
 def connect(path: Path, readonly: bool = True) -> sqlite3.Connection:
+    # Resolve a permitted leaf alias before checking sidecars: SQLite uses the
+    # real database location for its journal and WAL files.
+    path = config.require_project_path(path).resolve()
+    if path.exists() and path.stat().st_nlink > 1:
+        raise ValueError(f"index database has multiple hard links: {path}")
+    _require_safe_sidecars(path)
     if readonly:
         if not path.is_file():
             raise FileNotFoundError(path)
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)
@@ -232,6 +251,10 @@ def connect(path: Path, readonly: bool = True) -> sqlite3.Connection:
 
 
 def create(path: Path) -> sqlite3.Connection:
+    # Creating an index replaces the directory entry.  An existing leaf alias
+    # may be removed safely without opening or changing its target.
+    path = config.require_project_path(path, follow_leaf=False)
+    _require_safe_sidecars(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
     conn = sqlite3.connect(path)

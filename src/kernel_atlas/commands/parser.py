@@ -94,7 +94,7 @@ def _global_opts(parser, suppress: bool):
     g.add_argument("--kernel", "-K", type=_nonempty_arg,
                    help="which built index to use (e.g. 6.12.104)", **kw)
     g.add_argument("--db", type=_nonempty_arg,
-                   help="path to a specific index file", **kw)
+                   help="path to an index file inside the project", **kw)
     g.add_argument("--color", choices=("auto", "always", "never"),
                    **(kw or {"default": "auto"}))
 
@@ -143,7 +143,7 @@ def build_parser(support) -> argparse.ArgumentParser:
     sp.add_argument("--src", type=_nonempty_arg,
                     help="index an existing local kernel tree instead")
     sp.add_argument("--output", "-o", type=_nonempty_arg,
-                    help="write the index here")
+                    help="write the index here (inside the project)")
     sp.add_argument("--jobs", "-j", type=_jobs_int, help="parallel parser processes")
     sp.add_argument("--kinds", type=_nonempty_arg,
                     help="symbol kinds to index (default: "

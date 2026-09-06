@@ -2379,6 +2379,10 @@ def test_local_build_requires_detectable_or_explicit_version(tmp_path, capsys):
 
 def test_build_reports_expected_indexer_failures_without_a_traceback(
         mini_tree, tmp_path, monkeypatch, capsys):
+    # Even a failed build creates a publication lock. It must stay with the
+    # test data, not accumulate in the user's real indexes/.lifecycle-locks/.
+    isolated_home = config.data_root()
+    assert isolated_home.is_relative_to(tmp_path)
     def fail(*args, **kwargs):
         raise RuntimeError("cannot scan protected directory")
 
@@ -2391,6 +2395,27 @@ def test_build_reports_expected_indexer_failures_without_a_traceback(
     err = capsys.readouterr().err
     assert "could not build index: cannot scan protected directory" in err
     assert "Traceback" not in err
+    locks = kernelsrc._output_lock_paths(tmp_path / "index.db")
+    assert all(lock.is_relative_to(isolated_home) and lock.is_file() for lock in locks)
+
+
+def test_build_rejects_external_output_even_with_force(
+        mini_tree, tmp_path, monkeypatch, capsys):
+    # Both sides of this simulated boundary are in pytest's local scratch area.
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "personal-notes.db"
+    outside.write_bytes(b"preserve this file")
+    monkeypatch.setattr(config, "project_root", lambda: project)
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(project))
+
+    with pytest.raises(SystemExit):
+        cli.main(["build", "--src", str(mini_tree), "--output", str(outside),
+                  "--force", "--quiet"])
+
+    assert "outside the project" in capsys.readouterr().err
+    assert outside.read_bytes() == b"preserve this file"
+    assert list(project.iterdir()) == []
 
 
 def test_build_rechecks_output_existence_under_its_publication_lock(

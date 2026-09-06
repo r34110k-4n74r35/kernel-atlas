@@ -31,7 +31,10 @@ See [Building indexes](getting-started.md#building-indexes) and
 build, two starter queries are printed. A normal build uses or creates its
 source tree under `kernels/` and writes its database under `indexes/`; `use` writes the pin,
 and `remove --source` may remove both managed objects. An explicit
-`build --output PATH` writes the database at that path. These commands never
+`build --output PATH` writes the database at that path inside the source
+checkout. `KERNEL_ATLAS_HOME` may relocate managed data within the checkout;
+external data destinations and symlink escapes are rejected. A custom `--src`
+tree may be external and is read without modification. These commands never
 change your system `PATH`.
 
 ### `stats`
@@ -493,7 +496,7 @@ subcommand:
 | Option | Meaning |
 | --- | --- |
 | `-K`, `--kernel` | which index (`6.18.46`, or a unique prefix like `6.18`) |
-| `--db PATH` | a specific index file |
+| `--db PATH` | a specific index file inside the source checkout |
 | `--color` | `auto` (default), `always`, `never` |
 
 `-K` and `--db` are mutually exclusive. Index-selection options are rejected

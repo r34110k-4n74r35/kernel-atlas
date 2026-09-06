@@ -764,6 +764,7 @@ def cmd_use(args):
 
 def _unlink_index(path: Path) -> int:
     """Delete one regular index and its sidecars, or an index symlink leaf."""
+    path = config.require_project_path(path, follow_leaf=False)
 
     def inspect(leaf: Path):
         try:
@@ -1096,6 +1097,8 @@ def main(argv=None) -> int:
         except Exception:
             pass
         return 0
+    except (OSError, ValueError) as exc:
+        _die(str(exc))
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130

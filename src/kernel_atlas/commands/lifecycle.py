@@ -108,6 +108,7 @@ def cmd_build(args, support):
 
     out = (Path(args.output).expanduser()
            if args.output else config.index_path(version))
+    out = config.require_project_path(out, follow_leaf=False)
     if not args.src and support._path_inside(out, config.source_path(version)):
         support._die(f"index output {out} is inside the source tree "
                      f"{config.source_path(version)}; choose a path outside "
@@ -488,8 +489,9 @@ def cmd_remove(args, support):
                                 print(f"source is already absent at {tree}")
                         else:
                             try:
-                                shutil.rmtree(removal.quarantine)
-                            except OSError as exc:
+                                shutil.rmtree(config.require_project_path(
+                                    removal.quarantine))
+                            except (OSError, ValueError) as exc:
                                 print(
                                     f"  could not remove source {tree} from "
                                     f"quarantine {removal.quarantine}: {exc}; "

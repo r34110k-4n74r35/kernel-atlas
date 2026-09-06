@@ -84,6 +84,7 @@ _LOCK_STATE = threading.local()
 
 def _open_regular_lock(path: Path):
     """Open/create a lock leaf without ever writing through a symlink."""
+    path = config.require_project_path(path, follow_leaf=False)
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
@@ -105,7 +106,7 @@ def _open_regular_lock(path: Path):
 @contextmanager
 def _file_lock(lock: Path):
     """Take one re-entrant, cross-process exclusive lifecycle lock."""
-    lock = lock.parent.resolve() / lock.name
+    lock = config.require_project_path(lock, follow_leaf=False)
     held = getattr(_LOCK_STATE, "held", None)
     if held is None:
         held = _LOCK_STATE.held = {}
@@ -186,7 +187,7 @@ def output_lock(path: Path):
     alias converge with operations on the real index.  Rechecking after all
     locks are held closes races between cooperating lifecycle commands.
     """
-    path = Path(path).expanduser()
+    path = config.require_project_path(path, follow_leaf=False)
     for _ in range(16):
         before = _output_lock_paths(path)
         with ExitStack() as locks:
@@ -241,8 +242,8 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     atomic flags.  Unknown platforms fail closed instead of approximating the
     ownership boundary with a check-then-rename race.
     """
-    source = Path(source)
-    destination = Path(destination)
+    source = config.require_project_path(source, follow_leaf=False)
+    destination = config.require_project_path(destination, follow_leaf=False)
     if os.name == "nt":
         os.rename(source, destination)
         return
@@ -419,7 +420,8 @@ def _write_source_identity(version: str, tree: Path, source: str, *,
 def _store_source_identity(version: str,
                            identity: ManagedSourceIdentity) -> None:
     """Atomically persist an already validated source identity."""
-    marker = _source_identity_path(version)
+    marker = config.require_project_path(
+        _source_identity_path(version), follow_leaf=False)
     marker.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{marker.name}.", suffix=".tmp", dir=marker.parent)
@@ -544,7 +546,8 @@ def _same_source_identity(left: ManagedSourceIdentity,
 
 
 def _source_quarantine_base(*, create: bool) -> Path:
-    base = config.sources_dir() / ".kernel-atlas-removing"
+    base = config.require_project_path(
+        config.sources_dir() / ".kernel-atlas-removing", follow_leaf=False)
     if create:
         base.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -595,7 +598,8 @@ def prepare_source_removal(version: str,
     if current is None or not _same_source_identity(current, expected):
         return None
 
-    source = config.source_path(version)
+    source = config.require_project_path(
+        config.source_path(version), follow_leaf=False)
     base = _source_quarantine_base(create=False)
     quarantine = base / f"source-{current.token}"
     source_info = _entry_info(source)
@@ -686,7 +690,8 @@ def source_identity_marker(version: str) -> ManagedSourceIdentity | None:
 
 def clear_source_identity(version: str, token: str) -> None:
     """Remove the marker only when it still carries the expected nonce."""
-    marker = _source_identity_path(version)
+    marker = config.require_project_path(
+        _source_identity_path(version), follow_leaf=False)
     identity = _read_source_identity_marker(version)
     if identity is not None and secrets.compare_digest(identity.token, token):
         marker.unlink(missing_ok=True)
@@ -834,6 +839,7 @@ def _same_part(left: os.stat_result | None,
 
 def _unlink_download_part(path: Path, expected: os.stat_result) -> None:
     """Unlink only the same regular partial file observed by the caller."""
+    path = config.require_project_path(path, follow_leaf=False)
     current = _regular_part_info(path)
     if not _same_part(current, expected):
         raise OSError(
@@ -847,6 +853,7 @@ _EXPECTED_PART_UNSET = object()
 def _open_download_part(path: Path, *, append: bool,
                         expected=_EXPECTED_PART_UNSET):
     """Open a verified regular part without truncating through a link."""
+    path = config.require_project_path(path, follow_leaf=False)
     try:
         before = path.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -891,6 +898,7 @@ def _open_download_part(path: Path, *, append: bool,
 def download(url: str, dest: Path, quiet: bool = False, retries: int = 5) -> Path:
     """Download with resume. A dropped connection mid-transfer is common on a
     147MB tarball and must not be mistaken for a completed download."""
+    dest = config.require_project_path(dest, follow_leaf=False)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
 
@@ -1035,6 +1043,7 @@ def extract(tarball: Path, into: Path, quiet: bool = False, *,
     Extraction happens in a scratch directory that is renamed into place only
     when complete, so an interrupted run can never be mistaken for a full tree.
     """
+    into = config.require_project_path(into)
     into.mkdir(parents=True, exist_ok=True)
     stem = _archive_stem(tarball.name)
     scratch = Path(tempfile.mkdtemp(prefix=f".extracting-{stem}-", dir=into))
@@ -1134,7 +1143,8 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
         raise RuntimeError(
             f"source archive {archive_name!r} does not match Linux {version}"
         )
-    tarball = config.sources_dir() / archive_name
+    tarball = config.require_project_path(
+        config.sources_dir() / archive_name, follow_leaf=False)
     expect = (_expected_sha256(version, source_url=url) if verify else None)
     if verify and expect is None:
         if _is_kernel_org_rc_snapshot(version, url):
@@ -1163,8 +1173,11 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
             if not quiet:
                 print("  sha256 verified against kernel.org", file=sys.stderr)
             break
-        tarball.unlink(missing_ok=True)
-        tarball.with_name(tarball.name + ".part").unlink(missing_ok=True)
+        config.require_project_path(
+            tarball, follow_leaf=False).unlink(missing_ok=True)
+        config.require_project_path(
+            tarball.with_name(tarball.name + ".part"),
+            follow_leaf=False).unlink(missing_ok=True)
         if attempt == 2:
             raise RuntimeError(
                 f"sha256 mismatch for {archive_name} "
@@ -1193,7 +1206,8 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
         _write_source_identity(
             version, tree, url, authoritative=authoritative)
     if not keep_tarball:
-        tarball.unlink(missing_ok=True)
+        config.require_project_path(
+            tarball, follow_leaf=False).unlink(missing_ok=True)
     return tree
 
 

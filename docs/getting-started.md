@@ -94,20 +94,50 @@ You can keep several versions at once (`kernels/linux-7.2/`, `indexes/7.2.db`,
 
 The source-identity sidecar is created only for a tree downloaded and published
 by kernel-atlas; a custom `--src` build neither creates one nor records deletion
-authorization from one. A normal package installation that is not running from
-its checkout defaults to
-`~/.kernel-atlas/`. Set `KERNEL_ATLAS_HOME` to choose the data root explicitly,
-including when you want the data on another disk:
+authorization from one. An external `--src` tree is read without changing it.
+
+All application data paths must stay inside the source checkout, including
+custom `--output` and `--db` paths. Paths that escape through symlinks are
+rejected. Copy an external index into the checkout before querying it: even a
+read-only SQLite connection can use writable companion files beside the index.
+`KERNEL_ATLAS_HOME` can choose a different data directory **inside**
+the checkout, with `kernels/` and `indexes/` created beneath it. For example,
+from the project root:
 
 ```bash
-export KERNEL_ATLAS_HOME=/mnt/big-disk/kernel-atlas
+export KERNEL_ATLAS_HOME="$PWD/data"
 ```
+
+An installation without its source checkout refuses data operations and asks
+you to install an editable checkout. It does not create `~/.kernel-atlas` or
+another application directory outside the project. If you need another disk,
+place the whole checkout there.
+
+| Generated files | Purpose and retention |
+| --- | --- |
+| `kernels/linux-V/`, `indexes/V.db`, custom index outputs | Persistent study data. Keep until you no longer need the snapshot. Prefer `ka remove` for managed indexes and sources. |
+| `kernels/.linux-V.source.json`, `indexes/.default-version`, source/output/pin locks | Persistent ownership, selection, and coordination metadata. Keep with the data; lock files are not disposable cache. Use `ka use --clear` to clear a pin. |
+| Archives and `.part` files under `kernels/` | Downloads; partial files support resuming. Successful acquisition removes the archive unless `--keep-tarball` is set. |
+| `*.building` beside an index, `.extracting-*` under `kernels/` | Temporary build/extraction staging. Normally cleaned up; crashes or cleanup failures can leave residue. |
+| `.kernel-atlas-removing/` under `kernels/` | Quarantine for source removal. Preserve it and the source-identity sidecar so interrupted removal can be retried. |
+| `__pycache__/`, `.pytest_cache/`, `.ruff_cache/` | Standard regenerable development caches. Tests keep synthetic sources and indexes under `.pytest_cache/tmp/`. |
+| `.venv/`, `build/`, `dist/`, `src/kernel_atlas.egg-info/` | Local environment and packaging products. Recreate through installation or packaging when needed. |
+
+Python caches keep their normal layout; the project does not consolidate them
+into `.cache/` or require a special command runner. Package installers retain
+their normal shared caches, and Python, SQLite, and the operating system may use
+system temporary storage.
+This is an application storage policy, not an operating-system sandbox: it does
+not redirect those library and tool facilities. The default data directories are
+Git-ignored; add ignore rules for any custom locations.
+See [cleanup guidance](troubleshooting.md#leftover-generated-files) before
+removing temporary-looking data.
 
 ## Choosing a kernel version
 
 Three knobs pick which index a command uses, in this order:
 
-1. `--db PATH` — an explicit index file, for scripts and tests.
+1. `--db PATH` — an explicit index file inside the checkout, for scripts and tests.
 2. `-K` / `--kernel VERSION` — this command only.
 3. The **default index**: the version pinned with `ka use`, or if nothing is
    pinned (or that index is gone), the **highest built version**.
@@ -203,7 +233,7 @@ snapshot; rebuild after changing the tree.
 | `--kinds LIST` | symbol kinds to index (default: `function,syscall,struct,union,enum,typedef,macro,variable`; add `prototype` if wanted) |
 | `--with-calls` | also record the call graph (enables `ka calls`; a few hundred MB extra; requires the `macro` and `variable` kinds used to prevent false identities) |
 | `--jobs N` | parser processes (automatic default: one per CPU, capped at 16; explicit range 1–256) |
-| `--output PATH` | write the index somewhere specific |
+| `--output PATH` | write the index to a specific path inside the checkout |
 | `--keep-tarball` | keep the downloaded source archive after extraction |
 | `--no-verify` | skip the checksum (not recommended) |
 | `--force` | replace an existing index (reusing its source tree when present) |
@@ -236,10 +266,11 @@ With `--src`, download aliases such as `lts` are not version labels: omit the
 positional argument to detect the tree's `Makefile` version, or supply an
 explicit literal version for a vendor/local tree.
 
-An output outside `indexes/` is intentionally not discovered by `ka indexes`,
-`ka use`, `ka remove`, or `-K`; the build summary prints exact `--db PATH`
-commands for querying it, and you manage that database file yourself. A custom
-filename inside `indexes/` is discoverable and acts as its selection alias.
+An output elsewhere inside the checkout, outside the managed `indexes/`
+directory, is intentionally not discovered by `ka indexes`, `ka use`,
+`ka remove`, or `-K`; the build summary prints exact `--db PATH` commands for
+querying it, and you manage that database file yourself. A custom filename
+inside `indexes/` is discoverable and acts as its selection alias.
 
 A recent kernel is roughly 6,000 directories, 95,000 files, 4.2 million
 symbols, and 3,000 MAINTAINERS sections. A full call-enabled build can take

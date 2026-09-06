@@ -29,7 +29,7 @@ version = { attr = "kernel_atlas.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = [".git", ".venv", "indexes", "kernels"]
+norecursedirs = [".git", ".venv", ".pytest_cache", "indexes", "kernels"]
 
 [tool.ruff]
 target-version = "py310"

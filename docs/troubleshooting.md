@@ -4,6 +4,17 @@
 
 **"no index built yet"** — `ka build lts` once. Everything else needs an index.
 
+**A data path is outside the project** — keep `KERNEL_ATLAS_HOME`, `--output`,
+and `--db` inside the source checkout. A symlink to an external directory also
+escapes this boundary. Unset an old external `KERNEL_ATLAS_HOME` to restore
+the default `kernels/` and `indexes/` directories. External source trees remain
+valid read-only inputs through `--src`.
+
+**No source checkout is available** — install from a checkout using
+`.venv/bin/python -m pip install -e .` as shown in the
+[installation guide](getting-started.md#install). Application data operations
+require that checkout; there is no home-directory fallback.
+
 **"no index for X"** — `ka indexes` lists what you have. Prefixes must be
 unique *and* land on a version-component boundary (`-K 6` is ambiguous if you
 have both 6.12 and 6.18; `-K 6.1` does not select `6.18.46`).
@@ -59,3 +70,24 @@ corrupt, or was built with an incompatible schema. Rebuild that version with
 Rebuild with `--force` after editing its managed or custom source tree. An
 edited managed cache is intentionally recorded as local source, so that rebuilt
 index does not claim upstream `web` links for content it can no longer attest.
+
+## Leftover generated files
+
+First confirm no build, download, removal, or test run is using the files.
+After a crash, abandoned `*.building` files beside an index and `.extracting-*`
+directories under `kernels/` may be removed after inspecting the exact paths.
+They are staging data, not the published index or source tree. Ordinary errors
+attempt cleanup, but extraction cleanup errors are suppressed and can leave
+residue too.
+
+Keep a `.part` download if you intend to resume it; deleting it makes the next
+attempt start over. Retained source archives can be removed if you do not need
+them. Do not delete `.source.json` sidecars, lifecycle lock files, or
+`.kernel-atlas-removing/` as routine cache cleanup. Retry an interrupted source
+removal with the same `ka remove VERSION --source` command so its recorded
+identity and quarantine are handled together.
+
+Inactive Python, pytest, and Ruff caches can be removed and regenerated.
+`.pytest_cache/tmp/` contains only test fixtures and test indexes, not managed
+study data. The application does not automatically clean external artifacts or
+shared package-manager caches.

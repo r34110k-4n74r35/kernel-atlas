@@ -26,9 +26,16 @@ definitions, or schema rules. Keep regression tests focused on observable
 behavior, including bounded results, ambiguous identities, and path boundaries.
 
 The tests build a small synthetic kernel tree (`tests/fixture.py`) with its own
-`MAINTAINERS`, plus a throwaway `KERNEL_ATLAS_HOME` for `use` / `remove`, so
-they need no network and never touch your real indexes. Pytest discovery is
-confined to `tests/`; downloaded kernel selftests are never collected.
+`MAINTAINERS`. Each test gets an isolated `KERNEL_ATLAS_HOME`, including source
+and output locks, so the suite needs no network and does not touch your real
+indexes. Numbered temporary runs live under `.pytest_cache/tmp/` inside the
+checkout; this includes generated kernel fixtures and databases. Pytest discovery
+is confined to `tests/`; downloaded kernel selftests are never collected.
+
+Python bytecode, pytest, and Ruff caches use their normal layout. There is no
+cache consolidation or special runner. Installation and packaging tools keep
+their normal shared caches and temporary-directory behavior. See the
+[storage guide](getting-started.md#where-everything-lives) for retention and cleanup.
 
 ## Layout
 

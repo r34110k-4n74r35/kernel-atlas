@@ -1,9 +1,14 @@
+import os
+import sys
+import tempfile
+
 import pytest
 
 from kernel_atlas import config
 
 
-def test_data_lives_inside_the_project_checkout():
+def test_data_lives_inside_the_project_checkout(monkeypatch):
+    monkeypatch.delenv("KERNEL_ATLAS_HOME", raising=False)
     root = config.project_root()
     assert root is not None
     assert (root / "pyproject.toml").is_file()
@@ -160,3 +165,74 @@ def test_project_root_does_not_claim_an_unrelated_src_layout_project(
     installed.write_text("", encoding="utf-8")
     monkeypatch.setattr(config, "__file__", str(installed))
     assert config.project_root() is None
+
+
+def test_no_checkout_never_falls_back_to_a_home_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "project_root", lambda: None)
+    for value in (None, str(tmp_path / "override")):
+        if value is None:
+            monkeypatch.delenv("KERNEL_ATLAS_HOME", raising=False)
+        else:
+            monkeypatch.setenv("KERNEL_ATLAS_HOME", value)
+        with pytest.raises(ValueError, match="requires a source checkout"):
+            config.data_root()
+    assert not (tmp_path / "override").exists()
+
+
+def test_external_home_override_is_rejected_before_creating_data(monkeypatch, tmp_path):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    outside = tmp_path / "outside"
+    monkeypatch.setattr(config, "project_root", lambda: checkout)
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(outside))
+    with pytest.raises(ValueError, match="outside the project"):
+        config.set_default_version("9.9")
+    assert not outside.exists()
+    assert list(checkout.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["kernels", "indexes"])
+def test_managed_directories_cannot_redirect_outside_the_project(
+        monkeypatch, tmp_path, name):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (checkout / name).symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(config, "project_root", lambda: checkout)
+    monkeypatch.delenv("KERNEL_ATLAS_HOME", raising=False)
+    with pytest.raises(ValueError, match="outside the project"):
+        {"kernels": config.sources_dir, "indexes": config.index_dir}[name]()
+    assert list(outside.iterdir()) == []
+
+
+def test_relative_storage_override_follows_cwd_within_project(monkeypatch, tmp_path):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    monkeypatch.setattr(config, "project_root", lambda: checkout)
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", "study-data")
+    assert config.data_root() == checkout / "study-data"
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", "../outside")
+    with pytest.raises(ValueError, match="outside the project"):
+        config.data_root()
+
+
+def test_application_storage_does_not_change_python_cache_or_temp_settings(
+        monkeypatch, tmp_path):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    monkeypatch.setattr(config, "project_root", lambda: checkout)
+    monkeypatch.delenv("KERNEL_ATLAS_HOME", raising=False)
+    environment = dict(os.environ)
+    bytecode = sys.dont_write_bytecode
+    prefix = sys.pycache_prefix
+    tempdir = tempfile.tempdir
+
+    config.set_default_version("9.9")
+
+    assert dict(os.environ) == environment
+    assert sys.dont_write_bytecode == bytecode
+    assert sys.pycache_prefix == prefix
+    assert tempfile.tempdir == tempdir
+    assert not (checkout / ".cache").exists()

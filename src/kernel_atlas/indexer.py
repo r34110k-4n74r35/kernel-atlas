@@ -574,7 +574,7 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
     started = time.monotonic()
     version = config.validate_version(version)
     tree = Path(tree).resolve()
-    out = Path(out).expanduser()
+    out = config.require_project_path(out, follow_leaf=False)
     if not tree.is_dir():
         raise ValueError(f"kernel source tree does not exist: {tree}")
     if out.is_dir():
@@ -716,14 +716,18 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
     except BaseException:
         if conn is not None:
             conn.close()
-        scratch.unlink(missing_ok=True)
+        config.require_project_path(scratch, follow_leaf=False).unlink(missing_ok=True)
         raise
     assert conn is not None
     conn.close()
     try:
         with Progress("Publishing index", quiet=quiet):
+            # Recheck after callbacks and the long-running parse: an output
+            # parent redirected outside the project must not receive the index.
+            out = config.require_project_path(out, follow_leaf=False)
+            scratch = config.require_project_path(scratch, follow_leaf=False)
             scratch.replace(out)
     except BaseException:
-        scratch.unlink(missing_ok=True)
+        config.require_project_path(scratch, follow_leaf=False).unlink(missing_ok=True)
         raise
     return stats
