@@ -1,4 +1,4 @@
-# kernel-atlas
+# Kernel Atlas
 
 Explore Linux kernel structures and the relationships between subsystems from
 an offline source index. Start with a function, C structure, file, or directory;

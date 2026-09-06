@@ -11,10 +11,11 @@ import shlex
 import shutil
 import sqlite3
 import sys
-from contextlib import ExitStack
+import warnings
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from .. import config, cparse, db, indexer, kernelsrc, maintainers, render
+from .. import build_output, config, cparse, db, indexer, kernelsrc, maintainers, render
 from ..progress import Progress
 
 
@@ -39,6 +40,28 @@ def cmd_versions(args, support):
 
 
 def cmd_build(args, support):
+    with build_output.color_mode(args.color):
+        return _build(args, support)
+
+
+@contextmanager
+def _source_warning_style():
+    """Present acquisition warnings as CLI messages without changing the library."""
+    with warnings.catch_warnings():
+        original = warnings.showwarning
+
+        def show(message, category, filename, lineno, file=None, line=None):
+            if issubclass(category, kernelsrc.UnverifiedRCWarning):
+                # Verification warnings remain visible even with --quiet.
+                build_output.note("Warning", message, tone="warning", stream=file)
+            else:
+                original(message, category, filename, lineno, file=file, line=line)
+
+        warnings.showwarning = show
+        yield
+
+
+def _build(args, support):
     quiet = args.quiet
     if args.kinds is None:
         kinds = list(cparse.DEFAULT_KINDS)
@@ -103,8 +126,6 @@ def cmd_build(args, support):
             support._die(str(exc))
         managed_source_version = version
         managed_identity = None
-        if not quiet:
-            print(f"kernel {version} ({release.moniker})", file=sys.stderr)
 
     out = (Path(args.output).expanduser()
            if args.output else config.index_path(version))
@@ -116,6 +137,9 @@ def cmd_build(args, support):
     if args.src and support._path_inside(out, tree):
         support._die(f"index output {out} is inside the source tree {tree}; "
                      "choose a path outside the tree")
+    build_output.header(
+        version, tree if args.src else config.source_path(version), out,
+        calls=args.with_calls, workers=args.jobs, quiet=quiet)
     # Every managed build holds its source lock until parsing has finished, and
     # every build holds the output lock until atomic publication has finished.
     # Removal takes the same locks in the same order, so it cannot delete a
@@ -139,9 +163,10 @@ def cmd_build(args, support):
                 requested_source = (
                     release.source or kernelsrc.tarball_url(version))
                 try:
-                    tree = kernelsrc.ensure_source(
-                        version, keep_tarball=args.keep_tarball, quiet=quiet,
-                        verify=not args.no_verify, source_url=requested_source)
+                    with _source_warning_style():
+                        tree = kernelsrc.ensure_source(
+                            version, keep_tarball=args.keep_tarball, quiet=quiet,
+                            verify=not args.no_verify, source_url=requested_source)
                 except (OSError, RuntimeError) as exc:
                     support._die(f"could not obtain kernel source: {exc}")
                 with Progress("Checking cached source identity", quiet=quiet):
@@ -159,8 +184,6 @@ def cmd_build(args, support):
                 support._die(
                     f"index output {out} is inside the source tree {tree}; "
                     "choose a path outside the tree")
-            if not quiet:
-                print(f"indexing {tree}", file=sys.stderr)
 
             def revalidate_managed_source() -> None:
                 if managed_identity is None:
@@ -183,7 +206,7 @@ def cmd_build(args, support):
                     if managed_identity is not None else None),
                 pre_publish=(revalidate_managed_source
                              if managed_identity is not None else None))
-            size_mb = out.stat().st_size / (1024 * 1024)
+            size_bytes = out.stat().st_size
             try:
                 selectable_by_kernel = (
                     out.resolve() == config.index_path(version).resolve())
@@ -196,26 +219,8 @@ def cmd_build(args, support):
     else:
         query_cmd = (
             f"{support.PROG} --db {shlex.quote(str(out.resolve()))}")
-    print(
-        f"\nBuilt index for Linux {version}\n"
-        f"  {stats.dirs:,} directories, {stats.files:,} files\n"
-        f"  {stats.symbols:,} symbols from {stats.parsed:,} C/H files\n"
-        + (f"  {stats.skipped:,} parse inputs skipped, {stats.failed:,} failed"
-           f" ({stats.oversize:,} oversized)\n"
-           if stats.skipped or stats.failed else "")
-        + (f"  {stats.symlinks:,} symlinks recorded\n"
-           if stats.symlinks else "")
-        + (f"  {stats.calls:,} call records from "
-           f"{stats.call_occurrences:,} source occurrences: "
-           f"{stats.calls_resolved:,} resolved, "
-           f"{stats.calls_ambiguous:,} ambiguous, {stats.calls_macro:,} macro, "
-           f"{stats.calls_indirect:,} indirect, "
-           f"{stats.calls_unresolved:,} unresolved\n" if stats.calls else "")
-        + f"  {stats.subsystems:,} subsystems from MAINTAINERS\n"
-        f"  {out}  ({size_mb:.0f} MB, {stats.seconds:.0f}s)\n"
-        f"\nTry:  {query_cmd} info mm\n"
-        f"      {query_cmd} siblings mm/page_alloc.c"
-    )
+    build_output.summary(version, out, stats, size=size_bytes,
+                         calls=args.with_calls, query_cmd=query_cmd)
 
 
 def cmd_indexes(args, support):

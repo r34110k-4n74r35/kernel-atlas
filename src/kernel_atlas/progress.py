@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import textwrap
 import threading
 import time
+
+from .build_output import clean, color_enabled, display_width, wrap_text
+from .render_format import paint
 
 
 def _duration(seconds: float) -> str:
@@ -39,14 +41,17 @@ class Progress:
                  unit: str | None = None, initial: int = 0,
                  detail: str = "", quiet: bool = False,
                  refresh: bool = True, stream=None):
-        self.label = label
+        self.label = clean(label)
         self.total = total
-        self.unit = unit
+        self.unit = clean(unit) if unit else None
         self.completed = self.initial = initial
-        self.detail = detail
+        self.detail = clean(detail)
         self.quiet = quiet
         self.refresh = refresh
         self.stream = stream if stream is not None else sys.stderr
+        # The refresh thread does not inherit ContextVars from the CLI thread.
+        # Freeze its policy here so the first render and later updates agree.
+        self.color = color_enabled(self.stream)
         self.tty = (not quiet and self.stream.isatty()
                     and os.environ.get("TERM") != "dumb")
         self.started = 0.0
@@ -76,7 +81,7 @@ class Progress:
             if total is not None:
                 self.total = total
             if detail is not None:
-                self.detail = detail
+                self.detail = clean(detail)
             self._write()
 
     def _refresh(self):
@@ -84,37 +89,73 @@ class Progress:
             with self._lock:
                 self._write()
 
-    def _line(self, now: float, status: str | None = None) -> str:
+    def _parts(self, now: float, status: str | None = None):
         elapsed = max(0.0, now - self.started)
-        marker = status or ("|/-\\"[int(elapsed * 8) % 4] if self.tty else "started")
-        parts = [f"{marker} {self.label}"]
-        if self.total is not None and self.total > 0:
-            ratio = min(1.0, max(0.0, self.completed / self.total))
-            filled = int(ratio * 18)
-            parts.append(f"[{'#' * filled}{'-' * (18 - filled)}] {int(ratio * 100):3d}%")
+        spinner = "|/-\\"[int(elapsed * 8) % 4]
+        marker = status or (f"{spinner} running" if self.tty else "started")
+        header = f"  {marker} {self.label}"
+        count = ""
         if self.unit == "bytes":
             count = _bytes(self.completed)
             if self.total is not None:
                 count += f"/{_bytes(self.total)}"
-            parts.append(count)
         elif self.unit:
             count = f"{self.completed:,}"
             if self.total is not None:
                 count += f"/{self.total:,}"
-            parts.append(f"{count} {self.unit}")
-        parts.append(f"elapsed {_duration(elapsed)}")
+            count += f" {self.unit}"
+        elif self.total is not None:
+            count = f"{self.completed:,}/{self.total:,}"
+        metrics = [f"elapsed {_duration(elapsed)}"]
         delta = self.completed - self.initial
         if elapsed > 0 and delta > 0 and self.unit:
             rate = delta / elapsed
-            parts.append(f"{_bytes(rate)}/s" if self.unit == "bytes"
-                         else f"{rate:,.0f} {self.unit}/s")
+            metrics.append(f"{_bytes(rate)}/s" if self.unit == "bytes"
+                           else f"{rate:,.0f} {self.unit}/s")
             if status is None and self.total is not None:
-                parts.append(f"ETA {_duration(max(0, self.total - self.completed) / rate)}")
+                metrics.append(f"ETA {_duration(max(0, self.total - self.completed) / rate)}")
+        code = {"done": "1;32", "failed": "1;31", "interrupted": "1;33"}.get(
+            status, "1;36")
+        return header, count, metrics, code
+
+    def _summary_count(self, count: str) -> str:
+        if self.total is not None and self.total > 0:
+            ratio = min(1.0, max(0.0, self.completed / self.total))
+            return f"{count} ({int(ratio * 100)}%)"
+        return count
+
+    def _terminal_lines(self, now: float, status: str | None, width: int):
+        header, count, metrics, code = self._parts(now, status)
+        rows = [(header, code)]
+        if status:
+            count = self._summary_count(count)
+            rows.append(("    " + "   ".join(([count] if count else []) + metrics), ""))
+        else:
+            if self.total is not None and self.total > 0:
+                ratio = min(1.0, max(0.0, self.completed / self.total))
+                # Keep the measured count visible on narrow terminals too.
+                bar_width = max(4, min(18, width - display_width(count) - 15))
+                filled = int(ratio * bar_width)
+                bar = f"[{'#' * filled}{'-' * (bar_width - filled)}] " if width >= 24 else ""
+                count = f"{bar}{int(ratio * 100):3d}%" + (f"  {count}" if count else "")
+            if count:
+                rows.append((f"    {count}", "36"))
+            rows.append(("    " + "   ".join(metrics), ""))
         if self.detail:
-            parts.append(" ".join(self.detail.split()))
-        # Labels/details may contain a source filename or user-supplied version.
-        return "  " + "".join(c if c.isprintable() else "?"
-                              for c in " | ".join(parts))
+            rows.append((f"    {self.detail}", "2"))
+        # Wrap plain content first: ANSI color sequences have no display width.
+        return [paint(part, style, self.color and bool(style))
+                for content, style in rows
+                for part in wrap_text(content, width,
+                                      subsequent_indent="    " if width > 4 else "")]
+
+    def _log_line(self, now: float, status: str | None) -> str:
+        header, count, metrics, code = self._parts(now, status)
+        count = self._summary_count(count)
+        fields = ([count] if count else []) + metrics
+        if self.detail:
+            fields.append(self.detail)
+        return paint(header, code, self.color) + ": " + "; ".join(fields)
 
     def _write(self, *, force: bool = False, status: str | None = None):
         now = time.monotonic()
@@ -122,7 +163,6 @@ class Progress:
         if not force and now - self._last_write < interval:
             return
         self._last_write = now
-        line = self._line(now, status)
         if self.tty:
             try:
                 # stdout may be redirected while stderr still has a terminal.
@@ -132,21 +172,23 @@ class Progress:
             if size.columns <= 0 or size.lines <= 0:
                 size = shutil.get_terminal_size(fallback=(120, 24))
             width = max(1, size.columns - 1)
-            lines = textwrap.wrap(line, width, subsequent_indent="  " if width > 2 else "",
-                                  break_on_hyphens=False)[:max(1, size.lines - 1)]
-            # Wrap detailed counters instead of hiding rate/ETA on an 80-column
-            # terminal. Clear every old row when a shorter update replaces it.
+            lines = self._terminal_lines(now, status, width)[:max(1, size.lines - 1)]
+            rendered_rows = len(lines)
+            # Erase every previous row when a compact completion replaces the
+            # live bar; return to the last new row so phases stay together.
             lines += [""] * max(0, self._rows - len(lines))
             if self._rows > 1:
                 self.stream.write(f"\r\x1b[{self._rows - 1}A")
             else:
                 self.stream.write("\r")
             self.stream.write("\n\r".join(part + "\x1b[K" for part in lines))
+            if len(lines) > rendered_rows:
+                self.stream.write(f"\r\x1b[{len(lines) - rendered_rows}A")
             if status:
                 self.stream.write("\n")
-            self._rows = len(lines)
+            self._rows = rendered_rows
         else:
-            self.stream.write(line + "\n")
+            self.stream.write(self._log_line(now, status) + "\n")
         self.stream.flush()
 
     def __exit__(self, exc_type, exc, traceback):

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from . import __version__, config
+from .build_output import note
 from .progress import Progress
 
 RELEASES_URL = "https://www.kernel.org/releases.json"
@@ -952,10 +953,9 @@ def download(url: str, dest: Path, quiet: bool = False, retries: int = 5) -> Pat
                 _unlink_download_part(tmp, part_info)
             if attempt == retries:
                 raise OSError(f"download failed after {retries} attempts: {exc}")
-            if not quiet:
-                action = "restarting" if reset_range else "resuming"
-                print(f"\n  {exc} — {action} (attempt {attempt + 1}/{retries})",
-                      file=sys.stderr)
+            action = "restarting" if reset_range else "resuming"
+            note("Retry", f"{exc} — {action} (attempt {attempt + 1}/{retries})",
+                 tone="warning", quiet=quiet)
             if not reset_range:
                 time.sleep(min(2 ** attempt, 15))
     raise OSError("unreachable")
@@ -1120,8 +1120,7 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
                 f"cached source at {tree} reports Linux "
                 f"{actual_version or 'unknown'}, not {version}; move or remove it"
             )
-        if not quiet:
-            print(f"  source cached at {tree}", file=sys.stderr)
+        note("Source", f"cached at {tree}", quiet=quiet)
         return tree
     if tree.exists() or tree.is_symlink():
         # Atomic extraction never publishes a partial destination.  Therefore
@@ -1162,16 +1161,15 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
 
     for attempt in (1, 2):
         if not tarball.is_file():
-            if not quiet:
-                print(f"  fetching {url}", file=sys.stderr)
+            note("Fetch", url, quiet=quiet)
             download(url, tarball, quiet=quiet)
         if expect is None:
             break
         with Progress("Verifying archive checksum", quiet=quiet):
             actual = _sha256(tarball)
         if actual == expect:
-            if not quiet:
-                print("  sha256 verified against kernel.org", file=sys.stderr)
+            note("Checksum", "sha256 verified against kernel.org",
+                 tone="success", quiet=quiet)
             break
         config.require_project_path(
             tarball, follow_leaf=False).unlink(missing_ok=True)
@@ -1183,9 +1181,8 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
                 f"sha256 mismatch for {archive_name} "
                 f"(expected {expect[:16]}…, got {actual[:16]}…)"
             )
-        if not quiet:
-            print("  checksum mismatch — discarding and downloading again",
-                  file=sys.stderr)
+        note("Checksum", "mismatch — discarding and downloading again",
+             tone="warning", quiet=quiet)
 
     out = extract(
         tarball, config.sources_dir(), quiet=quiet, require_new=True)

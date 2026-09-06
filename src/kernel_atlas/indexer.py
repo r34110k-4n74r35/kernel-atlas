@@ -274,8 +274,9 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
         # map submits eagerly. Start workers before the refresh thread so
         # fork-based runtimes cannot inherit the renderer's thread/lock.
         results = pool.map(_work, batches)
+        worker_label = f"{jobs} worker" + ("s" if jobs != 1 else "")
         with Progress("Parsing sources", total=total_files, unit="files",
-                      detail=f"{jobs} workers", quiet=quiet) as progress:
+                      detail=worker_label, quiet=quiet) as progress:
             for result in results:
                 for file_id, lines, syms, status, error, parse in result:
                     conn.execute(
@@ -349,7 +350,7 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                 if len(sym_rows) > 50_000 or len(member_rows) > 100_000:
                     flush()
                 progress.update(done, detail=(
-                    f"{jobs} workers; {n_sym:,} symbols; {n_calls:,} calls; "
+                    f"{worker_label}; {n_sym:,} symbols; {n_calls:,} calls; "
                     f"{n_skipped:,} skipped; {n_failed:,} failed"))
             flush()
             conn.commit()
