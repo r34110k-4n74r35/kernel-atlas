@@ -2,9 +2,15 @@ import os
 
 import pytest
 
-from kernel_atlas import config as storage, db, indexer
+from kernel_atlas.storage import config as storage, db
+from kernel_atlas.indexing import indexer
 
 from tests.support.kernel_tree import make_mini_kernel
+from tests.support.indexes import (
+    path_index as path_index,
+    storage_roots as storage_roots,
+    study_index as study_index,
+)
 
 
 @pytest.hookimpl(tryfirst=True)

@@ -14,8 +14,8 @@ dependencies = [
 dev = ["pytest>=7", "ruff", "build"]
 
 [project.scripts]
-kernel-atlas = "kernel_atlas.cli:main"
-ka = "kernel_atlas.cli:main"
+kernel-atlas = "kernel_atlas.commands.cli:main"
+ka = "kernel_atlas.commands.cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]

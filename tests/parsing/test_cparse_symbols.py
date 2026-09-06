@@ -2,7 +2,7 @@
 
 import pytest
 
-from kernel_atlas import cparse
+from kernel_atlas.parsing import cparse
 
 from .helpers import KINDS, parse, by_name
 

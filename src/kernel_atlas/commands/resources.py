@@ -7,7 +7,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .. import config, db, query, render
+from ..storage import config, db
+from ..queries import query
+from ..presentation import render
 from ..queries import links
 from ..presentation.terminal import Console
 

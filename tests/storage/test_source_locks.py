@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from kernel_atlas import kernelsrc
+from kernel_atlas.storage import kernelsrc
 
 
 def test_source_lock_serializes_same_version_acquisition(monkeypatch, tmp_path):

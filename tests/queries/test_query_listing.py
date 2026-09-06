@@ -1,36 +1,9 @@
-"""Indexed contents, listing scopes, sibling filters, and result bounds."""
+"""Listing scopes, sibling filters, search, and result bounds."""
 
-from kernel_atlas import db, query
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 
 from .helpers import names, sib
-
-
-def test_index_metadata(mini_index):
-    conn = db.connect(mini_index)
-    meta = db.get_meta(conn)
-    assert meta["kernel_version"] == "6.12.104"
-    assert int(meta["n_files"]) >= 19
-    assert int(meta["n_symbols"]) > 20
-    conn.close()
-
-
-def test_every_file_is_indexed_not_just_c(conn):
-    paths = {r["path"] for r in conn.execute("SELECT path FROM files")}
-    assert "Makefile" in paths
-    assert "fs/ext4/Makefile" in paths
-    assert "Documentation/filesystems/ext4/about.rst" in paths
-
-
-def test_line_counts_recorded(conn):
-    row = conn.execute("SELECT lines FROM files WHERE path='fs/ext4/inode.c'").fetchone()
-    assert row["lines"] > 10
-
-
-def test_directory_rollups(conn):
-    row = conn.execute("SELECT * FROM dirs WHERE path='fs/ext4'").fetchone()
-    assert row["n_files"] == 3
-    row = conn.execute("SELECT * FROM dirs WHERE path='fs'").fetchone()
-    assert row["n_subdirs"] == 2
 
 
 def test_file_siblings_are_files_in_the_same_directory(conn):
@@ -137,20 +110,6 @@ def test_bounded_symbol_listing_uses_the_final_tie_break_order(
     conditional = [entry for entry in entries
                    if entry.name == "aaa_conditional"]
     assert [entry.line for entry in conditional] == [1, 2, 3]
-
-
-def test_limit_counts_siblings_not_the_target(mini_index, capsys):
-    """`-n 3` must return three *other* functions, not two plus the target.
-
-    ext4_bmap sorts first among the four functions in inode.c, so applying the
-    limit before dropping the target would silently return one row too few.
-    """
-    from kernel_atlas import cli
-
-    cli.main(["--db", str(mini_index), "siblings", "fs/ext4/inode.c:ext4_bmap",
-              "-f", "names", "-n", "3"])
-    got = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
-    assert got == ["ext4_get_block", "ext4_helper", "ext4_inode_blocks_set"]
 
 
 def test_search_substring_and_exact(conn):

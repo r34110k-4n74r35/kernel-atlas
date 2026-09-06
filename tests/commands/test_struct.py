@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_atlas import cli, db
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import db
 
 
 def test_struct_command_renders_detailed_member_study_report(

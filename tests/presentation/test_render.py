@@ -1,7 +1,7 @@
-from kernel_atlas import render
+from kernel_atlas.presentation import render
 from kernel_atlas.presentation import structure as structure_render
-from kernel_atlas.query import Entry
-from kernel_atlas.render import (entry_dict, human_size, render_plain, render_table,
+from kernel_atlas.queries.models import Entry
+from kernel_atlas.presentation.render import (entry_dict, human_size, render_plain, render_table,
                                  render_tree)
 
 

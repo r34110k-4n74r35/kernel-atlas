@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
-from .. import cparse
+from ..parsing import cparse
 
 _MAKE_ASSIGN_RE = re.compile(
     r"^\s*([A-Za-z0-9_./${}()%-]+)\s*(\+=|:=|\?=|=)\s*(.*?)\s*$")

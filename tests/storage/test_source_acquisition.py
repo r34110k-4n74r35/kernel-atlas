@@ -8,7 +8,7 @@ import tarfile
 
 import pytest
 
-from kernel_atlas import config, kernelsrc
+from kernel_atlas.storage import config, kernelsrc
 
 from .helpers import _make_tree
 

@@ -1,7 +1,4 @@
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from kernel_atlas.maintainers import (
+from kernel_atlas.parsing.maintainers import (
     SubsystemMap,
     load,
     parse_maintainers,
@@ -179,20 +176,18 @@ F: tools/testing/selftests/drivers/net/netcons\*
         ["NETCONSOLE"]
 
 
-def test_existing_directory_without_trailing_slash_is_recursive():
-    with TemporaryDirectory() as tmp:
-        tree = Path(tmp)
-        driver = tree / "drivers/infiniband/hw/erdma"
-        driver.mkdir(parents=True)
-        (driver / "erdma_cmdq.c").write_text("", encoding="utf-8")
-        (tree / "MAINTAINERS").write_text("""\
+def test_existing_directory_without_trailing_slash_is_recursive(tmp_path):
+    driver = tmp_path / "drivers/infiniband/hw/erdma"
+    driver.mkdir(parents=True)
+    (driver / "erdma_cmdq.c").write_text("", encoding="utf-8")
+    (tmp_path / "MAINTAINERS").write_text("""\
 ALIBABA ELASTIC RDMA DRIVER
 M: Maintainer <m@example.com>
 F: drivers/infiniband/hw/erdma
 """, encoding="utf-8")
-        smap = load(tree)
-        assert names(smap, "drivers/infiniband/hw/erdma/erdma_cmdq.c") == \
-            ["ALIBABA ELASTIC RDMA DRIVER"]
+    smap = load(tmp_path)
+    assert names(smap, "drivers/infiniband/hw/erdma/erdma_cmdq.c") == \
+        ["ALIBABA ELASTIC RDMA DRIVER"]
 
 
 def test_name_regex_with_backreference_keeps_its_group_numbering():

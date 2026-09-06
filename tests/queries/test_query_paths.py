@@ -1,42 +1,11 @@
 """Literal subtree boundaries and limits, independent of filesystem casing."""
 
-import json
 from contextlib import closing
 
 import pytest
 
-from kernel_atlas import cli, db, query
-
-
-@pytest.fixture
-def path_index(mini_index, tmp_path):
-    out = tmp_path / "paths.db"
-    with closing(db.connect(mini_index)) as source, closing(
-        db.connect(out, readonly=False)
-    ) as conn:
-        source.backup(conn)
-        root_id = conn.execute("SELECT id FROM dirs WHERE path=''").fetchone()[0]
-        conn.execute("UPDATE dirs SET name='000-root' WHERE id=?", (root_id,))
-        for path in ("Area", "area", "a[bc]*?_%", "abcXYZ"):
-            cursor = conn.execute(
-                "INSERT INTO dirs(path,parent_id,name,depth) VALUES (?,?,?,1)",
-                (path, root_id, path),
-            )
-            directory = cursor.lastrowid
-            cursor = conn.execute(
-                "INSERT INTO files(path,dir_id,name,ext) VALUES (?,?,?,'.c')",
-                (f"{path}/unit.c", directory, "unit.c"),
-            )
-            conn.execute(
-                "INSERT INTO symbols(file_id,name,kind,start_line,end_line)"
-                " VALUES (?,'unit','function',1,1)", (cursor.lastrowid,),
-            )
-            conn.execute(
-                "INSERT INTO dirs(path,parent_id,name,depth) VALUES (?,?,?,2)",
-                (f"{path}/child", directory, "child"),
-            )
-        conn.commit()
-    return out
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 
 
 @pytest.mark.parametrize("base", ["Area", "area", "a[bc]*?_%"])
@@ -59,12 +28,3 @@ def test_hidden_root_does_not_consume_a_directory_limit(path_index, sort):
         all_entries = query.collect(conn, scope, ("dir",), sort=sort)
         assert all_entries
         assert query.collect(conn, scope, ("dir",), sort=sort, limit=1) == all_entries[:1]
-
-
-@pytest.mark.parametrize("base", ["Area", "area", "a[bc]*?_%"])
-def test_tree_command_stays_in_literal_subtree(path_index, base, capsys):
-    assert cli.main([
-        "--db", str(path_index), "tree", base, "--files", "-f", "json",
-    ]) == 0
-    rows = json.loads(capsys.readouterr().out)
-    assert {row["path"] for row in rows} == {f"{base}/unit.c", f"{base}/child"}

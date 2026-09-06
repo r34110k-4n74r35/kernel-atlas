@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from kernel_atlas import cli, config, db, kernelsrc
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import config, db, kernelsrc
 from kernel_atlas.presentation import terminal
 from kernel_atlas.commands import lifecycle
 

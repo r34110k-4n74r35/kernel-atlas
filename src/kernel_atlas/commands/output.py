@@ -5,9 +5,10 @@ from __future__ import annotations
 import re
 import sys
 
-from .. import query, render
+from ..queries import query
+from ..presentation import render
 from ..presentation import terminal
-from ..query import Entry
+from ..queries.models import Entry
 
 
 PROG = "kernel-atlas"

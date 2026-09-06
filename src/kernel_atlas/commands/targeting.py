@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from ..queries import links
-from .. import query
+from ..queries import query
 from .output import PROG, _die
 from .selection import _same_path, index_version, selected_index
 from .source import _normalize_target_spec, find_source_tree

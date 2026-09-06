@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from kernel_atlas import db
+from kernel_atlas.storage import db
 
 
 def _metadata(**overrides):

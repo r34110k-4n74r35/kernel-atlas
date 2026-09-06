@@ -13,6 +13,6 @@ dist/
 .ruff_cache/
 .DS_Store
 
-# Kernel sources and built indexes live inside the project (see config.py)
+# Kernel sources and built indexes live inside the project (see storage/config.py)
 kernels/
 indexes/

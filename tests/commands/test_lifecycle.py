@@ -6,7 +6,8 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli, config, kernelsrc
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import config, kernelsrc
 
 from .helpers import _fake_index
 
@@ -71,7 +72,7 @@ def test_stats_reports_parse_input_outcomes(mini_index, capsys):
 ])
 def test_versions_turns_a_malformed_release_feed_into_one_line_error(
         monkeypatch, capsys, payload):
-    from kernel_atlas import kernelsrc
+    from kernel_atlas.storage import kernelsrc
 
     monkeypatch.setattr(kernelsrc, "_get", lambda *args, **kwargs: payload)
     with pytest.raises(SystemExit):
@@ -217,15 +218,6 @@ def test_indexes_reports_metadata_version_separately_from_filename_alias(
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["version"] == "6.12.104"
     assert rows[0]["alias"] == "learning"
-
-
-def test_pin_roundtrip_in_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
-    assert config.get_default_version() is None
-    config.set_default_version("6.1")
-    assert config.get_default_version() == "6.1"
-    config.clear_default_version()
-    assert config.get_default_version() is None
 
 
 def test_stats_and_check_expose_call_occurrence_totals(mini_index, capsys):

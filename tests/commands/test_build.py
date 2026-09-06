@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_atlas import cli, config, kernelsrc
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import config, kernelsrc
 
 from .helpers import _fake_index
 
@@ -88,7 +89,7 @@ def test_build_rechecks_output_existence_under_its_publication_lock(
         mini_tree, tmp_path, monkeypatch, capsys):
     from contextlib import contextmanager
 
-    from kernel_atlas import kernelsrc
+    from kernel_atlas.storage import kernelsrc
 
     output = tmp_path / "study.db"
 
@@ -118,7 +119,8 @@ def test_managed_build_holds_source_then_output_locks_through_publication(
         mini_tree, tmp_path, monkeypatch, capsys):
     from contextlib import contextmanager
 
-    from kernel_atlas import indexer, kernelsrc
+    from kernel_atlas.indexing import indexer
+    from kernel_atlas.storage import kernelsrc
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -186,7 +188,8 @@ def test_custom_build_of_a_managed_cache_path_also_holds_its_source_lock(
     import shutil
     from contextlib import contextmanager
 
-    from kernel_atlas import indexer, kernelsrc
+    from kernel_atlas.indexing import indexer
+    from kernel_atlas.storage import kernelsrc
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -226,7 +229,7 @@ def test_custom_build_symlink_alias_locks_the_canonical_managed_tree(
     import shutil
     from contextlib import contextmanager
 
-    from kernel_atlas import indexer
+    from kernel_atlas.indexing import indexer
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -271,7 +274,8 @@ def test_output_containment_checks_the_symlink_entry_not_its_target(tmp_path):
 
 def test_custom_build_output_is_not_blocked_by_the_managed_index(
         mini_tree, tmp_path, monkeypatch, capsys):
-    from kernel_atlas import indexer, kernelsrc
+    from kernel_atlas.indexing import indexer
+    from kernel_atlas.storage import kernelsrc
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -311,7 +315,7 @@ def test_modified_managed_cache_is_recorded_as_local_source(
         mini_tree, tmp_path, monkeypatch, capsys):
     import shutil
 
-    from kernel_atlas import indexer
+    from kernel_atlas.indexing import indexer
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -348,7 +352,7 @@ def test_managed_source_change_during_build_prevents_publication(
         mini_tree, tmp_path, monkeypatch, capsys):
     import shutil
 
-    from kernel_atlas import indexer
+    from kernel_atlas.indexing import indexer
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))
@@ -384,7 +388,7 @@ def test_managed_source_change_during_build_prevents_publication(
 
 def test_downloaded_build_rejects_output_inside_managed_source_before_fetch(
         tmp_path, monkeypatch, capsys):
-    from kernel_atlas import kernelsrc
+    from kernel_atlas.storage import kernelsrc
 
     home = tmp_path / "home"
     monkeypatch.setenv("KERNEL_ATLAS_HOME", str(home))

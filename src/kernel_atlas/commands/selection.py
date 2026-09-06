@@ -8,7 +8,7 @@ import stat
 import sys
 from pathlib import Path
 
-from .. import config, db
+from ..storage import config, db
 from ..presentation import terminal
 from .output import PROG, _die
 

@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 
 
 def test_info_and_path_distinguish_a_missing_recorded_source_member(

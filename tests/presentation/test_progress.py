@@ -7,7 +7,9 @@ import threading
 
 import pytest
 
-from kernel_atlas import cli, db, indexer
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import db
+from kernel_atlas.indexing import indexer
 from kernel_atlas.presentation import build as build_output
 from kernel_atlas.presentation import progress
 from kernel_atlas.presentation.progress import Progress

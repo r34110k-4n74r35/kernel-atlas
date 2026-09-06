@@ -8,7 +8,7 @@ import shlex
 
 import pytest
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 from kernel_atlas.presentation import terminal
 
 from tests.support.terminal import Terminal, plain

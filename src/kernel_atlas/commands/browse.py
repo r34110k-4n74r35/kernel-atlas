@@ -7,8 +7,9 @@ import shlex
 import sys
 from dataclasses import replace
 
-from .. import query, render
-from ..query import Entry
+from ..queries import query
+from ..presentation import render
+from ..queries.models import Entry
 from ..presentation.terminal import Console
 
 

@@ -9,7 +9,10 @@ import argparse
 import re
 import sys
 
-from .. import __version__, cparse, query, render
+from .. import __version__
+from ..parsing import cparse
+from ..queries import query
+from ..presentation import render
 from ..presentation import terminal
 from ..queries.documentation import documentation_scope
 

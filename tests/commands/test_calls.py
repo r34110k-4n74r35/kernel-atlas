@@ -6,7 +6,9 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli, config
+from kernel_atlas.commands import cli
+from kernel_atlas.commands.calls import _frames_from_text
+from kernel_atlas.storage import config
 
 
 def test_calls_rejects_non_function_targets(mini_index, capsys):
@@ -270,3 +272,36 @@ def test_find_and_calls_filter_before_applying_limit(
     assert cli.main(["--db", str(copied), "calls", "ext4_bmap",
                      "--grep", "^needle_zz_keep$", "-n", "1", "-f", "names"]) == 0
     assert capsys.readouterr().out.strip() == "needle_zz_keep"
+
+
+def test_backtrace_frame_extraction():
+    oops = """
+    BUG: kernel NULL pointer dereference at 0000000000000000
+    Call Trace:
+     <TASK>
+     ext4_bmap+0x12/0x40
+     ? __alloc_pages+0x3f0/0x6c0
+     tcp_sendmsg+0x59/0x110
+     </TASK>
+    """
+    assert _frames_from_text(oops) == ["ext4_bmap", "__alloc_pages", "tcp_sendmsg"]
+
+
+def test_backtrace_gdb_style():
+    assert _frames_from_text("#3  0xffffffff81 in ext4_bmap (mapping=0x0)") == \
+        ["ext4_bmap"]
+
+
+def test_backtrace_preserves_repeated_short_and_optimized_frames():
+    text = """
+    x+0x1/0x2
+    work.isra.0+0x10/0x20
+    x+0x3/0x4
+    helper.constprop.17
+    """
+    assert _frames_from_text(text) == ["x", "work", "x", "helper"]
+
+
+def test_backtrace_accepts_mixed_case_gdb_and_bare_frames():
+    text = "#3  0xffffffff81 in Proc_2 (x=0)\nBDEV_I\n"
+    assert _frames_from_text(text) == ["Proc_2", "BDEV_I"]

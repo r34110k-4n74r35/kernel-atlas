@@ -20,18 +20,19 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from . import __version__, config
-from .presentation.build import note
-from .presentation.progress import Progress
-from .storage import managed_source as _managed_source
-from .storage.locks import (
+from .. import __version__
+from . import config
+from ..presentation.build import note
+from ..presentation.progress import Progress
+from . import managed_source as _managed_source
+from .locks import (
     _file_lock as _file_lock,
     _output_lock_paths as _output_lock_paths,
     output_lock as output_lock,
     pin_lock as pin_lock,
     source_lock as source_lock,
 )
-from .storage.managed_source import (
+from .managed_source import (
     ManagedSourceIdentity as ManagedSourceIdentity,
     ManagedSourceRemoval as ManagedSourceRemoval,
     _rename_noreplace as _rename_noreplace,

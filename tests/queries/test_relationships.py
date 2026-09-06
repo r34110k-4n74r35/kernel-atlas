@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kernel_atlas import db
+from kernel_atlas.storage import db
 from kernel_atlas.queries import relationships
 
 

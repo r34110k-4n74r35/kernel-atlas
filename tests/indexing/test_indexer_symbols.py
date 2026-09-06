@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from kernel_atlas import db, indexer
+from kernel_atlas.storage import db
+from kernel_atlas.indexing import indexer
 
 from .helpers import _tree
 
@@ -217,3 +218,31 @@ def test_directory_subsystems_are_derived_from_descendant_files(tmp_path):
         ("A", 2, 1, 0.5), ("B", 2, 1, 0.5)]
     assert root_total == 4
     assert root_composition == 4
+
+
+def test_index_metadata(mini_index):
+    conn = db.connect(mini_index)
+    meta = db.get_meta(conn)
+    assert meta["kernel_version"] == "6.12.104"
+    assert int(meta["n_files"]) >= 19
+    assert int(meta["n_symbols"]) > 20
+    conn.close()
+
+
+def test_every_file_is_indexed_not_just_c(conn):
+    paths = {r["path"] for r in conn.execute("SELECT path FROM files")}
+    assert "Makefile" in paths
+    assert "fs/ext4/Makefile" in paths
+    assert "Documentation/filesystems/ext4/about.rst" in paths
+
+
+def test_line_counts_recorded(conn):
+    row = conn.execute("SELECT lines FROM files WHERE path='fs/ext4/inode.c'").fetchone()
+    assert row["lines"] > 10
+
+
+def test_directory_rollups(conn):
+    row = conn.execute("SELECT * FROM dirs WHERE path='fs/ext4'").fetchone()
+    assert row["n_files"] == 3
+    row = conn.execute("SELECT * FROM dirs WHERE path='fs'").fetchone()
+    assert row["n_subdirs"] == 2

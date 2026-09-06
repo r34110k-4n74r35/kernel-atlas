@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_atlas import db, indexer, query
+from kernel_atlas.storage import db
+from kernel_atlas.indexing import indexer
+from kernel_atlas.queries import query
 
 from .helpers import _tree
 

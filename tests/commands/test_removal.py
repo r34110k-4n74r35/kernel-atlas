@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import cli, config, db, kernelsrc
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import config, db, kernelsrc
 
 from .helpers import _authorize_source, _fake_source
 
@@ -181,7 +182,7 @@ def test_remove_rechecks_source_authorization_after_acquiring_output_lock(
         home, monkeypatch, capsys):
     from contextlib import contextmanager
 
-    from kernel_atlas import kernelsrc
+    from kernel_atlas.storage import kernelsrc
 
     index = home / "indexes" / "7.2.db"
     managed = _fake_source(home, "7.2")

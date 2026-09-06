@@ -6,7 +6,8 @@ import http.client
 
 import pytest
 
-from kernel_atlas import __version__, kernelsrc
+from kernel_atlas import __version__
+from kernel_atlas.storage import kernelsrc
 
 from .helpers import _make_tree
 

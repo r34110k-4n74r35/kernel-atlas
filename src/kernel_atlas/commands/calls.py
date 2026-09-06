@@ -6,7 +6,8 @@ import csv
 import re
 import sys
 
-from .. import query, render
+from ..queries import query
+from ..presentation import render
 from ..queries import relationships
 from ..presentation.terminal import Console
 

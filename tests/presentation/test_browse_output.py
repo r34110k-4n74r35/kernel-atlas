@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 from kernel_atlas.presentation import structure as structure_render
 from kernel_atlas.presentation import terminal
 

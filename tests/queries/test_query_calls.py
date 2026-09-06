@@ -1,9 +1,9 @@
-"""Call queries, identity ambiguity, and backtrace frame extraction."""
+"""Call queries, occurrence evidence, and identity ambiguity."""
 
 import pytest
 
-from kernel_atlas import db, query
-from kernel_atlas.cli import _frames_from_text
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 
 from .helpers import names
 
@@ -72,36 +72,3 @@ def test_callers_string_api_rejects_ambiguous_callable_identity(
     with pytest.raises(ValueError, match="pass a concrete symbol id"):
         query.callers(conn, "ext4_get_block")
     conn.close()
-
-
-def test_backtrace_frame_extraction():
-    oops = """
-    BUG: kernel NULL pointer dereference at 0000000000000000
-    Call Trace:
-     <TASK>
-     ext4_bmap+0x12/0x40
-     ? __alloc_pages+0x3f0/0x6c0
-     tcp_sendmsg+0x59/0x110
-     </TASK>
-    """
-    assert _frames_from_text(oops) == ["ext4_bmap", "__alloc_pages", "tcp_sendmsg"]
-
-
-def test_backtrace_gdb_style():
-    assert _frames_from_text("#3  0xffffffff81 in ext4_bmap (mapping=0x0)") == \
-        ["ext4_bmap"]
-
-
-def test_backtrace_preserves_repeated_short_and_optimized_frames():
-    text = """
-    x+0x1/0x2
-    work.isra.0+0x10/0x20
-    x+0x3/0x4
-    helper.constprop.17
-    """
-    assert _frames_from_text(text) == ["x", "work", "x", "helper"]
-
-
-def test_backtrace_accepts_mixed_case_gdb_and_bare_frames():
-    text = "#3  0xffffffff81 in Proc_2 (x=0)\nBDEV_I\n"
-    assert _frames_from_text(text) == ["Proc_2", "BDEV_I"]

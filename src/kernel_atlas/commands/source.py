@@ -6,7 +6,9 @@ import re
 import shlex
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from .. import config, query, render
+from ..storage import config
+from ..queries import query
+from ..presentation import render
 from ..presentation.terminal import Console, clean
 from .output import _die
 from .selection import index_version

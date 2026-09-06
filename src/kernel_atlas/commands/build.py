@@ -9,7 +9,9 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from ..presentation import build as build_output
-from .. import config, cparse, indexer, kernelsrc
+from ..storage import config, kernelsrc
+from ..parsing import cparse
+from ..indexing import indexer
 from ..presentation.progress import Progress
 
 

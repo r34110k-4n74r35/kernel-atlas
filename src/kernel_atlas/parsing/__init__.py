@@ -1,1 +1,1 @@
-"""C syntax parsing, aggregate documentation, and source recovery internals."""
+"""C source parsing, aggregate documentation, and MAINTAINERS ownership."""

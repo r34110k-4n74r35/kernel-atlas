@@ -15,7 +15,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from .. import config
+from . import config
 
 
 _LOCK_STATE = threading.local()

@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from kernel_atlas import config
+from kernel_atlas.storage import config
 
 
 def test_data_lives_inside_the_project_checkout(monkeypatch):
@@ -155,12 +155,30 @@ def test_set_default_version_failure_preserves_complete_old_pin_and_cleans_temp(
     assert not list(pin.parent.glob("..default-version.*.tmp"))
 
 
+def test_project_root_finds_checkout_from_the_storage_package(monkeypatch, tmp_path):
+    checkout = tmp_path / "checkout"
+    module = checkout / "src/kernel_atlas/storage/config.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text("[project]\nname='kernel-atlas'\n")
+    monkeypatch.setattr(config, "__file__", str(module))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KERNEL_ATLAS_HOME", raising=False)
+
+    assert config.project_root() == checkout
+    assert config.data_root() == checkout
+    assert config.sources_dir() == checkout / "kernels"
+    assert config.index_dir() == checkout / "indexes"
+
+
 def test_project_root_does_not_claim_an_unrelated_src_layout_project(
         monkeypatch, tmp_path):
     host = tmp_path / "unrelated-app"
-    (host / "src").mkdir(parents=True)
+    (host / "src/kernel_atlas/storage").mkdir(parents=True)
     (host / "pyproject.toml").write_text("[project]\nname='unrelated'\n")
-    installed = host / ".venv/lib/python3.12/site-packages/kernel_atlas/config.py"
+    installed = (
+        host / ".venv/lib/python3.12/site-packages/kernel_atlas/storage/config.py"
+    )
     installed.parent.mkdir(parents=True)
     installed.write_text("", encoding="utf-8")
     monkeypatch.setattr(config, "__file__", str(installed))
@@ -236,3 +254,12 @@ def test_application_storage_does_not_change_python_cache_or_temp_settings(
     assert sys.pycache_prefix == prefix
     assert tempfile.tempdir == tempdir
     assert not (checkout / ".cache").exists()
+
+
+def test_pin_roundtrip_in_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("KERNEL_ATLAS_HOME", str(tmp_path))
+    assert config.get_default_version() is None
+    config.set_default_version("6.1")
+    assert config.get_default_version() == "6.1"
+    config.clear_default_version()
+    assert config.get_default_version() is None

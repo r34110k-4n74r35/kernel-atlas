@@ -1,7 +1,7 @@
-"""Public CLI entry point and compatibility facade for command services.
+"""CLI entry point and shared command services.
 
-Argument definitions and feature handlers live in ``commands``. Shared services
-are re-exported here so existing imports and handler injection remain stable.
+Argument definitions and feature handlers live beside this module. Shared
+services are passed explicitly from this entry point to each command handler.
 """
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import indexer as indexer
-from .presentation import terminal
-from .commands import (
+from ..indexing import indexer as indexer
+from ..presentation import terminal
+from . import (
     aggregate as cli_aggregate,
     browse as cli_browse,
     build as cli_build,
@@ -21,9 +21,9 @@ from .commands import (
     resources as cli_resources,
     source as cli_source,
 )
-from .commands.calls import _frames_from_text as _frames_from_text
-from .commands.parser import _MAX_CLI_COUNT as _MAX_CLI_COUNT, _MAX_JOBS as _MAX_JOBS
-from .commands.output import (
+from .calls import _frames_from_text as _frames_from_text
+from .parser import _MAX_CLI_COUNT as _MAX_CLI_COUNT, _MAX_JOBS as _MAX_JOBS
+from .output import (
     PROG as PROG,
     _die as _die,
     _split_list as _split_list,
@@ -40,7 +40,7 @@ from .commands.output import (
     _post_filter as _post_filter,
     _reject_symbol_size_sort as _reject_symbol_size_sort,
 )
-from .commands.selection import (
+from .selection import (
     _version_key as _version_key,
     version_prefix_match as version_prefix_match,
     _index_version_key as _index_version_key,
@@ -58,7 +58,7 @@ from .commands.selection import (
     _managed_source_record as _managed_source_record,
     _managed_source_recorded_by as _managed_source_recorded_by,
 )
-from .commands.source import (
+from .source import (
     find_source_tree as find_source_tree,
     _TARGET_SUFFIX_RE as _TARGET_SUFFIX_RE,
     _normalize_target_spec as _normalize_target_spec,
@@ -67,7 +67,7 @@ from .commands.source import (
     _path_inside as _path_inside,
     _MAX_SHOW as _MAX_SHOW,
 )
-from .commands.targeting import (
+from .targeting import (
     _SOURCE_SUFFIXES as _SOURCE_SUFFIXES,
     _suggestions as _suggestions,
     resolve_or_die as resolve_or_die,

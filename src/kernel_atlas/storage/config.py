@@ -46,7 +46,8 @@ def validate_version(version: str) -> str:
 
 def project_root() -> Path | None:
     """The checkout this package was imported from, if there is one."""
-    package_dir = Path(__file__).resolve().parent
+    # This module lives one level below the top-level package, in storage/.
+    package_dir = Path(__file__).resolve().parents[1]
     for parent in package_dir.parents:
         candidate = parent / "src" / "kernel_atlas"
         if not (parent / "pyproject.toml").is_file() or not candidate.is_dir():

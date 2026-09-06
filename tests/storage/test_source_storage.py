@@ -6,7 +6,7 @@ import io
 
 import pytest
 
-from kernel_atlas import config, kernelsrc
+from kernel_atlas.storage import config, kernelsrc
 
 
 @pytest.fixture

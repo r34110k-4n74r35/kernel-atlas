@@ -13,11 +13,12 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, cparse, db, maintainers
-from .indexing import call_resolution
-from .presentation.progress import Progress
+from ..storage import config, db
+from ..parsing import cparse, maintainers
+from . import call_resolution
+from ..presentation.progress import Progress
 
-from .indexing.kbuild import (
+from .kbuild import (
     _make_logical_lines as _make_logical_lines,
     _make_assignments as _make_assignments,
     _expand_make_value as _expand_make_value,

@@ -1,6 +1,6 @@
 """CLI handlers for kernel source and index lifecycle operations.
 
-The public command functions remain in :mod:`kernel_atlas.cli`.  They pass that
+The command entry points live in :mod:`kernel_atlas.commands.cli`. They pass that
 module as ``support`` so command code can reuse its stable selection, error, and
 path-safety helpers without introducing an import cycle.
 """
@@ -13,7 +13,9 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
-from .. import config, db, kernelsrc, maintainers, render
+from ..storage import config, db, kernelsrc
+from ..parsing import maintainers
+from ..presentation import render
 from ..presentation.terminal import Console, format_size
 from .build import (
     _source_warning_style as _source_warning_style,

@@ -2,7 +2,8 @@
 
 import sqlite3
 
-from kernel_atlas import db, query
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 
 
 def test_file_gets_its_precise_subsystem(conn):
@@ -146,5 +147,5 @@ def test_ancestry_never_labels_the_rest(conn):
 
 
 def test_licenses_is_a_named_area():
-    from kernel_atlas.maintainers import top_level_area
+    from kernel_atlas.parsing.maintainers import top_level_area
     assert top_level_area("LICENSES/preferred/GPL-2.0")[0] == "Licenses"

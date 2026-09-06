@@ -15,23 +15,23 @@ import json
 import re
 import sqlite3
 
-from . import maintainers
-from .queries.documentation import DocumentationMatch, rank_documentation
-from .queries.models import Entry, Resolution, Scope, Target
-from .queries.paths import (
+from ..parsing import maintainers
+from .documentation import DocumentationMatch, rank_documentation
+from .models import Entry, Resolution, Scope, Target
+from .paths import (
     glob_under as glob_under,
     like_escape as like_escape,
     like_under as like_under,
     parent_path as parent_path,
 )
-from .queries.targeting import (
+from .targeting import (
     is_copy_path as _is_copy_path,
     normalize_spec as _norm,
     path_rank as _path_rank,
     rank_candidate as _rank_candidate,
     symbol_target as _target_from_symbol_row,
 )
-from .queries.structures import (
+from .structures import (
     resolve_structure as _resolve_structure,
     structure_detail as _structure_detail,
     structure_selector as _structure_selector,

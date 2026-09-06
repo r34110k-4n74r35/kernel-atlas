@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 
 
 def test_web_and_docs_commands(mini_index, capsys):
@@ -59,8 +59,8 @@ def test_web_rejects_links_for_a_custom_source_index(
 
 def test_docs_bare_name_picks_the_area_directory_not_a_symbol(mini_index, capsys):
     """`mm` is both the top-level directory and arch/x86/mm/."""
-    from kernel_atlas.cli import _resolve_area
-    from kernel_atlas import db
+    from kernel_atlas.commands.cli import _resolve_area
+    from kernel_atlas.storage import db
     conn = db.connect(mini_index, readonly=True)
     t = _resolve_area(conn, "mm").target
     conn.close()

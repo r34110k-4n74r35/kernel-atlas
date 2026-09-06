@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import kernelsrc
+from kernel_atlas.storage import kernelsrc
 
 
 def test_normal_download_fails_closed_when_checksum_is_unavailable(

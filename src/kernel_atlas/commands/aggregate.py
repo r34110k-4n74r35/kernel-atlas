@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 
 from ..queries import links
-from .. import query, render
+from ..queries import query
+from ..presentation import render
 from ..presentation.terminal import Console, terminal_width
 
 

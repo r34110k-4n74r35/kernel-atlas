@@ -1,6 +1,6 @@
 """Convenience helpers for collecting and comparing query results."""
 
-from kernel_atlas import query
+from kernel_atlas.queries import query
 
 
 def names(entries):

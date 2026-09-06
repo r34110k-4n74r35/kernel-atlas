@@ -1,48 +1,14 @@
-"""Documentation relevance, filtering, and explainable CLI output."""
+"""Documentation relevance, scope filtering, and query evidence."""
 
 from __future__ import annotations
 
-import json
 from contextlib import closing
 
 import pytest
 
-from kernel_atlas import cli, db, indexer, query
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 from kernel_atlas.queries.documentation import documentation_scope
-
-
-@pytest.fixture(scope="module")
-def study_index(tmp_path_factory):
-    root = tmp_path_factory.mktemp("documentation-study")
-    tree = root / "linux"
-    tree.mkdir()
-    (tree / "MAINTAINERS").write_text(
-        "USB STUDY\nF: include/linux/usb.h\nF: Documentation/usb/\n"
-        "F: Documentation/driver-api/usb/\n"
-        "F: Documentation/devicetree/bindings/usb/\n",
-        encoding="utf-8",
-    )
-    contents = {
-        "include/linux/usb.h": "struct usb_device { int address; };\n",
-        "core.c": "struct packet_queue { int length; };\n",
-        "Documentation/usb/index.rst": "USB guide\n",
-        "Documentation/driver-api/usb/device.rst": "USB device API\n",
-        "Documentation/devicetree/bindings/usb/usb-device.yaml": "title: USB device\n",
-        "Documentation/devicetree/bindings/usb/vendor.txt": "USB binding\n",
-        "Documentation/usb/Makefile": "# build instructions\n",
-        "Documentation/networking/packet_queue.rst": "Queue design\n",
-        "Documentation/io_uring/overview.rst": "Literal underscore\n",
-        "Documentation/ioxuring/overview.rst": "Different directory\n",
-        "Documentation/100%/index.rst": "Literal percent\n",
-        "Documentation/100more/index.rst": "Different directory\n",
-    }
-    for path, content in contents.items():
-        full = tree / path
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content, encoding="utf-8")
-    out = root / "study.db"
-    indexer.build(tree, out, "9.9", jobs=1, quiet=True)
-    return out
 
 
 def test_structure_study_prefers_api_guides_to_bindings(study_index):
@@ -110,40 +76,3 @@ def test_library_rejects_invalid_limits(study_index, limit):
         target = query.resolve(conn, "Documentation").target
         with pytest.raises(ValueError, match="non-negative integer"):
             query.documentation_for(conn, target, limit)
-
-
-def test_cli_explanations_are_optional_and_scopes_preserve_json(study_index, capsys):
-    args = ["--db", str(study_index), "docs", "usb_device", "-n", "1", "-f", "json"]
-    assert cli.main(args) == 0
-    ordinary = json.loads(capsys.readouterr().out)
-    assert "reasons" not in ordinary[0]
-    assert cli.main([*args, "--explain", "--under", "devicetree/bindings"]) == 0
-    explained = json.loads(capsys.readouterr().out)
-    assert explained[0]["path"].endswith("usb-device.yaml")
-    assert explained[0]["reasons"]
-    assert explained[0]["index"] == "9.9"
-
-
-def test_cli_human_explanations_and_local_source_next_step(study_index, capsys):
-    assert (
-        cli.main(
-            ["--db", str(study_index), "docs", "usb_device", "--explain", "-n", "1"]
-        )
-        == 0
-    )
-    output = capsys.readouterr().out
-    assert "claimed by target owner: USB STUDY" in output
-    assert " show Documentation/driver-api/usb/device.rst" in output
-
-
-def test_cli_rejects_invalid_scope_without_opening_index(capsys):
-    with pytest.raises(SystemExit) as stopped:
-        cli.main(["--db", "nonexistent.db", "docs", "usb_device", "--under", "../usb"])
-    assert stopped.value.code == 2
-    assert "--under" in capsys.readouterr().err
-
-
-def test_cli_reports_the_scope_when_no_documents_match(study_index, capsys):
-    with pytest.raises(SystemExit):
-        cli.main(["--db", str(study_index), "docs", "usb_device", "--under", "missing"])
-    assert "under Documentation/missing" in capsys.readouterr().err

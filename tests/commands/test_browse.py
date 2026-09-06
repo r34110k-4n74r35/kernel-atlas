@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 
 
 def test_info_omits_the_rest_and_includes_links(mini_index, capsys):
@@ -302,7 +302,7 @@ def test_fixed_shape_listing_formats_reject_column_controls(
 
 def test_plain_find_does_not_compute_invisible_subsystems(
         mini_index, monkeypatch, capsys):
-    from kernel_atlas import query
+    from kernel_atlas.queries import query
 
     monkeypatch.setattr(
         query, "annotate_subsystems",
@@ -341,7 +341,8 @@ def test_siblings_uses_symbol_ids_for_same_name_same_line(
     conn.commit()
     conn.close()
 
-    from kernel_atlas import db, query
+    from kernel_atlas.storage import db
+    from kernel_atlas.queries import query
     reader = db.connect(copied, readonly=True)
     by_line = query.resolve(reader, "include/linux/fs.h:500")
     reader.close()
@@ -359,3 +360,28 @@ def test_siblings_uses_symbol_ids_for_same_name_same_line(
     same = [r for r in rows if r["name"] == "same_word"]
     assert len(same) == 2
     assert len([r for r in same if r.get("is_target")]) == 1
+
+
+@pytest.mark.parametrize("base", ["Area", "area", "a[bc]*?_%"])
+def test_tree_command_stays_in_literal_subtree(path_index, base, capsys):
+    import json
+
+    assert cli.main([
+        "--db", str(path_index), "tree", base, "--files", "-f", "json",
+    ]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert {row["path"] for row in rows} == {f"{base}/unit.c", f"{base}/child"}
+
+
+def test_limit_counts_siblings_not_the_target(mini_index, capsys):
+    """`-n 3` must return three *other* functions, not two plus the target.
+
+    ext4_bmap sorts first among the four functions in inode.c, so applying the
+    limit before dropping the target would silently return one row too few.
+    """
+    from kernel_atlas.commands import cli
+
+    cli.main(["--db", str(mini_index), "siblings", "fs/ext4/inode.c:ext4_bmap",
+              "-f", "names", "-n", "3"])
+    got = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert got == ["ext4_get_block", "ext4_helper", "ext4_inode_blocks_set"]

@@ -21,8 +21,8 @@ import re
 import tree_sitter_c
 from tree_sitter import Language, Parser, Query, QueryCursor, QueryError
 
-from .parsing import aggregates as _aggregate_parse
-from .parsing.calls import (
+from . import aggregates as _aggregate_parse
+from .calls import (
     _EMPTY_MACRO_TRANSITIONS,
     _call_site,
     _collect_call_details,
@@ -31,7 +31,7 @@ from .parsing.calls import (
     _macro_transitions,
     _summarize_call_sites,
 )
-from .parsing.models import (
+from .models import (
     ALL_KINDS as ALL_KINDS,
     DEFAULT_KINDS as DEFAULT_KINDS,
     ENUM,
@@ -47,7 +47,7 @@ from .parsing.models import (
     Symbol as Symbol,
     TypeMember as TypeMember,
 )
-from .parsing.recovery import (
+from .recovery import (
     _RECOVERED_DECL_PREFIX,
     _head_call_candidates,
     _is_file_scope,
@@ -59,7 +59,7 @@ from .parsing.recovery import (
     _source_exports,
     _starts_recovered_toplevel,
 )
-from .parsing.syntax import (
+from .syntax import (
     ATTRIBUTE_MACROS as _ATTRIBUTE_MACROS,
     C_TYPE_KEYWORDS as _C_TYPE_KEYWORDS,
     INLINE_SPECIFIERS as _INLINE_SPECIFIERS,

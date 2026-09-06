@@ -8,7 +8,9 @@ import warnings
 
 import pytest
 
-from kernel_atlas import cli, indexer, kernelsrc
+from kernel_atlas.commands import cli
+from kernel_atlas.indexing import indexer
+from kernel_atlas.storage import kernelsrc
 from kernel_atlas.presentation import build as build_output
 from kernel_atlas.presentation import terminal
 from kernel_atlas.commands.lifecycle import _source_warning_style

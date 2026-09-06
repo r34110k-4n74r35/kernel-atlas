@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime
 
 from ..indexing import call_resolution
-from .. import config
+from . import config
 from .integrity import validate_structure
 from .schema import SCHEMA_VERSION, SchemaError
 

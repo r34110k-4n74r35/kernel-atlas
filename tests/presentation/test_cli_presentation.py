@@ -4,9 +4,10 @@ import io
 
 import pytest
 
-from kernel_atlas import cli, render
+from kernel_atlas.commands import cli
+from kernel_atlas.presentation import render
 from kernel_atlas.presentation import terminal
-from kernel_atlas.query import Entry
+from kernel_atlas.queries.models import Entry
 
 from tests.support.cli_matrix import COMMANDS, QUERY_ARGS, _formats
 from tests.support.terminal import Terminal as TTY, plain

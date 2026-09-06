@@ -10,14 +10,14 @@ import sqlite3
 from pathlib import Path
 
 from . import config
-from .storage.schema import (
+from .schema import (
     INDEXES as INDEXES,
     SCHEMA as SCHEMA,
     SCHEMA_VERSION as SCHEMA_VERSION,
     TYPE_ALIAS_KINDS as TYPE_ALIAS_KINDS,
     SchemaError as SchemaError,
 )
-from .storage.validation import validate_schema as validate_schema
+from .validation import validate_schema as validate_schema
 
 
 def _require_safe_sidecars(path: Path) -> None:

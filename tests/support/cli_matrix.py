@@ -1,6 +1,6 @@
 """Registered CLI commands and representative arguments for format coverage."""
 
-from kernel_atlas import cli
+from kernel_atlas.commands import cli
 
 QUERY_ARGS = {
     "stats": [],

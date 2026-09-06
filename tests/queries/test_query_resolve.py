@@ -2,7 +2,8 @@
 
 import pytest
 
-from kernel_atlas import db, query
+from kernel_atlas.storage import db
+from kernel_atlas.queries import query
 
 
 def test_resolve_directory(conn):

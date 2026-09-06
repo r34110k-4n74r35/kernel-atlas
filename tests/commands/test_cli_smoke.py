@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import cli, kernelsrc
+import kernel_atlas
+from kernel_atlas.commands import cli
+from kernel_atlas.storage import kernelsrc
 
 from tests.support.kernel_tree import make_mini_kernel
 from tests.support.cli_matrix import COMMANDS, LIFECYCLE_COMMANDS, QUERY_ARGS, _formats
@@ -23,7 +25,7 @@ def run_cli(tmp_path):
     env = dict(
         os.environ,
         KERNEL_ATLAS_HOME=str(tmp_path / "home"),
-        PYTHONPATH=str(Path(cli.__file__).resolve().parents[1]),
+        PYTHONPATH=str(Path(kernel_atlas.__file__).resolve().parents[1]),
         NO_COLOR="1",
     )
 

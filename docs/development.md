@@ -42,53 +42,51 @@ their normal shared caches and temporary-directory behavior. See the
 
 ```text
 src/kernel_atlas/
-  cli.py               public entry point and command dispatch
-  cparse.py            parser setup and symbol capture orchestration
-  indexer.py           scan, parse, attach evidence, publish
-  db.py                public database API and connections
-  kernelsrc.py         release lookup, download, extraction, acquisition
-  query.py             public target resolution and query orchestration
-  render.py            human and machine listing formats
-  config.py            project-local storage configuration
-  maintainers.py       MAINTAINERS interpretation and ownership patterns
-  commands/            command handlers and shared CLI services
-  parsing/             syntax, records, recovery, calls, aggregates, documentation
-  indexing/            Kbuild domains, literal includes, call identity resolution
-  queries/             models, paths, targeting, structures, documentation, links
-  storage/             schema, validation, integrity, source identity, locking
-  presentation/        terminal formatting, progress, build and structure reports
+  __init__.py          package metadata and version
+  __main__.py          python -m kernel_atlas entry point
+  commands/            CLI entry point, command handlers, shared CLI services
+  parsing/             C parser, MAINTAINERS, syntax, records, recovery, documentation
+  indexing/            index builds, Kbuild domains, includes, call identity resolution
+  queries/             target resolution, listings, structures, documentation, links
+  storage/             configuration, database, source acquisition, identity, locking
+  presentation/        listing formats, terminal output, progress, study reports
 docs/                  task-oriented user and developer guides
 tests/
+  __init__.py          test package marker
+  conftest.py          shared fixtures and project-local temporary directories
   commands/            command behavior and process smoke tests
   parsing/             C symbols, recovery, aggregates, calls, MAINTAINERS
   indexing/            builds, Kbuild evidence, includes, call resolution
   queries/             resolution, listings, structures, resources, relationships
   storage/             schema, integrity, acquisition, locking, safe paths
   presentation/        terminal presentation and machine-format contracts
-  support/             synthetic kernel, CLI matrix, terminal test helpers
+  support/             synthetic kernels and indexes, CLI matrix, terminal helpers
 kernels/, indexes/     generated local study data (Git-ignored)
 ```
 
-The six feature packages have matching names under `src/kernel_atlas/` and
-`tests/`. Tests of a public root module belong to its feature group: for example,
-`indexer.py` is covered by `tests/indexing/`, and `render.py` by
-`tests/presentation/`. `tests/support/` contains test fixtures only, so it has no
-production counterpart.
+All implementation modules live in the six feature packages, with matching
+names under `src/kernel_atlas/` and `tests/`. For example,
+`indexing/indexer.py` is covered by `tests/indexing/`, and
+`presentation/render.py` by `tests/presentation/`. Only package metadata and
+the module entry point remain at the source package root. Shared test
+configuration stays at the test root; `tests/support/` contains test fixtures
+only, so it has no production counterpart.
 
 Internal modules use short names within their feature package:
 
 | Package | Modules |
 | --- | --- |
-| `parsing/` | `models.py`, `syntax.py`, `calls.py`, `recovery.py`, `aggregates.py`, `documentation.py`, `groups.py` |
-| `indexing/` | `kbuild.py`, `call_resolution.py` |
-| `queries/` | `models.py`, `paths.py`, `targeting.py`, `structures.py`, `documentation.py`, `relationships.py`, `links.py` |
-| `storage/` | `schema.py`, `validation.py`, `integrity.py`, `managed_source.py`, `locks.py` |
-| `presentation/` | `terminal.py`, `progress.py`, `build.py`, `structure.py` |
+| `parsing/` | `cparse.py`, `maintainers.py`, `models.py`, `syntax.py`, `calls.py`, `recovery.py`, `aggregates.py`, `documentation.py`, `groups.py` |
+| `indexing/` | `indexer.py`, `kbuild.py`, `call_resolution.py` |
+| `queries/` | `query.py`, `models.py`, `paths.py`, `targeting.py`, `structures.py`, `documentation.py`, `relationships.py`, `links.py` |
+| `storage/` | `config.py`, `db.py`, `kernelsrc.py`, `schema.py`, `validation.py`, `integrity.py`, `managed_source.py`, `locks.py` |
+| `presentation/` | `render.py`, `terminal.py`, `progress.py`, `build.py`, `structure.py` |
 
 The command package groups orchestration by task:
 
 | Module | Responsibility |
 | --- | --- |
+| `commands/cli.py` | Entry point, dispatch, shared services for handlers |
 | `commands/parser.py` | Options, validation, command registration |
 | `commands/build.py` | Source acquisition and atomic index builds |
 | `commands/lifecycle.py` | Releases, index selection, removal, statistics, checks |
@@ -101,21 +99,20 @@ The command package groups orchestration by task:
 | `commands/targeting.py` | Target resolution, ambiguity diagnostics, follow-up commands |
 | `commands/output.py` | CLI diagnostics, listing columns, formats, symbol filters |
 
-Supporting domain modules remain outside the CLI package: `maintainers.py`
+Supporting domain modules remain outside the CLI package: `parsing/maintainers.py`
 handles ownership, `indexing/call_resolution.py` resolves identities, `queries/relationships.py`
-computes subsystem connections, and `kernelsrc.py` provides the public source
+computes subsystem connections, and `storage/kernelsrc.py` provides the source
 acquisition API. `storage/managed_source.py` owns provenance and removal;
-`storage/locks.py` coordinates concurrent operations. `config.py` determines
+`storage/locks.py` coordinates concurrent operations. `storage/config.py` determines
 local storage; `queries/links.py` builds upstream URLs.
 `presentation/progress.py` handles build-phase counters, timing, terminal refresh, and plain
 stderr logs. Keep it independent of indexing logic and out of parser workers.
 
-The facade modules (`cparse.py`, `query.py`, `render.py`, `db.py`, `kernelsrc.py`,
-and `cli.py`) retain their established public imports and entry points.
-Feature modules depend on shared models and helpers, not their invoking facade.
+Orchestration and API modules live alongside their feature helpers. Helpers
+depend on shared models and other helpers, not their invoking orchestration module.
 Parser fragments and filesystem rename operations receive explicit callbacks
 where orchestration must supply a dependency. CLI handlers receive shared
-services through the entry point; `cli.py` re-exports those services from their
+services through the entry point; `commands/cli.py` re-exports those services from their
 own modules. Keep these imports one-way.
 
 Tests are Python packages, so same-purpose filenames can live beside their
@@ -124,20 +121,26 @@ directory's `helpers.py` or `conftest.py`. Put only utilities shared across
 features in `tests/support/`; test modules must not import other test modules.
 The CLI smoke and presentation suites share `tests/support/cli_matrix.py`,
 which checks every registered command and advertised format.
+Shared documentation and path-query indexes, along with simulated storage
+boundaries, live in `tests/support/indexes.py`; `tests/conftest.py` registers
+their fixtures. Keep query API assertions in
+`tests/queries/`, command behavior in `tests/commands/`, and color, wrapping, and
+output-format contracts in `tests/presentation/`.
 
 ## Choosing where to change code
 
 Keep argument syntax in `commands/parser.py`, command orchestration in the relevant
 `commands/` handler, and domain logic in a feature module. For example, documentation
 ranking belongs in `queries/documentation.py`; its terminal and JSON presentation
-belongs in `commands/resources.py`. `query.documentation_for()` still returns file
-entries, while `query.documentation_matches()` exposes entries plus reasons.
+belongs in `commands/resources.py`. In `queries/query.py`, `documentation_for()`
+returns file entries, while `documentation_matches()` exposes entries plus reasons.
 
 Kbuild analysis belongs in `indexing/kbuild.py`. Keep end-to-end build tests in
 `tests/indexing/test_indexer_build.py` and isolated Makefile interpretation tests
 in `tests/indexing/test_kbuild.py`. Translation-unit, include-path, and call
 resolution regressions have separate modules in the same directory.
-The existing indexer helper imports are retained for compatibility.
+`indexing/indexer.py` coordinates the build and imports analysis helpers from
+`indexing/kbuild.py` and `indexing/call_resolution.py`.
 Build-domain and include analysis share the indexed Makefile inventory, avoiding
 redundant tree walks and keeping both analyses inside the same source boundary.
 The set of parsed source paths is reused across all Makefiles. Recipe bodies
@@ -148,7 +151,7 @@ ASCII case and can mix distinct Linux paths. Keep case-insensitive name search
 in `LIKE` predicates. Filter hidden rows before SQL limits, so a bounded query
 agrees with the same prefix of its unbounded result.
 
-Keep normal C capture dispatch in `cparse.py`, malformed-source recovery in
+Keep normal C capture dispatch in `parsing/cparse.py`, malformed-source recovery in
 `parsing/recovery.py`, and invocation classification in `parsing/calls.py`.
 Aggregate member traversal belongs in `parsing/aggregates.py`; its documentation
 and struct-group interpretation have dedicated helpers. Split by responsibility
@@ -172,13 +175,16 @@ the guides and complete test fixtures in the source archive. The project
 version is defined once in `src/kernel_atlas/__init__.py`; setuptools reads it
 for package metadata. Runtime dependencies stay separate from the `dev` extra.
 
-`ka`, `kernel-atlas`, `python -m kernel_atlas`, and imports from
-`kernel_atlas.cli` keep their existing entry points. Internal `cli_*` handler
-modules now live in `kernel_atlas.commands`; import that package when working
-on command internals. Short command aliases share the same handlers and remain
-available.
+`ka`, `kernel-atlas`, and `python -m kernel_atlas` keep the same command syntax
+and behavior. Both installed console scripts now point to
+`kernel_atlas.commands.cli:main`. Reinstall an existing editable checkout with
+`.venv/bin/python -m pip install -e '.[dev]'` to refresh its console scripts.
+Short command aliases share the same handlers and remain available.
 
-These changes use the existing schema. Query fixes work with existing indexes;
-the Kbuild and C-include fixes require rebuilding call graphs with
-`--with-calls --force`. Preserve the original `--src` and `--output` when
-rebuilding a custom snapshot.
+Python imports must use the feature packages. For example, replace
+`from kernel_atlas import db, query` with `from kernel_atlas.storage import db`
+and `from kernel_atlas.queries import query`; use
+`from kernel_atlas.commands.cli import main` for the CLI entry point.
+The former root module paths have no compatibility shims. This regrouping
+preserves the database schema and index format, so existing indexes remain
+usable without rebuilding.

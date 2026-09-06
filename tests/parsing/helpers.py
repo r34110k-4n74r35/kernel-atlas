@@ -1,6 +1,6 @@
 """Small helpers for parsing inline C snippets and inspecting symbols."""
 
-from kernel_atlas import cparse
+from kernel_atlas.parsing import cparse
 
 KINDS = frozenset(cparse.DEFAULT_KINDS)
 

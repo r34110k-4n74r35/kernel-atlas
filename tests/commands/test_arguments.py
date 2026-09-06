@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from kernel_atlas import __version__, cli
+from kernel_atlas import __version__
+from kernel_atlas.commands import cli
 
 
 @pytest.mark.parametrize(

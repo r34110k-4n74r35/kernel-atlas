@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from kernel_atlas import db
+from kernel_atlas.storage import db
 
 from .helpers import _identity_index, _metadata
 

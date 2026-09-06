@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from kernel_atlas import cparse, db, indexer
+from kernel_atlas.parsing import cparse
+from kernel_atlas.storage import db
+from kernel_atlas.indexing import indexer
 
 from .helpers import _tree
 

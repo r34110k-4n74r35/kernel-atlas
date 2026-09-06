@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from kernel_atlas import db, kernelsrc
+from kernel_atlas.storage import db, kernelsrc
 
 
 def _fake_index(root, version: str) -> None:

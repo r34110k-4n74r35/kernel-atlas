@@ -1,1 +1,1 @@
-"""Index storage, validation, and managed source lifecycle internals."""
+"""Project data paths, SQLite indexes, and managed kernel source storage."""
