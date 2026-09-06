@@ -215,7 +215,7 @@ def cmd_build(args, support):
 
 def cmd_indexes(args, support):
     paths = config.list_indexes()
-    if not paths:
+    if not paths and args.format != "json":
         print(f"no indexes yet — run '{support.PROG} build lts'")
         return
     active = support.default_index() if paths else None
