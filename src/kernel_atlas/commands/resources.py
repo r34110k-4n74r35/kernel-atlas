@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from . import config, db, links, query, render
+from .. import config, db, links, query, render
 
 
 def cmd_web(args, support):
@@ -64,10 +64,13 @@ def cmd_docs(args, support):
     conn, meta = support.open_index(args)
     resolution = support._resolve_area(conn, args.target, meta)
     target = resolution.target
-    entries = query.documentation_for(conn, target, limit=args.limit)
+    matches = query.documentation_matches(
+        conn, target, limit=args.limit, under=args.under)
+    entries = [match.entry for match in matches]
     if not entries:
+        scope_note = f" under {args.under}" if args.under else ""
         support._die(
-            f"no Documentation/ files related to {target.display}")
+            f"no Documentation/ files related to {target.display}{scope_note}")
     subsystem = query.subsystem_for_target(conn, target)
     label = (subsystem["name"]
              if subsystem and subsystem["name"] not in query.CATCH_ALL
@@ -75,7 +78,8 @@ def cmd_docs(args, support):
     version = support.index_version(meta)
     if args.format == "json":
         payload = []
-        for entry in entries:
+        for match in matches:
+            entry = match.entry
             item = {
                 "path": entry.path,
                 "name": entry.name,
@@ -85,6 +89,8 @@ def cmd_docs(args, support):
             }
             item.update(links.links(
                 version, entry.path, source=meta.get("source")))
+            if args.explain:
+                item["reasons"] = list(match.reasons)
             payload.append(item)
         sys.stdout.write(render.render_json(payload))
         return
@@ -96,13 +102,18 @@ def cmd_docs(args, support):
     print(render.paint(heading, "1", color))
     if resolution.note:
         print(render.paint(f"  ({resolution.note})", "33", color))
-    for entry in entries:
-        print(f"  {entry.path}")
+    for match in matches:
+        print(f"  {match.entry.path}")
+        if args.explain:
+            for reason in match.reasons:
+                print(f"    - {reason}")
     prefix = support._command_prefix(args, meta)
     first = shlex.quote(entries[0].path)
     summary = f"\n{len(entries)} file{'s' if len(entries) != 1 else ''}"
     if links.links(version, entries[0].path, source=meta.get("source")):
         summary += f"   Next: {prefix} web {first}"
+    else:
+        summary += f"   Next: {prefix} show {first}"
     print(render.paint(summary, "90", color))
 
 

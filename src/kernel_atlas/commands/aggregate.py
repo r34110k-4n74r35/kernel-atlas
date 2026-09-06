@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import links, query, render
+from .. import links, query, render
 
 
 def cmd_struct(args, support):

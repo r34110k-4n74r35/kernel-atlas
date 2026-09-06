@@ -826,12 +826,6 @@ def _regular_part_info(path: Path) -> os.stat_result | None:
     return info
 
 
-def _regular_part_size(path: Path) -> int:
-    """Compatibility size view of :func:`_regular_part_info`."""
-    info = _regular_part_info(path)
-    return info.st_size if info is not None else 0
-
-
 def _same_part(left: os.stat_result | None,
                right: os.stat_result | None) -> bool:
     if left is None or right is None:

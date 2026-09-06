@@ -16,7 +16,14 @@ import re
 import sqlite3
 
 from . import maintainers
+from .documentation_query import DocumentationMatch, rank_documentation
 from .query_models import Entry, Resolution, Scope, Target
+from .query_paths import (
+    glob_under as glob_under,
+    like_escape as like_escape,
+    like_under as like_under,
+    parent_path as parent_path,
+)
 from .query_targeting import (
     is_copy_path as _is_copy_path,
     normalize_spec as _norm,
@@ -36,25 +43,6 @@ PATH_KINDS = ("dir", "file")
 ALL_KINDS = PATH_KINDS + SYMBOL_KINDS
 
 LEVELS = ("auto", "file", "dir", "subtree", "subsystem", "tree")
-
-
-def parent_path(path: str) -> str:
-    """Directory containing a file path; '' for a top-level file or the root."""
-    if not path or "/" not in path:
-        return ""
-    return path.rsplit("/", 1)[0]
-
-
-def like_escape(s: str) -> str:
-    """Escape ``\\``, ``%`` and ``_`` so a kernel path is a literal LIKE prefix."""
-    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def like_under(path: str) -> str:
-    """LIKE pattern for every path strictly below `path` (``''`` → the whole tree)."""
-    if not path:
-        return "%"
-    return like_escape(path) + "/%"
 
 
 def line_selector_suffix(spec: str) -> str | None:
@@ -402,10 +390,10 @@ def directory_unclaimed_files(conn: sqlite3.Connection, path: str) -> int:
     """Descendant files with no primary MAINTAINERS evidence at all."""
     return int(conn.execute(
         "SELECT COUNT(*) FROM files f"
-        " WHERE f.path LIKE ? ESCAPE '\\'"
+        " WHERE f.path GLOB ?"
         " AND NOT EXISTS (SELECT 1 FROM path_subsys p"
         " WHERE p.ref_kind='file' AND p.ref_id=f.id AND p.is_primary=1)",
-        (like_under(path),),
+        (glob_under(path),),
     ).fetchone()[0])
 
 
@@ -489,14 +477,14 @@ def build_scope(conn: sqlite3.Connection, t: Target, level: str) -> Scope:
 
     if level == "subtree":
         base = t.path if t.kind == "dir" else parent_path(t.path)
-        like = like_under(base)
+        pattern = glob_under(base)
         return Scope(
             f"everything under {base or 'the kernel root'}",
-            "SELECT * FROM dirs WHERE path = ? OR path LIKE ? ESCAPE '\\'",
-            (base, like),
-            "SELECT * FROM files WHERE path LIKE ? ESCAPE '\\'", (like,),
-            "s.file_id IN (SELECT id FROM files WHERE path LIKE ? ESCAPE '\\')",
-            (like,))
+            "SELECT * FROM dirs WHERE path = ? OR path GLOB ?",
+            (base, pattern),
+            "SELECT * FROM files WHERE path GLOB ?", (pattern,),
+            "s.file_id IN (SELECT id FROM files WHERE path GLOB ?)",
+            (pattern,))
 
     # level == "dir": the container directory.
     if t.kind == "dir":
@@ -660,13 +648,14 @@ def collect(conn: sqlite3.Connection, scope: Scope, kinds, limit: int = 0,
     entries: list[Entry] = []
 
     if "dir" in kinds and scope.dir_sql:
+        # The synthetic root is never a listing entry. Exclude it before LIMIT
+        # so bounded and unbounded queries return the same leading results.
+        directory_sql = f"SELECT * FROM ({scope.dir_sql}) WHERE path != ''"
         sql, params = _bounded(
-            conn, scope.dir_sql, scope.dir_params,
+            conn, directory_sql, scope.dir_params,
             order=_DIR_ORDER.get(sort, _DIR_ORDER["name"]),
             limit=limit, grep=grep)
         for r in conn.execute(sql, params):
-            if not r["path"]:
-                continue
             entries.append(Entry(kind="dir", name=r["name"], path=r["path"],
                                  n_files=r["n_files"], n_subdirs=r["n_subdirs"],
                                  ref_id=r["id"]))
@@ -917,74 +906,11 @@ def callers(conn: sqlite3.Connection, symbol_id: int | str,
                   macro_count=r["macro_count"]) for r in rows]
 
 
-def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> list[Entry]:
-    """Rank Documentation files by direct, ownership, and lexical evidence.
-
-    Limits are applied only after all evidence has been combined.  This keeps
-    a broad area or incidental secondary MAINTAINERS match from filling the
-    result before a specific file's documentation is considered.
-    """
-    cap = limit if limit and limit > 0 else 10**9
-    docs = conn.execute(
-        "SELECT id,path,name,size,lines FROM files"
-        " WHERE path LIKE 'Documentation/%' ORDER BY path"
-    ).fetchall()
-    if not docs:
-        return []
-
-    stop = {"api", "core", "doc", "docs", "driver", "drivers", "file",
-            "files", "kernel", "linux", "main", "subsystem", "system"}
-
-    def tokens(value: str) -> set[str]:
-        stem = value.rsplit(".", 1)[0]
-        return {word for word in re.findall(r"[a-z0-9]+", stem.lower())
-                if len(word) >= 3 and word not in stop}
-
-    def lexical(source: set[str], candidate: set[str]) -> int:
-        score = 0
-        for left in source:
-            best = 0
-            for right in candidate:
-                if left == right:
-                    best = max(best, 30 + min(len(left), 12))
-                    continue
-                common = 0
-                for a, b in zip(left, right):
-                    if a != b:
-                        break
-                    common += 1
-                if common >= 4:
-                    best = max(best, 5 + min(common, 12))
-            score += best
-        return score
-
-    path = t.path or ""
-    parts = [part for part in path.split("/") if part]
+def documentation_matches(conn: sqlite3.Connection, t: Target, limit: int = 30,
+                          *, under: str | None = None
+                          ) -> list[DocumentationMatch]:
+    """Related documents with ranking evidence; scope is applied before limit."""
     file_id = t.file_id or (t.id if t.kind == "file" else None)
-    identity_terms = tokens(parts[-1]) if parts else set()
-    path_terms = tokens("/".join(parts[-3:]))
-    semantic_terms = set(path_terms)
-    if t.kind == "symbol":
-        semantic_terms.update(tokens(t.name))
-    elif file_id is not None:
-        # Macro-heavy generated headers can contain tens of thousands of names.
-        # A bounded set of declaration identities retains useful semantic hints
-        # without turning one interactive docs query into hundreds of millions
-        # of token comparisons.  The target path and owner evidence remain
-        # unbounded and carry the strongest tiers below.
-        for row in conn.execute(
-                "SELECT name FROM symbols WHERE file_id=?"
-                " AND kind IN ('function','syscall','struct','union','enum',"
-                "              'typedef','variable')"
-                " GROUP BY name"
-                " ORDER BY MIN(CASE kind WHEN 'function' THEN 0"
-                "  WHEN 'syscall' THEN 0 WHEN 'struct' THEN 1"
-                "  WHEN 'union' THEN 1 WHEN 'enum' THEN 1"
-                "  WHEN 'typedef' THEN 2 ELSE 3 END),"
-                " MAX(is_exported) DESC,LENGTH(name) DESC,name LIMIT 192",
-                (file_id,)):
-            semantic_terms.update(tokens(row["name"]))
-
     if t.kind == "dir":
         owners = directory_primary_subsystems(conn, t.id)
         specific_owners = [row for row in owners
@@ -996,99 +922,14 @@ def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30) -> l
     else:
         specific_owners = [row for row in file_primary_subsystems(conn, file_id)
                            if row["name"] not in CATCH_ALL]
-    for owner in specific_owners:
-        semantic_terms.update(tokens(owner["name"]))
+    return rank_documentation(conn, t, specific_owners, limit, under=under)
 
-    owner_rank = {row["id"]: rank for rank, row in enumerate(specific_owners)}
-    owner_paths: dict[str, int] = {}
-    if owner_rank:
-        placeholders = ",".join("?" for _ in owner_rank)
-        for row in conn.execute(
-            "SELECT f.path,p.subsystem_id FROM files f"
-            " JOIN path_subsys p ON p.ref_kind='file' AND p.ref_id=f.id"
-            f" WHERE f.path LIKE 'Documentation/%'"
-            f" AND p.subsystem_id IN ({placeholders})",
-            tuple(owner_rank),
-        ):
-            rank = owner_rank[row["subsystem_id"]]
-            owner_paths[row["path"]] = min(
-                owner_paths.get(row["path"], rank), rank)
 
-    direct_exact = path if path.startswith("Documentation/") \
-        and t.kind != "dir" else None
-    direct_prefix: str | None = None
-    if t.kind == "dir" and (not path or path == "Documentation"):
-        direct_prefix = "Documentation/"
-    elif t.kind == "dir" and path.startswith("Documentation/"):
-        direct_prefix = path.rstrip("/") + "/"
-    elif path.startswith("Documentation/"):
-        direct_prefix = path.rpartition("/")[0] + "/"
-
-    aliases = {
-        "arch": "arch", "block": "block", "drivers": "driver-api",
-        "fs": "filesystems", "include": "core-api", "kernel": "core-api",
-        "net": "networking", "security": "security", "sound": "sound",
-        "tools": "tools", "virt": "virt",
-    }
-    area_roots: list[str] = []
-    if t.kind == "dir" and parts and parts[0] != "Documentation":
-        last = aliases.get(parts[-1], parts[-1])
-        top = aliases.get(parts[0], parts[0])
-        candidates = [last]
-        if len(parts) > 1:
-            candidates.append(f"{top}/{parts[-1]}")
-        candidates.append(top)
-        for area in candidates:
-            area = area.strip("/")
-            prefix = f"Documentation/{area}/"
-            standalone = re.compile(
-                rf"^Documentation/{re.escape(area)}\.[^/]+$")
-            if area not in area_roots and any(
-                    row["path"].startswith(prefix)
-                    or standalone.fullmatch(row["path"])
-                    for row in docs):
-                area_roots.append(area)
-
-    ranked: list[tuple[tuple, sqlite3.Row]] = []
-    for row in docs:
-        doc_path = row["path"]
-        doc_terms = tokens(doc_path.removeprefix("Documentation/"))
-        path_score = lexical(identity_terms, doc_terms)
-        semantic_score = lexical(semantic_terms, doc_terms)
-        owner = owner_paths.get(doc_path)
-        area = next((rank for rank, root in enumerate(area_roots)
-                     if doc_path.startswith(f"Documentation/{root}/")
-                     or re.fullmatch(
-                         rf"Documentation/{re.escape(root)}\.[^/]+",
-                         doc_path)), None)
-        exact = direct_exact == doc_path
-        contained = direct_prefix is not None and doc_path.startswith(direct_prefix)
-
-        if exact:
-            tier = 0
-        elif contained:
-            tier = 1
-        elif owner is not None and semantic_score:
-            tier = 2
-        elif path_score:
-            tier = 3
-        elif owner is not None:
-            tier = 4
-        elif area is not None:
-            tier = 5
-        else:
-            continue
-        stem = row["name"].rsplit(".", 1)[0].lower()
-        overview = 0 if stem in {"index", "readme", "overview"} else 1
-        depth = doc_path.count("/")
-        ranked.append(((tier, -semantic_score, owner if owner is not None else 10**6,
-                        area if area is not None else 10**6,
-                        overview, depth, doc_path), row))
-
-    ranked.sort(key=lambda item: item[0])
-    return [Entry(kind="file", name=row["name"], path=row["path"],
-                  size=row["size"], lines=row["lines"])
-            for _, row in ranked[:cap]]
+def documentation_for(conn: sqlite3.Connection, t: Target, limit: int = 30,
+                      *, under: str | None = None) -> list[Entry]:
+    """Compatibility API returning the related file entries."""
+    return [match.entry for match in documentation_matches(
+        conn, t, limit, under=under)]
 
 
 def describe_area(path: str) -> tuple[str, str] | None:

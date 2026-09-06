@@ -14,7 +14,7 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import config, cparse, db, indexer, kernelsrc, maintainers, render
+from .. import config, cparse, db, indexer, kernelsrc, maintainers, render
 
 
 def cmd_versions(args, support):

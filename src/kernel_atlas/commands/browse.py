@@ -7,8 +7,8 @@ import shlex
 import sys
 from dataclasses import replace
 
-from . import query, render
-from .query import Entry
+from .. import query, render
+from ..query import Entry
 
 
 def cmd_info(args, support):
@@ -547,8 +547,8 @@ def cmd_tree(args, support):
 
     rows = conn.execute(
         "SELECT path, name, depth, n_files, n_subdirs FROM dirs"
-        " WHERE (path = ? OR path LIKE ? ESCAPE '\\') AND depth <= ? ORDER BY path",
-        (base, query.like_under(base), base_depth + max_depth)).fetchall()
+        " WHERE (path = ? OR path GLOB ?) AND depth <= ? ORDER BY path",
+        (base, query.glob_under(base), base_depth + max_depth)).fetchall()
     entries = [Entry(kind="dir", name=r["name"], path=r["path"],
                      n_files=r["n_files"], n_subdirs=r["n_subdirs"])
                for r in rows if r["path"]]
@@ -556,12 +556,12 @@ def cmd_tree(args, support):
         # Visual depth: files `max_depth` components below `base`, not one
         # extra level deeper than the directories (the old Python filter).
         slash_max = (base.count("/") + max_depth) if base else (max_depth - 1)
-        like = query.like_under(base)
+        pattern = query.glob_under(base)
         if slash_max >= 0:
             frows = conn.execute(
                 "SELECT path, name, size, lines, n_symbols FROM files"
-                f" WHERE path LIKE ? ESCAPE '\\' AND {support._SLASH_COUNT} <= ? ORDER BY path",
-                (like, slash_max)).fetchall()
+                f" WHERE path GLOB ? AND {support._SLASH_COUNT} <= ? ORDER BY path",
+                (pattern, slash_max)).fetchall()
             entries += [Entry(kind="file", name=r["name"], path=r["path"],
                               size=r["size"], lines=r["lines"],
                               n_symbols=r["n_symbols"])

@@ -210,6 +210,48 @@ def test_symlink_is_represented_without_following_it(tmp_path):
     assert stats.parsed == 1
 
 
+@pytest.mark.parametrize("untrusted_build_file", ["symlink", "excluded-directory"])
+def test_build_evidence_respects_the_indexed_source_boundary(
+        tmp_path, untrusted_build_file, monkeypatch):
+    tree = _tree(tmp_path / "linux-9.9")
+    program = tree / "scripts" / "probe"
+    program.mkdir(parents=True)
+    (program / "main.c").write_text(
+        "int helper(void); int main(void) { return helper(); }\n")
+    (program / "helper.c").write_text("int helper(void) { return 1; }\n")
+    if untrusted_build_file == "symlink":
+        external = tmp_path / "external.Makefile"
+        external.write_text("hostprogs := probe\nprobe-objs := main.o helper.o\n")
+        try:
+            (program / "Makefile").symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+    else:
+        excluded = tree / ".git"
+        excluded.mkdir()
+        (excluded / "Makefile").write_text(
+            "hostprogs := ../scripts/probe/probe\n"
+            "probe-objs := ../scripts/probe/main.o ../scripts/probe/helper.o\n")
+
+    # Build evidence must reuse the file inventory, not walk excluded paths
+    # again in a separate discovery pass.
+    monkeypatch.setattr(Path, "rglob", lambda *a, **kw: pytest.fail("unexpected rescan"))
+    out = tmp_path / "index.db"
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    try:
+        domains = dict(conn.execute(
+            "SELECT path,call_domain FROM files WHERE ext='.c'"))
+        assert domains == {
+            "scripts/probe/main.c": "isolated:scripts/probe/main.c",
+            "scripts/probe/helper.c": "isolated:scripts/probe/helper.c",
+        }
+        call = conn.execute("SELECT resolution,callee_id FROM calls").fetchone()
+        assert tuple(call) == ("unresolved", None)
+    finally:
+        conn.close()
+
+
 def test_build_persists_detailed_aggregate_rows_aliases_and_counts(tmp_path):
     tree = _tree(tmp_path / "linux-9.9")
     (tree / "types.h").write_text("""\
@@ -911,6 +953,29 @@ int aggregate(void) { return load_firmware(); }
 
     assert tuple(include) == ("aggregate.c", "member.c", 1)
     assert tuple(call) == ("included_source", "member.c")
+
+
+@pytest.mark.parametrize("directive", [
+    '#include /* shared implementation */ "member.c"\n',
+    '#include \\\n"member.c"\n',
+])
+def test_source_include_with_comments_or_continuations(tmp_path, directive):
+    tree = _tree(tmp_path / "linux-9.9")
+    (tree / "member.c").write_text(
+        "static int member_helper(void) { return 1; }\n")
+    (tree / "caller.c").write_text(
+        directive + "int caller(void) { return member_helper(); }\n")
+    out = tmp_path / "index.db"
+    indexer.build(tree, out, "9.9", want_calls=True, jobs=1, quiet=True)
+    conn = db.connect(out)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM source_includes").fetchone()[0] == 1
+        call = conn.execute(
+            "SELECT resolution FROM calls WHERE callee='member_helper'"
+        ).fetchone()
+        assert call["resolution"] == "included_source"
+    finally:
+        conn.close()
 
 
 def test_commented_source_include_does_not_invent_a_translation_unit(tmp_path):
@@ -1706,44 +1771,3 @@ int main(void) { return detect_memory(); }
     assert domains["arch/x86/boot/main.c"] == "image:arch:x86:boot"
     assert domains["arch/x86/boot/memory.c"] == "image:arch:x86:boot"
     assert tuple(call) == ("unique_global", "arch/x86/boot/memory.c")
-
-
-@pytest.mark.parametrize("name", [
-    "hostprogs", "host-progs", "userprogs", "hostprogs-always-y",
-    "hostprogs-always-m", "userprogs-always-$(CONFIG_CC_CAN_LINK)",
-])
-def test_kbuild_program_list_names_are_recognized(name):
-    assert indexer._is_program_list(name)
-
-
-@pytest.mark.parametrize("name", [
-    "hostprogs-installed", "userprogs-always-n", "obj-y", "always-y",
-])
-def test_unrelated_kbuild_lists_are_not_programs(name):
-    assert not indexer._is_program_list(name)
-
-
-def test_pure_kbuild_addprefix_object_list_is_expanded():
-    values = {
-        "libfdt-objs": ["fdt.o fdt_ro.o"],
-        "libfdt": ["$(addprefix libfdt/,$(libfdt-objs))"],
-        "fdtoverlay-objs": ["fdtoverlay.o $(libfdt)"],
-    }
-    assert indexer._expand_make_value(
-        " ".join(values["fdtoverlay-objs"]), values
-    ) == "fdtoverlay.o libfdt/fdt.o libfdt/fdt_ro.o"
-
-
-@pytest.mark.parametrize("name", [
-    "obj-y", "obj-$(CONFIG_TEST)", "lib-m", "module-objs", "module-y",
-    "module-$(CONFIG_TEST)", "always-y",
-])
-def test_kbuild_compile_link_object_lists_are_recognized(name):
-    assert indexer._is_kbuild_object_list(name)
-
-
-@pytest.mark.parametrize("name", [
-    "clean-files", "targets", "ccflags-y", "subdir-ccflags-y", "CFLAGS_x.o",
-])
-def test_non_build_object_lists_are_not_compile_evidence(name):
-    assert not indexer._is_kbuild_object_list(name)

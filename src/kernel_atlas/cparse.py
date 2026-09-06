@@ -1324,11 +1324,6 @@ def _collect_call_details(
     return _summarize_call_sites(tuple(sites))
 
 
-def _collect_calls(src: bytes, node, end_byte: int | None = None) -> tuple[str, ...]:
-    """Compatibility wrapper returning every syntactically visible callee."""
-    return _collect_call_details(src, node, end_byte)[0]
-
-
 def _parse_aggregate_fragment(
         src: bytes, kind: str, expected_name: str) -> Symbol | None:
     """Re-enter the facade for one synthetic aggregate source fragment."""

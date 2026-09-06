@@ -1,4 +1,4 @@
-"""Tests for index selection: `use`, `remove`, and default resolution."""
+"""CLI behavior, lifecycle safety, argument validation, and output contracts."""
 
 from __future__ import annotations
 
@@ -424,7 +424,7 @@ def test_remove_with_source_and_duplicate_specs(home, capsys):
 
 def test_remove_source_failure_keeps_index_and_pin_for_a_retry(
         home, monkeypatch, capsys):
-    from kernel_atlas import cli_lifecycle
+    from kernel_atlas.commands import lifecycle as cli_lifecycle
 
     index = home / "indexes" / "7.2.db"
     tree = _fake_source(home, "7.2")
@@ -591,7 +591,7 @@ def test_partial_source_removal_can_resume_with_the_same_nonce(
         home, monkeypatch, capsys):
     import shutil
 
-    from kernel_atlas import cli_lifecycle
+    from kernel_atlas.commands import lifecycle as cli_lifecycle
 
     index = home / "indexes" / "7.2.db"
     tree = _fake_source(home, "7.2")
@@ -621,7 +621,7 @@ def test_source_retry_never_deletes_a_new_conventional_tree(
         home, monkeypatch, capsys):
     import shutil
 
-    from kernel_atlas import cli_lifecycle
+    from kernel_atlas.commands import lifecycle as cli_lifecycle
 
     index = home / "indexes" / "7.2.db"
     tree = _fake_source(home, "7.2")

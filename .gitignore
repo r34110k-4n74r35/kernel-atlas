@@ -9,6 +9,8 @@ dist/
 *.db-wal
 *.db-shm
 .cache/
+.pytest_cache/
+.ruff_cache/
 .DS_Store
 
 # Kernel sources and built indexes live inside the project (see config.py)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import sys
 
-from . import query, relationships, render
+from .. import query, relationships, render
 
 
 def cmd_trace(args, support):
