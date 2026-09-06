@@ -15,6 +15,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .. import config, cparse, db, indexer, kernelsrc, maintainers, render
+from ..progress import Progress
 
 
 def cmd_versions(args, support):
@@ -91,7 +92,8 @@ def cmd_build(args, support):
     else:
         spec = args.version or "lts"
         try:
-            release = kernelsrc.resolve_version(spec)
+            with Progress("Resolving kernel version", detail=spec, quiet=quiet):
+                release = kernelsrc.resolve_version(spec)
         except (OSError, LookupError, ValueError) as exc:
             support._die(str(exc))
         version = release.version
@@ -141,7 +143,8 @@ def cmd_build(args, support):
                         verify=not args.no_verify, source_url=requested_source)
                 except (OSError, RuntimeError) as exc:
                     support._die(f"could not obtain kernel source: {exc}")
-                managed_identity = kernelsrc.managed_source_identity(version, tree)
+                with Progress("Checking cached source identity", quiet=quiet):
+                    managed_identity = kernelsrc.managed_source_identity(version, tree)
                 # A kernel.org URL is exact provenance only while the tree still
                 # matches the tool-published extraction.  Old, edited, or
                 # unverified caches remain usable but are recorded as local.
@@ -177,7 +180,8 @@ def cmd_build(args, support):
                         "managed_tree_digest": managed_identity.digest,
                     }
                     if managed_identity is not None else None),
-                pre_publish=revalidate_managed_source)
+                pre_publish=(revalidate_managed_source
+                             if managed_identity is not None else None))
             size_mb = out.stat().st_size / (1024 * 1024)
             try:
                 selectable_by_kernel = (

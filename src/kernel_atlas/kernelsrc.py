@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from . import __version__, config
+from .progress import Progress
 
 RELEASES_URL = "https://www.kernel.org/releases.json"
 CDN = "https://cdn.kernel.org/pub/linux/kernel"
@@ -806,14 +807,6 @@ def _archive_stem(name: str) -> str:
     raise ValueError(f"unsupported kernel source archive: {name}")
 
 
-def _human(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
-        n /= 1024
-    return f"{n:.1f}GB"
-
-
 def _regular_part_info(path: Path) -> os.stat_result | None:
     """Return a resumable part's identity, rejecting links/special files."""
     try:
@@ -926,30 +919,19 @@ def download(url: str, dest: Path, quiet: bool = False, retries: int = 5) -> Pat
                 if remaining < 0:
                     raise OSError(
                         f"server returned an invalid Content-Length: {length!r}")
-                total = remaining + have
+                total = remaining + have if length is not None else None
                 got = have
-                tty = sys.stderr.isatty()
-                step = 0
-                with _open_download_part(
-                        tmp, append=bool(have), expected=part_info) as fh:
-                    while chunk := resp.read(1 << 20):
-                        fh.write(chunk)
-                        got += len(chunk)
-                        if quiet or not total:
-                            continue
-                        pct = got * 100 // total
-                        if tty:
-                            print(f"\r  downloading {_human(got)}/{_human(total)}"
-                                  f" ({pct}%)", end="", file=sys.stderr, flush=True)
-                        elif pct >= step + 20:
-                            step = pct - pct % 20
-                            print(f"  downloading {pct}% "
-                                  f"({_human(got)}/{_human(total)})",
-                                  file=sys.stderr, flush=True)
-            if total and got < total:
-                raise OSError(f"connection closed after {got} of {total} bytes")
-            if not quiet:
-                print(file=sys.stderr)
+                with Progress("Downloading source", total=total, unit="bytes",
+                              initial=have, quiet=quiet,
+                              detail=f"attempt {attempt}/{retries}") as progress:
+                    with _open_download_part(
+                            tmp, append=bool(have), expected=part_info) as fh:
+                        while chunk := resp.read(1 << 20):
+                            fh.write(chunk)
+                            got += len(chunk)
+                            progress.update(got)
+                    if total is not None and got < total:
+                        raise OSError(f"connection closed after {got} of {total} bytes")
             _rename_noreplace(tmp, dest)
             return dest
         except (OSError, http.client.HTTPException) as exc:
@@ -1054,46 +1036,45 @@ def extract(tarball: Path, into: Path, quiet: bool = False, *,
     when complete, so an interrupted run can never be mistaken for a full tree.
     """
     into.mkdir(parents=True, exist_ok=True)
-    if not quiet:
-        print(f"  extracting {tarball.name} ...", file=sys.stderr, flush=True)
-
     stem = _archive_stem(tarball.name)
     scratch = Path(tempfile.mkdtemp(prefix=f".extracting-{stem}-", dir=into))
     try:
-        _checked_archive(tarball)
-        if shutil.which("tar"):
-            try:
-                subprocess.run(["tar", "-xf", str(tarball), "-C", str(scratch)],
-                               check=True, capture_output=True)
-            except subprocess.CalledProcessError as exc:
-                raise RuntimeError(
-                    f"tar failed: {exc.stderr.decode('utf-8', 'replace')[:400]}")
-        else:
-            with tarfile.open(tarball, "r:*") as tf:
-                tf.extractall(scratch)
+        with Progress("Checking archive", detail=tarball.name, quiet=quiet):
+            _checked_archive(tarball)
+        with Progress("Extracting source", detail=tarball.name, quiet=quiet):
+            if shutil.which("tar"):
+                try:
+                    subprocess.run(["tar", "-xf", str(tarball), "-C", str(scratch)],
+                                   check=True, capture_output=True)
+                except subprocess.CalledProcessError as exc:
+                    raise RuntimeError(
+                        f"tar failed: {exc.stderr.decode('utf-8', 'replace')[:400]}")
+            else:
+                with tarfile.open(tarball, "r:*") as tf:
+                    tf.extractall(scratch)
 
-        extracted = scratch / stem
-        if extracted.is_symlink() or not extracted.is_dir():
-            raise RuntimeError(
-                f"expected a real {stem}/ directory inside {tarball}")
-        final = into / stem
-        if final.exists() or final.is_symlink():
-            # Another concurrent extraction may already have published the
-            # same complete tree.  Never delete a destination here.
-            if require_new:
+            extracted = scratch / stem
+            if extracted.is_symlink() or not extracted.is_dir():
                 raise RuntimeError(
-                    f"source destination {final} appeared during extraction; "
-                    "it has not been claimed as tool-owned")
+                    f"expected a real {stem}/ directory inside {tarball}")
+            final = into / stem
+            if final.exists() or final.is_symlink():
+                # Another concurrent extraction may already have published the
+                # same complete tree.  Never delete a destination here.
+                if require_new:
+                    raise RuntimeError(
+                        f"source destination {final} appeared during extraction; "
+                        "it has not been claimed as tool-owned")
+                return final
+            try:
+                _rename_noreplace(extracted, final)
+            except FileExistsError as exc:
+                if require_new:
+                    raise RuntimeError(
+                        f"source destination {final} appeared during extraction; "
+                        "it has not been claimed as tool-owned") from exc
+                return final
             return final
-        try:
-            _rename_noreplace(extracted, final)
-        except FileExistsError as exc:
-            if require_new:
-                raise RuntimeError(
-                    f"source destination {final} appeared during extraction; "
-                    "it has not been claimed as tool-owned") from exc
-            return final
-        return final
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -1176,7 +1157,8 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
             download(url, tarball, quiet=quiet)
         if expect is None:
             break
-        actual = _sha256(tarball)
+        with Progress("Verifying archive checksum", quiet=quiet):
+            actual = _sha256(tarball)
         if actual == expect:
             if not quiet:
                 print("  sha256 verified against kernel.org", file=sys.stderr)
@@ -1207,8 +1189,9 @@ def _ensure_source_locked(version: str, keep_tarball: bool = False,
     # this pristine extraction from an edited or replacement tree.
     authoritative = bool(
         verify and (expect is not None or _is_kernel_org_rc_snapshot(version, url)))
-    _write_source_identity(
-        version, tree, url, authoritative=authoritative)
+    with Progress("Recording source identity", quiet=quiet):
+        _write_source_identity(
+            version, tree, url, authoritative=authoritative)
     if not keep_tarball:
         tarball.unlink(missing_ok=True)
     return tree

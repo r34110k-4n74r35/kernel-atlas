@@ -492,6 +492,27 @@ class _Response(io.BytesIO):
         self.close()
 
 
+@pytest.mark.parametrize("known_length", [True, False])
+def test_download_progress_with_and_without_content_length(
+        monkeypatch, tmp_path, capsys, known_length):
+    def open_response(*args, **kwargs):
+        response = _Response(b"payload")
+        if not known_length:
+            response.headers.clear()
+        return response
+
+    monkeypatch.setattr(kernelsrc.urllib.request, "urlopen", open_response)
+    dest = tmp_path / "linux.tar.xz"
+    kernelsrc.download("https://example.invalid/linux.tar.xz", dest, retries=1)
+    assert dest.read_bytes() == b"payload"
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "done Downloading source" in output.err
+    assert ("100%" in output.err) == known_length
+    assert "7.0 B" in output.err
+    assert "\r" not in output.err
+
+
 def test_download_restarts_after_stale_part_gets_416(monkeypatch, tmp_path):
     dest = tmp_path / "linux.tar.xz"
     part = dest.with_name(dest.name + ".part")

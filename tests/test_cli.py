@@ -203,7 +203,7 @@ def test_empty_selectors_and_build_values_are_rejected_by_argparse(argv, capsys)
 
 
 @pytest.mark.parametrize(("command", "phrases"), [
-    ("build", ["keep a downloaded source archive", "suppress download"]),
+    ("build", ["keep a downloaded source archive", "progress bars", "final build summary"]),
     ("find", ["complete, case-sensitive name", "name prefix"]),
     ("subsystems", ["only names matching", "sort key", "max subsystems"]),
     ("subsystem", ["max directory rows", "does not limit the --files list"]),

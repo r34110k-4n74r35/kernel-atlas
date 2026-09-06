@@ -207,7 +207,30 @@ snapshot; rebuild after changing the tree.
 | `--keep-tarball` | keep the downloaded source archive after extraction |
 | `--no-verify` | skip the checksum (not recommended) |
 | `--force` | replace an existing index (reusing its source tree when present) |
-| `--quiet` | no progress output |
+| `--quiet` | suppress progress; keep the final build summary and errors |
+
+Build progress appears on stderr automatically. Downloads show bytes and
+transfer speed; scanning shows discovered files and directories. Parsing shows
+a progress bar, files processed, worker count, symbols, call records, skipped
+inputs, and failures. Ownership mapping has its own file counter. Known totals
+include a percentage and estimated remaining time based on the phase's measured
+rate; estimates can change when later files are more expensive to parse.
+
+Archive extraction, build-domain analysis, call resolution, database indexing,
+source-identity checks, and the final integrity audit show their phase and
+elapsed time. These steps have no reliable total, so they use a spinner. Each
+phase finishes with `done`, `failed`, or `interrupted`; finishing parsing does
+not mean the entire index has been built.
+
+Terminals update in place and wrap details to the available width. Redirected
+stderr uses plain start/end lines and occasional counter updates, without
+terminal escape sequences. `--quiet` suppresses both forms:
+
+```bash
+ka build --src /path/to/linux --with-calls --jobs 8
+ka build --src /path/to/linux --with-calls 2>build-progress.log
+ka build --src /path/to/linux --quiet
+```
 
 With `--src`, download aliases such as `lts` are not version labels: omit the
 positional argument to detect the tree's `Makefile` version, or supply an

@@ -156,7 +156,8 @@ def build_parser(support) -> argparse.ArgumentParser:
                     help="skip the sha256 check against kernel.org")
     sp.add_argument("--force", action="store_true", help="rebuild if it already exists")
     sp.add_argument("--quiet", "-q", action="store_true",
-                    help="suppress download and indexing progress")
+                    help="suppress phase progress bars and counters; "
+                         "keep the final build summary")
     sp.set_defaults(func=support.cmd_build)
 
     sp = add_lifecycle("indexes", help="list indexes you have built")

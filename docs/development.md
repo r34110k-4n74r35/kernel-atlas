@@ -64,6 +64,8 @@ Supporting domain modules remain outside the CLI package: `maintainers.py`
 handles ownership, `call_resolution.py` resolves identities, `relationships.py`
 computes subsystem connections, and `kernelsrc.py` manages downloads and source
 identity. `config.py` determines local storage; `links.py` builds upstream URLs.
+`progress.py` handles build-phase counters, timing, terminal refresh, and plain
+stderr logs. Keep it independent of indexing logic and out of parser workers.
 
 The facade modules (`cparse.py`, `query.py`, `render.py`, and `cli.py`) retain
 their established imports and entry points. Parser/query/render feature modules

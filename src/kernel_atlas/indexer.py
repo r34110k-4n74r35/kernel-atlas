@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 import time
 from collections import Counter, defaultdict, deque
@@ -15,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import call_resolution, config, cparse, db, maintainers
+from .progress import Progress
 
 from .kbuild import (
     _make_logical_lines as _make_logical_lines,
@@ -154,70 +154,70 @@ def _scan_tree(tree: Path, conn: sqlite3.Connection, quiet: bool):
     n_symlink_parse = 0
     queue = deque([(tree, "", 1)])
 
-    while queue:
-        abs_dir, rel_dir, parent_id = queue.popleft()
-        try:
-            with os.scandir(abs_dir) as it:
-                entries = sorted(it, key=lambda e: e.name)
-        except OSError as exc:
-            raise RuntimeError(f"could not scan source directory {abs_dir}: {exc}") from exc
-        for entry in entries:
-            rel = f"{rel_dir}/{entry.name}" if rel_dir else entry.name
+    with Progress("Scanning source tree", unit="files", quiet=quiet) as progress:
+        while queue:
+            abs_dir, rel_dir, parent_id = queue.popleft()
             try:
-                is_symlink = entry.is_symlink()
-                is_dir = entry.is_dir(follow_symlinks=False)
-                is_file = entry.is_file(follow_symlinks=False)
+                with os.scandir(abs_dir) as it:
+                    entries = sorted(it, key=lambda e: e.name)
             except OSError as exc:
-                raise RuntimeError(f"could not inspect source path {entry.path}: {exc}") from exc
-            if is_symlink:
-                ext = os.path.splitext(entry.name)[1].lower()
+                raise RuntimeError(f"could not scan source directory {abs_dir}: {exc}") from exc
+            for entry in entries:
+                rel = f"{rel_dir}/{entry.name}" if rel_dir else entry.name
                 try:
-                    size = entry.stat(follow_symlinks=False).st_size
+                    is_symlink = entry.is_symlink()
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
                 except OSError as exc:
-                    raise RuntimeError(
-                        f"could not stat source file {entry.path}: {exc}") from exc
-                try:
-                    link_target = os.readlink(entry.path)
-                except OSError as exc:
-                    link_target = None
-                    link_error = f"{type(exc).__name__}: {exc}"[:400]
-                else:
-                    link_error = None
-                file_rows.append((next_file_id, rel, parent_id, entry.name, ext, size,
-                                  1, link_target, "symlink", link_error))
-                n_symlinks += 1
-                if ext in PARSE_EXTS:
-                    n_symlink_parse += 1
-                next_file_id += 1
-            elif is_dir:
-                if entry.name in SKIP_DIRS:
-                    continue
-                dir_rows.append((next_dir_id, rel, parent_id, entry.name,
-                                 rel.count("/") + 1))
-                queue.append((entry.path, rel, next_dir_id))
-                next_dir_id += 1
-            elif is_file:
-                ext = os.path.splitext(entry.name)[1].lower()
-                try:
-                    size = entry.stat(follow_symlinks=False).st_size
-                except OSError as exc:
-                    raise RuntimeError(
-                        f"could not stat source file {entry.path}: {exc}") from exc
-                file_rows.append((next_file_id, rel, parent_id, entry.name, ext, size,
-                                  0, None, "pending", None))
-                pending.append((next_file_id, rel, ext in PARSE_EXTS))
-                next_file_id += 1
+                    raise RuntimeError(f"could not inspect source path {entry.path}: {exc}") from exc
+                if is_symlink:
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    try:
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"could not stat source file {entry.path}: {exc}") from exc
+                    try:
+                        link_target = os.readlink(entry.path)
+                    except OSError as exc:
+                        link_target = None
+                        link_error = f"{type(exc).__name__}: {exc}"[:400]
+                    else:
+                        link_error = None
+                    file_rows.append((next_file_id, rel, parent_id, entry.name, ext, size,
+                                      1, link_target, "symlink", link_error))
+                    n_symlinks += 1
+                    if ext in PARSE_EXTS:
+                        n_symlink_parse += 1
+                    next_file_id += 1
+                elif is_dir:
+                    if entry.name in SKIP_DIRS:
+                        continue
+                    dir_rows.append((next_dir_id, rel, parent_id, entry.name,
+                                     rel.count("/") + 1))
+                    queue.append((entry.path, rel, next_dir_id))
+                    next_dir_id += 1
+                elif is_file:
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    try:
+                        size = entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        raise RuntimeError(
+                            f"could not stat source file {entry.path}: {exc}") from exc
+                    file_rows.append((next_file_id, rel, parent_id, entry.name, ext, size,
+                                      0, None, "pending", None))
+                    pending.append((next_file_id, rel, ext in PARSE_EXTS))
+                    next_file_id += 1
 
-    conn.executemany(
-        "INSERT INTO dirs(id, path, parent_id, name, depth) VALUES (?,?,?,?,?)", dir_rows)
-    conn.executemany(
-        "INSERT INTO files(id, path, dir_id, name, ext, size, is_symlink,"
-        " link_target, index_status, index_error) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        file_rows)
-    conn.commit()
-    if not quiet:
-        print(f"  tree: {len(dir_rows):,} directories, {len(file_rows):,} files",
-              file=sys.stderr)
+            progress.update(len(file_rows), detail=f"{len(dir_rows):,} directories")
+
+        conn.executemany(
+            "INSERT INTO dirs(id, path, parent_id, name, depth) VALUES (?,?,?,?,?)", dir_rows)
+        conn.executemany(
+            "INSERT INTO files(id, path, dir_id, name, ext, size, is_symlink,"
+            " link_target, index_status, index_error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            file_rows)
+        conn.commit()
     return len(dir_rows), len(file_rows), pending, n_symlinks, n_symlink_parse
 
 
@@ -229,8 +229,6 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
     n_parsed = n_sym = n_calls = 0
     n_skipped = n_failed = n_oversize = 0
     done = 0
-    started = time.monotonic()
-
     sym_rows: list[tuple] = []
     alias_rows: list[tuple] = []
     member_rows: list[tuple] = []
@@ -273,138 +271,136 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
         initializer=_init_worker,
         initargs=(str(tree), list(kinds), want_calls, max_file_bytes),
     ) as pool:
-        for result in pool.map(_work, batches):
-            for file_id, lines, syms, status, error, parse in result:
-                conn.execute(
-                    "UPDATE files SET lines=?, n_symbols=?, index_status=?,"
-                    " index_error=? WHERE id=?",
-                    (lines, len(syms), status, error, file_id),
-                )
-                if status == "read_error" or status == "parse_error":
-                    n_failed += 1
-                elif parse and status == "parsed":
-                    n_parsed += 1
-                elif parse and status.startswith("skipped_"):
-                    n_skipped += 1
-                    if status == "skipped_oversize":
-                        n_oversize += 1
-                for (name, kind, start, end, sig, st, inl, exp, calls,
-                     indirect_calls, call_sites, summary, description,
-                     members, aliases,
-                     anonymous, parse_complete, parse_warnings,
-                     unmatched_docs, conditions) in syms:
-                    sym_rows.append((next_sym_id, file_id, name, kind, start, end,
-                                     sig, summary, description, st, inl, exp,
-                                     anonymous, parse_complete,
-                                     json.dumps(parse_warnings),
-                                     json.dumps(dict(unmatched_docs)),
-                                     json.dumps(conditions)))
-                    for alias in aliases:
-                        alias_rows.append((next_sym_id, alias))
-                    member_ids = list(range(
-                        next_member_id, next_member_id + len(members)))
-                    for ordinal, member in enumerate(members):
-                        (parent_index, member_name, member_kind, type_text,
-                         declaration, member_start, member_end, bit_width,
-                         dimensions, member_description, description_source,
-                         conditions, visibility, member_anonymous,
-                         generated_by) = member
-                        parent_id = (member_ids[parent_index]
-                                     if parent_index is not None else None)
-                        member_rows.append((
-                            member_ids[ordinal], next_sym_id, parent_id, ordinal,
-                            member_name, member_kind, type_text, declaration,
-                            member_start, member_end, bit_width,
-                            json.dumps(dimensions), member_description,
-                            description_source, json.dumps(conditions),
-                            visibility, member_anonymous, generated_by,
-                        ))
-                    next_member_id += len(members)
-                    sites_by_name: dict[str, list[tuple]] = defaultdict(list)
-                    for site in call_sites:
-                        sites_by_name[site[0]].append(site)
-                    indirect = set(indirect_calls)
-                    for callee in calls:
-                        sites = sites_by_name.get(callee, ())
-                        direct_n = sum(site[1] == "direct" for site in sites)
-                        indirect_n = sum(
-                            site[1] == "indirect" for site in sites)
-                        macro_n = sum(site[1] == "macro" for site in sites)
-                        if not sites:
-                            indirect_n = int(callee in indirect)
-                            direct_n = 1 - indirect_n
-                        initial = "unresolved" if direct_n else (
-                            "macro" if macro_n else "indirect")
-                        call_rows.append((
-                            next_sym_id, callee, initial,
-                            direct_n, indirect_n, macro_n,
-                        ))
-                        n_calls += 1
-                    next_sym_id += 1
-                    n_sym += 1
-            done += len(result)
-            if len(sym_rows) > 50_000 or len(member_rows) > 100_000:
-                flush()
-            if not quiet and done % 5000 < BATCH:
-                pct = done * 100 // max(total_files, 1)
-                print(f"\r  parsing {done:,}/{total_files:,} files ({pct}%) "
-                      f"— {n_sym:,} symbols", end="", file=sys.stderr, flush=True)
-    flush()
-    conn.commit()
-    if not quiet:
-        print(f"\r  parsed {n_parsed:,} C/H inputs — {n_sym:,} symbols in "
-              f"{time.monotonic() - started:.1f}s"
-              + (f"; {n_skipped:,} skipped, {n_failed:,} failed"
-                 if n_skipped or n_failed else "")
-              + f"{' ' * 20}", file=sys.stderr)
+        # map submits eagerly. Start workers before the refresh thread so
+        # fork-based runtimes cannot inherit the renderer's thread/lock.
+        results = pool.map(_work, batches)
+        with Progress("Parsing sources", total=total_files, unit="files",
+                      detail=f"{jobs} workers", quiet=quiet) as progress:
+            for result in results:
+                for file_id, lines, syms, status, error, parse in result:
+                    conn.execute(
+                        "UPDATE files SET lines=?, n_symbols=?, index_status=?,"
+                        " index_error=? WHERE id=?",
+                        (lines, len(syms), status, error, file_id),
+                    )
+                    if status == "read_error" or status == "parse_error":
+                        n_failed += 1
+                    elif parse and status == "parsed":
+                        n_parsed += 1
+                    elif parse and status.startswith("skipped_"):
+                        n_skipped += 1
+                        if status == "skipped_oversize":
+                            n_oversize += 1
+                    for (name, kind, start, end, sig, st, inl, exp, calls,
+                         indirect_calls, call_sites, summary, description,
+                         members, aliases,
+                         anonymous, parse_complete, parse_warnings,
+                         unmatched_docs, conditions) in syms:
+                        sym_rows.append((next_sym_id, file_id, name, kind, start, end,
+                                         sig, summary, description, st, inl, exp,
+                                         anonymous, parse_complete,
+                                         json.dumps(parse_warnings),
+                                         json.dumps(dict(unmatched_docs)),
+                                         json.dumps(conditions)))
+                        for alias in aliases:
+                            alias_rows.append((next_sym_id, alias))
+                        member_ids = list(range(
+                            next_member_id, next_member_id + len(members)))
+                        for ordinal, member in enumerate(members):
+                            (parent_index, member_name, member_kind, type_text,
+                             declaration, member_start, member_end, bit_width,
+                             dimensions, member_description, description_source,
+                             conditions, visibility, member_anonymous,
+                             generated_by) = member
+                            parent_id = (member_ids[parent_index]
+                                         if parent_index is not None else None)
+                            member_rows.append((
+                                member_ids[ordinal], next_sym_id, parent_id, ordinal,
+                                member_name, member_kind, type_text, declaration,
+                                member_start, member_end, bit_width,
+                                json.dumps(dimensions), member_description,
+                                description_source, json.dumps(conditions),
+                                visibility, member_anonymous, generated_by,
+                            ))
+                        next_member_id += len(members)
+                        sites_by_name: dict[str, list[tuple]] = defaultdict(list)
+                        for site in call_sites:
+                            sites_by_name[site[0]].append(site)
+                        indirect = set(indirect_calls)
+                        for callee in calls:
+                            sites = sites_by_name.get(callee, ())
+                            direct_n = sum(site[1] == "direct" for site in sites)
+                            indirect_n = sum(
+                                site[1] == "indirect" for site in sites)
+                            macro_n = sum(site[1] == "macro" for site in sites)
+                            if not sites:
+                                indirect_n = int(callee in indirect)
+                                direct_n = 1 - indirect_n
+                            initial = "unresolved" if direct_n else (
+                                "macro" if macro_n else "indirect")
+                            call_rows.append((
+                                next_sym_id, callee, initial,
+                                direct_n, indirect_n, macro_n,
+                            ))
+                            n_calls += 1
+                        next_sym_id += 1
+                        n_sym += 1
+                done += len(result)
+                if len(sym_rows) > 50_000 or len(member_rows) > 100_000:
+                    flush()
+                progress.update(done, detail=(
+                    f"{jobs} workers; {n_sym:,} symbols; {n_calls:,} calls; "
+                    f"{n_skipped:,} skipped; {n_failed:,} failed"))
+            flush()
+            conn.commit()
     return n_parsed, n_sym, n_calls, n_skipped, n_failed, n_oversize
 
 
 def _attach_subsystems(tree: Path, conn: sqlite3.Connection, quiet: bool,
                        max_per_path: int | None = None) -> int:
-    smap = maintainers.load(tree)
-    if not smap.sections:
-        if not quiet:
-            print("  no MAINTAINERS file found; skipping subsystem mapping",
-                  file=sys.stderr)
-        return 0
+    with Progress("Mapping ownership", unit="files", quiet=quiet) as progress:
+        smap = maintainers.load(tree)
+        if not smap.sections:
+            progress.update(detail="no MAINTAINERS sections; nothing to map")
+            return 0
 
-    conn.executemany(
-        "INSERT INTO subsystems(id, name, status, maintainers, reviewers, lists,"
-        " trees, websites, patchwork, bugs, chats, profiles, keywords)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [(s.id, s.name, s.status, json.dumps(s.maintainers), json.dumps(s.reviewers),
-          json.dumps(s.lists), json.dumps(s.trees), json.dumps(s.websites),
-          json.dumps(s.patchwork), json.dumps(s.bugs), json.dumps(s.chats),
-          json.dumps(s.profiles), json.dumps(s.keywords)) for s in smap.sections],
-    )
-
-    rows: list[tuple] = []
-    # F:/N: rules describe files.  Matching a bare directory string against
-    # them produces false gaps (``kernel/futex``) and false ownership
-    # (wildcards which merely happen to match child directory names).
-    for rid, path in conn.execute("SELECT id, path FROM files").fetchall():
-        matches = smap.match(path)
-        if max_per_path is not None:
-            matches = matches[:max_per_path]
-        top_score = matches[0][1] if matches else None
-        for rank, (sec, score) in enumerate(matches):
-            rows.append(("file", rid, sec.id, score, rank,
-                         int(score == top_score)))
-        if len(rows) > 200_000:
-            conn.executemany(
-                "INSERT INTO path_subsys(ref_kind, ref_id, subsystem_id, score,"
-                " rank, is_primary) VALUES (?,?,?,?,?,?)", rows)
-            rows = []
-    if rows:
         conn.executemany(
-            "INSERT INTO path_subsys(ref_kind, ref_id, subsystem_id, score, rank,"
-            " is_primary) VALUES (?,?,?,?,?,?)", rows)
-    conn.commit()
-    if not quiet:
-        print(f"  subsystems: {len(smap.sections):,} sections from MAINTAINERS",
-              file=sys.stderr)
-    return len(smap.sections)
+            "INSERT INTO subsystems(id, name, status, maintainers, reviewers, lists,"
+            " trees, websites, patchwork, bugs, chats, profiles, keywords)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(s.id, s.name, s.status, json.dumps(s.maintainers), json.dumps(s.reviewers),
+              json.dumps(s.lists), json.dumps(s.trees), json.dumps(s.websites),
+              json.dumps(s.patchwork), json.dumps(s.bugs), json.dumps(s.chats),
+              json.dumps(s.profiles), json.dumps(s.keywords)) for s in smap.sections],
+        )
+
+        rows: list[tuple] = []
+        # F:/N: rules describe files.  Matching a bare directory string against
+        # them produces false gaps (``kernel/futex``) and false ownership
+        # (wildcards which merely happen to match child directory names).
+        paths = conn.execute("SELECT id, path FROM files").fetchall()
+        progress.update(total=len(paths),
+                        detail=f"{len(smap.sections):,} MAINTAINERS sections")
+        for done, (rid, path) in enumerate(paths, 1):
+            matches = smap.match(path)
+            if max_per_path is not None:
+                matches = matches[:max_per_path]
+            top_score = matches[0][1] if matches else None
+            for rank, (sec, score) in enumerate(matches):
+                rows.append(("file", rid, sec.id, score, rank,
+                             int(score == top_score)))
+            progress.update(done)
+            if len(rows) > 200_000:
+                conn.executemany(
+                    "INSERT INTO path_subsys(ref_kind, ref_id, subsystem_id, score,"
+                    " rank, is_primary) VALUES (?,?,?,?,?,?)", rows)
+                rows = []
+        if rows:
+            conn.executemany(
+                "INSERT INTO path_subsys(ref_kind, ref_id, subsystem_id, score, rank,"
+                " is_primary) VALUES (?,?,?,?,?,?)", rows)
+        conn.commit()
+        return len(smap.sections)
 
 
 def _derive_directory_composition(conn: sqlite3.Connection) -> None:
@@ -630,16 +626,21 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
             max_file_bytes)
         stats.skipped += symlink_parse
         if want_calls:
-            _assign_call_domains(tree, conn)
+            with Progress("Analyzing build domains", quiet=quiet):
+                _assign_call_domains(tree, conn)
         stats.subsystems = _attach_subsystems(tree, conn, quiet)
-        _rollup(conn)
+        with Progress("Summarizing directories", quiet=quiet):
+            _rollup(conn)
 
         # Resolution needs the symbol/file indexes created by finalization.
         # It deliberately runs after every translation unit has been parsed so
         # uniqueness is decided across the complete index.
-        db.finalize(conn)
+        with Progress("Creating database indexes", quiet=quiet):
+            db.finalize(conn)
         if want_calls:
-            resolution = _resolve_calls(conn, keep_evidence=True)
+            with Progress("Resolving calls", detail=f"{stats.calls:,} call records",
+                          quiet=quiet):
+                resolution = _resolve_calls(conn, keep_evidence=True)
             stats.call_occurrences = int(conn.execute(
                 "SELECT COALESCE(SUM(direct_count+indirect_count+macro_count),0)"
                 " FROM calls").fetchone()[0])
@@ -690,7 +691,8 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
         # Insert a provisional duration so the completed schema can be audited.
         # It is replaced after that publication audit, which can itself be a
         # material part of a multi-million-symbol build.
-        conn.execute("ANALYZE main")
+        with Progress("Analyzing database statistics", quiet=quiet):
+            conn.execute("ANALYZE main")
         stats.seconds = time.monotonic() - started
         conn.execute("INSERT INTO meta(key, value) VALUES (?,?)",
                      ("build_seconds", f"{stats.seconds:.1f}"))
@@ -698,13 +700,15 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
         # Publication is atomic only after a full identity/count audit.  Normal
         # read commands perform the cheap schema check; users can explicitly
         # repeat this scan with ``kernel-atlas check``.
-        if want_calls:
-            db.validate_schema(
-                conn, deep=True, reuse_call_evidence=True)
-        else:
-            db.validate_schema(conn, deep=True)
+        with Progress("Validating index", detail="full integrity audit", quiet=quiet):
+            if want_calls:
+                db.validate_schema(
+                    conn, deep=True, reuse_call_evidence=True)
+            else:
+                db.validate_schema(conn, deep=True)
         if pre_publish is not None:
-            pre_publish()
+            with Progress("Rechecking source identity", quiet=quiet):
+                pre_publish()
         stats.seconds = time.monotonic() - started
         conn.execute("UPDATE meta SET value=? WHERE key='build_seconds'",
                      (f"{stats.seconds:.1f}",))
@@ -717,7 +721,8 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
     assert conn is not None
     conn.close()
     try:
-        scratch.replace(out)
+        with Progress("Publishing index", quiet=quiet):
+            scratch.replace(out)
     except BaseException:
         scratch.unlink(missing_ok=True)
         raise
