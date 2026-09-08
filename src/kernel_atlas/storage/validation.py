@@ -10,7 +10,7 @@ from datetime import datetime
 from ..indexing import call_resolution
 from . import config
 from .integrity import validate_structure
-from .schema import SCHEMA_VERSION, SchemaError
+from .schema import READABLE_SCHEMA_VERSIONS, SCHEMA_VERSION, SchemaError
 
 
 def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
@@ -25,6 +25,8 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
     """
     meta = _validate_metadata(conn)
     _validate_layout(conn)
+    from .evidence import validate_evidence
+    validate_evidence(conn, meta, deep=False)
     if not deep:
         return meta
 
@@ -33,6 +35,7 @@ def validate_schema(conn: sqlite3.Connection, *, deep: bool = False,
     try:
         validate_structure(conn, meta)
         _validate_call_evidence(conn, meta, reuse_call_evidence=reuse_call_evidence)
+        validate_evidence(conn, meta, deep=True)
     except SchemaError:
         raise
     except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError) as exc:
@@ -61,7 +64,7 @@ def _validate_metadata(conn: sqlite3.Connection) -> dict[str, str]:
     actual = meta.get("schema_version")
     if not actual:
         raise SchemaError("index has no schema version (it may be incomplete)")
-    if actual != SCHEMA_VERSION:
+    if actual not in READABLE_SCHEMA_VERSIONS:
         raise SchemaError(
             f"unsupported index schema {actual!r}; expected {SCHEMA_VERSION!r}"
         )

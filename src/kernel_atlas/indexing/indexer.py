@@ -16,6 +16,7 @@ from pathlib import Path
 from ..storage import config, db
 from ..parsing import cparse, maintainers
 from . import call_resolution
+from ..parsing.contracts import function_contracts
 from ..presentation.progress import Progress
 
 from .kbuild import (
@@ -61,12 +62,14 @@ def _work(batch: list[tuple[int, str, bool]]):
     """Read each file once: count lines, and parse it when it is C."""
     out = []
     for file_id, rel, parse in batch:
+        size = None
         try:
             with open(os.path.join(_W_ROOT, rel), "rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
                 data = fh.read(_W_MAX_FILE_BYTES + 1)
                 if b"\0" in data[:8192]:
                     status = "skipped_binary" if parse else "binary"
-                    out.append((file_id, 0, (), status, None, parse))
+                    out.append((file_id, 0, (), status, None, parse, size, None, {}))
                     continue
                 if len(data) > _W_MAX_FILE_BYTES:
                     # Large generated headers are intentionally not handed to
@@ -81,16 +84,17 @@ def _work(batch: list[tuple[int, str, bool]]):
                         last = chunk[-1:]
                     lines = newlines + (1 if n_bytes and last != b"\n" else 0)
                     status = "skipped_oversize" if parse else "indexed"
-                    out.append((file_id, lines, (), status, None, parse))
+                    out.append((file_id, lines, (), status, None, parse, n_bytes, None, {}))
                     continue
         except OSError as exc:
             error = f"{type(exc).__name__}: {exc}"[:400]
-            out.append((file_id, 0, (), "read_error", error, parse))
+            out.append((file_id, 0, (), "read_error", error, parse, None, None, {}))
             continue
         lines = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
         syms: tuple = ()
         status = "indexed"
         error = None
+        contracts = {}
         if parse:
             try:
                 parsed = cparse.parse_source(
@@ -102,6 +106,7 @@ def _work(batch: list[tuple[int, str, bool]]):
                 error = f"{type(exc).__name__}: {exc}"[:400]
             else:
                 status = "parsed"
+            contracts = function_contracts(data, parsed)
             syms = tuple(
                 (s.name, s.kind, s.start_line, s.end_line, s.signature,
                  int(s.is_static), int(s.is_inline), int(s.is_exported), s.calls,
@@ -119,7 +124,12 @@ def _work(batch: list[tuple[int, str, bool]]):
                  s.parse_warnings, s.unmatched_member_docs, s.conditions)
                 for s in parsed
             )
-        out.append((file_id, lines, syms, status, error, parse))
+        document = (data.decode("utf-8", "replace")
+                    if rel.startswith("Documentation/") and len(data) <= 1 << 20
+                    and Path(rel).suffix.lower() in {".rst", ".txt", ".md", ".yaml", ".yml"}
+                    else None)
+        out.append((file_id, lines, syms, status, error, parse,
+                    len(data), document, contracts))
     return out
 
 
@@ -235,11 +245,13 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
     alias_rows: list[tuple] = []
     member_rows: list[tuple] = []
     call_rows: list[tuple] = []
+    site_rows: list[tuple] = []
+    contract_rows: list[tuple] = []
     next_sym_id = 1
     next_member_id = 1
 
     def flush() -> None:
-        nonlocal sym_rows, alias_rows, member_rows, call_rows
+        nonlocal sym_rows, alias_rows, member_rows, call_rows, site_rows, contract_rows
         if sym_rows:
             conn.executemany(
                 "INSERT INTO symbols(id, file_id, name, kind, start_line, end_line,"
@@ -267,6 +279,12 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                 " indirect_count,macro_count) VALUES (?,?,?,?,?,?)",
                 call_rows)
             call_rows = []
+        if site_rows:
+            conn.executemany("INSERT INTO call_sites VALUES (?,?,?,?,?)", site_rows)
+            site_rows = []
+        if contract_rows:
+            conn.executemany("INSERT INTO function_docs VALUES (?,?,?,?,?,?,?)", contract_rows)
+            contract_rows = []
 
     with ProcessPoolExecutor(
         max_workers=jobs,
@@ -280,11 +298,14 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
         with Progress("Parsing sources", total=total_files, unit="files",
                       detail=worker_label, quiet=quiet) as progress:
             for result in results:
-                for file_id, lines, syms, status, error, parse in result:
+                for (file_id, lines, syms, status, error, parse,
+                     size, document, contracts) in result:
+                    if document is not None:
+                        conn.execute("INSERT INTO document_text VALUES (?,?)", (file_id, document))
                     conn.execute(
                         "UPDATE files SET lines=?, n_symbols=?, index_status=?,"
-                        " index_error=? WHERE id=?",
-                        (lines, len(syms), status, error, file_id),
+                        " index_error=?, size=COALESCE(?,size) WHERE id=?",
+                        (lines, len(syms), status, error, size, file_id),
                     )
                     if status == "read_error" or status == "parse_error":
                         n_failed += 1
@@ -294,11 +315,18 @@ def _parse_all(tree: Path, conn: sqlite3.Connection, pending, kinds, want_calls,
                         n_skipped += 1
                         if status == "skipped_oversize":
                             n_oversize += 1
-                    for (name, kind, start, end, sig, st, inl, exp, calls,
+                    for ordinal, (name, kind, start, end, sig, st, inl, exp, calls,
                          indirect_calls, call_sites, summary, description,
                          members, aliases,
                          anonymous, parse_complete, parse_warnings,
-                         unmatched_docs, conditions) in syms:
+                         unmatched_docs, conditions) in enumerate(syms):
+                        contract = contracts.get(ordinal)
+                        if contract:
+                            contract_rows.append((next_sym_id, contract['line'], contract['summary'],
+                                                  json.dumps(contract['parameters']), contract['description'],
+                                                  contract['context'], contract['returns']))
+                        for callee, site_kind, line, offset in call_sites:
+                            site_rows.append((next_sym_id, callee, site_kind, line, offset))
                         sym_rows.append((next_sym_id, file_id, name, kind, start, end,
                                          sig, summary, description, st, inl, exp,
                                          anonymous, parse_complete,
@@ -659,6 +687,10 @@ def build(tree: Path, out: Path, version: str, kinds=cparse.DEFAULT_KINDS,
             "INSERT INTO meta(key, value) VALUES (?,?)",
             [
                 ("schema_version", db.SCHEMA_VERSION),
+                ("has_call_sites", "1" if want_calls else "0"),
+                ("has_document_text", "1"),
+                ("has_function_docs", "1"),
+                ("document_text_max_bytes", str(min(max_file_bytes, 1 << 20))),
                 ("kernel_version", version),
                 ("source", source),
                 ("tree_path", str(tree)),

@@ -6,7 +6,7 @@ import csv
 import re
 import sys
 
-from ..queries import query
+from ..queries import call_graph, query
 from ..presentation import render
 from ..queries import relationships
 from ..presentation.terminal import Console
@@ -141,15 +141,9 @@ def cmd_trace(args, support):
         ], align_right=(1,), tones={0: "accent"})
 
 
-def cmd_calls(args, support):
-    conn, meta = support.open_index(args)
-    support._reject_symbol_size_sort(args, query.SYMBOL_KINDS)
-    if meta.get("has_calls") != "1":
-        advice = support._call_graph_rebuild_advice(args, meta)
-        support._die(
-            f"this index ({support.index_version(meta)}) has no call graph — "
-            f"{advice}")
-    target_spec = support._normalize_target_spec(meta, args.target)
+def _callable_target(conn, meta, spec, support):
+    """Resolve one exact callable identity for either end of an exploration."""
+    target_spec = support._normalize_target_spec(meta, spec)
     resolution = (support.resolve_or_die(conn, target_spec)
                   if ":" in target_spec
                   else query.resolve_symbol(conn, target_spec))
@@ -177,6 +171,23 @@ def cmd_calls(args, support):
             f"{len(callable_alternatives) + 1} callable definitions are named "
             f"{target.name!r}; qualify the target as {qualifier}"
             + (f" (for example: {examples})" if examples else ""))
+    return target
+
+
+def cmd_calls(args, support):
+    conn, meta = support.open_index(args)
+    support._reject_symbol_size_sort(args, query.SYMBOL_KINDS)
+    if meta.get("has_calls") != "1":
+        advice = support._call_graph_rebuild_advice(args, meta)
+        support._die(
+            f"this index ({support.index_version(meta)}) has no call graph — "
+            f"{advice}")
+    target = _callable_target(conn, meta, args.target, support)
+    if (getattr(args, "sites", False) or getattr(args, "depth", None) is not None
+            or getattr(args, "to", None) is not None):
+        return _advanced_calls(conn, meta, target, args, support)
+    if getattr(args, "max_nodes", 200) != 200:
+        support._die("--max-nodes requires --sites, --depth, or --to")
     if support._split_list(args.kinds):
         selected_kinds = support.kinds_from_args(args, None)
         invalid = [kind for kind in selected_kinds
@@ -225,6 +236,114 @@ def cmd_calls(args, support):
         index=support.index_version(meta),
         default_columns=default_columns)
 
+
+
+def _advanced_calls(conn, meta, target, args, support):
+    """Render bounded evidence without silently reusing flat-list filters."""
+    if args.format not in {"table", "json"}:
+        support._die("--sites, --depth and --to support --format table or json")
+    incompatible = []
+    for attribute, flag in (
+            ("columns", "--columns"), ("grep", "--grep"), ("kinds", "--kinds"),
+            ("static_only", "--static-only"), ("no_static", "--no-static"),
+            ("exported", "--exported"), ("with_subsystem", "--with-subsystem")):
+        if getattr(args, attribute, None):
+            incompatible.append(flag)
+    if args.sort != "name":
+        incompatible.append("--sort")
+    graph_mode = args.depth is not None or args.to is not None
+    if graph_mode and args.limit != 200:
+        incompatible.append("--limit (use --max-nodes)")
+    if incompatible:
+        support._die("call exploration does not support " + ", ".join(incompatible))
+    if args.to is not None and args.callers:
+        support._die("--to follows calls from the target and cannot be used with --callers")
+    if args.sites and meta.get("has_call_sites") != "1":
+        support._die(
+            "this index has no individual call-site evidence — "
+            + support._call_graph_rebuild_advice(args, meta))
+    if graph_mode:
+        destination = (_callable_target(conn, meta, args.to, support)
+                       if args.to is not None else None)
+        result = call_graph.explore(
+            conn, target.id, depth=args.depth if args.depth is not None else 8,
+            max_nodes=args.max_nodes, incoming=args.callers,
+            to_id=destination.id if destination else None, sites=args.sites)
+    else:
+        result = call_graph.call_sites(
+            conn, target.id, incoming=args.callers,
+            limit=min(args.limit or args.max_nodes, args.max_nodes))
+    result["index"] = support.index_version(meta)
+    if args.format == "json":
+        sys.stdout.write(render.render_json(result))
+        return
+    console = Console(args.color)
+    label = {"sites": "Call sites", "graph": "Call exploration", "path": "Call path"}
+    console.heading(f"{label[result['mode']]}: {target.display} [{support._linux(meta)}]")
+    console.blank()
+    if result["mode"] == "sites":
+        _render_sites(console, result["sites"])
+    elif result["mode"] == "path":
+        if result["found"]:
+            console.heading("Shortest resolved source-level chain", tone="success")
+            console.table(("HOP", "FUNCTION", "DEFINITION"), [
+                (str(index), node["name"], f"{node['path']}:{node['line']}")
+                for index, node in enumerate(result["path"])
+            ], tones={0: "muted", 1: "success"})
+            if args.sites:
+                pairs = {(a["id"], b["id"])
+                         for a, b in zip(result["path"], result["path"][1:])}
+                _render_sites(console, [site for edge in result["edges"]
+                                       if (edge["caller"]["id"], edge["callee"]["id"]) in pairs
+                                       for site in edge["sites"] if site["kind"] == "direct"])
+        else:
+            console.note("No resolved chain found within the search limits.")
+    else:
+        console.field("Direction", result["direction"])
+        console.table(("DEPTH", "FUNCTION", "DEFINITION"), [
+            (str(node["depth"]), node["name"], f"{node['path']}:{node['line']}")
+            for node in result["nodes"]
+        ], tones={0: "muted", 1: "success"})
+        console.blank()
+        console.heading("Resolved direct calls")
+        console.table(("CALLER", "CALLEE", "OCCURRENCES", "RESOLUTION"), [
+            (_node_label(edge["caller"]), _node_label(edge["callee"]),
+             str(edge["direct_count"]), edge["resolution"])
+            for edge in result["edges"]
+        ], tones={0: "success", 1: "success", 3: "muted"})
+        if args.sites:
+            _render_sites(console, [site for edge in result["edges"]
+                                   for site in edge["sites"]])
+    if result.get("boundary"):
+        console.blank()
+        console.heading("Exploration boundary", tone="warning")
+        console.table(("CALLER", "CALLEE", "REASON"), [
+            (_node_label(edge["caller"]), edge["name"], edge["reason"])
+            for edge in result["boundary"]
+        ], tones={2: "warning"})
+        if args.sites:
+            # A mixed resolved group is already displayed above.
+            _render_sites(console, [site for edge in result["boundary"]
+                                   if edge["reason"] != "non_direct_occurrences"
+                                   for site in edge["sites"]])
+    console.blank()
+    if result.get("cycles_detected"):
+        console.note("Cycles detected among the explored identities; nodes are visited once.")
+    if result["truncated"]:
+        console.note("Results truncated: " + ", ".join(result["truncation_reasons"]))
+    console.text(result["note"], tone="muted")
+
+
+def _node_label(node):
+    return f"{node['path']}:{node['line']} ({node['name']})"
+
+
+def _render_sites(console, sites):
+    console.table(("CALLER", "CALLEE", "CALL SITE", "KIND", "RESOLUTION"), [
+        (site["caller"], site["callee"], f"{site['path']}:{site['line']}",
+         site["kind"], site["resolution"])
+        for site in sites
+    ], tones={0: "success", 1: "success", 2: "accent", 4: "muted"})
 
 def cmd_relationships(args, support):
     """Show ownership overlap and conservative direct-call flow."""

@@ -73,6 +73,54 @@ def test_query_commands_in_every_advertised_format(run_cli, mini_index, command,
         assert "ext4_get_block(NULL, block)" in result.stdout
 
 
+@pytest.mark.parametrize("fmt", ["table", "json"])
+@pytest.mark.parametrize(("mode", "arguments"), [
+    ("sites", ("calls", "ext4_bmap", "--sites")),
+    ("graph", ("calls", "ext4_bmap", "--depth", "2", "--sites", "--max-nodes", "10")),
+    ("path", ("calls", "ext4_bmap", "--to", "ext4_inode_blocks_set")),
+    ("relations", ("struct", "ext4_sb_info", "--relations", "--max-relations", "3")),
+    ("used-by", ("struct", "ext4_sb_info", "--used-by", "--max-relations", "3")),
+    ("detail", ("info", "ext4_get_block", "--detail")),
+    ("search", ("docs", "--search", "futex locking")),
+    ("mentions", ("docs", "ext4_bmap", "--mentions")),
+], ids=lambda value: value if isinstance(value, str) else None)
+def test_evidence_modes_cross_process_boundary(run_cli, mini_index, mode, arguments, fmt):
+    """Cover option dispatch and stable evidence shapes without mirroring queries."""
+    result = run_cli("--db", str(mini_index), *arguments, "-f", fmt)
+    assert result.stdout.strip()
+    assert "\x1b[" not in result.stdout
+    if fmt != "json":
+        return
+    payload = json.loads(result.stdout)
+    if mode in {"sites", "graph", "path"}:
+        assert payload["mode"] == mode
+        assert payload["target"]["name"] == "ext4_bmap"
+        if mode == "sites":
+            assert payload["sites"] and payload["sites"][0]["line"] > 0
+        elif mode == "graph":
+            assert payload["edges"] and len(payload["nodes"]) <= 10
+        else:
+            assert payload["found"] and len(payload["path"]) == 3
+    elif mode in {"relations", "used-by"}:
+        relations = payload["definitions"][0]["type_relationships"]
+        assert relations["incoming_requested"]
+        assert relations["outgoing_requested"] == (mode == "relations")
+        assert len(relations["incoming"]) <= 3
+    elif mode == "detail":
+        # This fixture has no kernel-doc for the function: absence must survive
+        # the real CLI rather than being replaced by inferred requirements.
+        assert payload["documentation"]["documented"] is False
+        assert payload["documentation"]["context"] is None
+    elif mode in {"search", "mentions"}:
+        assert payload["mode"] == mode
+        assert payload["coverage"]["documentation_text"]
+        if mode == "search":
+            assert payload["matches"][0]["path"] == "Documentation/locking/futex.rst"
+            assert payload["matches"][0]["line"] == 1
+        else:
+            assert payload["matching"] == "case-sensitive identifier"
+
+
 def test_local_build_selection_and_removal_roundtrip(run_cli, tmp_path):
     tree = make_mini_kernel(tmp_path / "linux")
     assert json.loads(run_cli("indexes", "-f", "json").stdout) == []

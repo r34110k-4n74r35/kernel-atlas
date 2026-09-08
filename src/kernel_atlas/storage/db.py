@@ -49,6 +49,9 @@ def connect(path: Path, readonly: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # SQLite may otherwise spill sorts and temporary tables to a system temp
+    # directory. Keep temporary query/build state in this process's memory.
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 
@@ -62,6 +65,7 @@ def create(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
     conn.executescript(SCHEMA)
     return conn

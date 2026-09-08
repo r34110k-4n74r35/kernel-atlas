@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..queries import links
 from ..queries import query
+from ..queries.type_relationships import structure_relationships
 from ..presentation import render
 from ..presentation.terminal import Console, terminal_width
 
@@ -128,6 +129,11 @@ def cmd_struct(args, support):
                 "expanded macros.",
             ],
         })
+        if getattr(args, "relations", False) or getattr(args, "used_by", False):
+            detail["type_relationships"] = structure_relationships(
+                conn, target, outgoing=getattr(args, "relations", False),
+                incoming=True, limit=getattr(args, "max_relations", 100),
+            )
         definitions.append(detail)
 
     payload = {
@@ -146,6 +152,8 @@ def cmd_struct(args, support):
         if index:
             print()
         sys.stdout.write(render.render_structure(detail, color, width))
+        if "type_relationships" in detail:
+            _render_relationships(detail["type_relationships"], Console(args.color))
     target_spec = shlex.quote(
         f"{definitions[0]['path']}:{definitions[0]['line']}")
     prefix = support._command_prefix(args, meta)
@@ -156,3 +164,45 @@ def cmd_struct(args, support):
     if definitions[0]["links"]:
         next_lines.append(f"{prefix} web {target_spec}")
     Console(args.color).commands(next_lines)
+
+
+def _render_relationships(relationships: dict, console: Console) -> None:
+    for direction, title in (("outgoing", "Types referenced by members"),
+                             ("incoming", "Declarations using this type")):
+        if not relationships[direction + "_requested"]:
+            continue
+        console.blank()
+        console.heading(title)
+        relations = relationships[direction]
+        if not relations:
+            console.text("No explicit indexed declaration relationships found.", tone="muted")
+            continue
+        rows = []
+        for relation in relations:
+            owner = relation["owner"]
+            identity = owner["name"]
+            if relation["member"]:
+                identity += "." + relation["member"]
+            location = f"{owner['path']}:{relation['line']}"
+            candidates = "; ".join(
+                f"{candidate['path']}:{candidate['line']} ({candidate['visibility'].replace('_', ' ')})"
+                for candidate in relation["candidates"]
+            ) or "No indexed definition"
+            if relation["candidates_truncated"]:
+                candidates += (f"; showing {len(relation['candidates'])} of "
+                               f"{relation['candidates_total']} candidates")
+            spelling = ((relation["kind"] + " ") if relation["kind"] else "") + relation["name"]
+            rows.append([
+                relation["role"].replace("_", " "), f"{identity} — {location}",
+                spelling, f"{relation['resolution']}: {candidates}",
+            ])
+        console.table(["Relationship", "Declaration", "Type", "Candidate definitions"],
+                      rows, tones={0: "info", 2: "accent", 3: "muted"})
+        if relationships[direction + "_truncated"]:
+            console.note(f"Showing the first {relationships['limit']} {direction} relationships; "
+                         "increase --max-relations to see more.")
+        if any(relation["candidates_truncated"] for relation in relations):
+            console.note(f"Candidate definitions are limited to {relationships['candidate_limit']} "
+                         "per relationship; ambiguity and matching use the full candidate set.")
+    for limitation in relationships["limits"]:
+        console.note(limitation, tone="info")

@@ -54,6 +54,8 @@ ka build lts --with-calls     # download + index the latest LTS (once)
 ka indexes                    # see which version the build selected
 ka info mm                    # what is this directory, who maintains it?
 ka struct usb_device          # every field, shape, condition, and source doc
+ka struct usb_device --used-by # references in members and function declarations
+ka info usb_get_dev --detail   # documented parameters, context, and return value
 ka siblings kernel/sched      # what sits next to the scheduler?
 ka find tcp_sendmsg --exact   # where is this symbol?
 ka show tcp_sendmsg           # print its source
@@ -122,6 +124,7 @@ place the whole checkout there.
 | Generated files | Purpose and retention |
 | --- | --- |
 | `kernels/linux-V/`, `indexes/V.db`, custom index outputs | Persistent study data. Keep until you no longer need the snapshot. Prefer `ka remove` for managed indexes and sources. |
+| Document text, function comments, and call sites within each new `.db` | Stored query evidence. Kept with that index; no separate application cache folder is created. |
 | `kernels/.linux-V.source.json`, `indexes/.default-version`, source/output/pin locks | Persistent ownership, selection, and coordination metadata. Keep with the data; lock files are not disposable cache. Use `ka use --clear` to clear a pin. |
 | Archives and `.part` files under `kernels/` | Downloads; partial files support resuming. Successful acquisition removes the archive unless `--keep-tarball` is set. |
 | `*.building` beside an index, `.extracting-*` under `kernels/` | Temporary build/extraction staging. Normally cleaned up; crashes or cleanup failures can leave residue. |
@@ -129,10 +132,14 @@ place the whole checkout there.
 | `__pycache__/`, `.pytest_cache/`, `.ruff_cache/` | Standard regenerable development caches. Tests keep synthetic sources and indexes under `.pytest_cache/tmp/`. |
 | `.venv/`, `build/`, `dist/`, `src/kernel_atlas.egg-info/` | Local environment and packaging products. Recreate through installation or packaging when needed. |
 
+`build/` and `dist/` are packaging products, not kernel study data. They need
+not be retained after packaging or verification finishes. Routine application
+commands do not create them.
+
 Python caches keep their normal layout; the project does not consolidate them
 into `.cache/` or require a special command runner. Package installers retain
-their normal shared caches, and Python, SQLite, and the operating system may use
-system temporary storage.
+their normal shared caches, and Python and the operating system may use system
+temporary storage. SQLite sorts and temporary tables stay in process memory.
 This is an application storage policy, not an operating-system sandbox: it does
 not redirect those library and tool facilities. The default data directories are
 Git-ignored; add ignore rules for any custom locations.
@@ -296,6 +303,15 @@ macros; `--kinds function,syscall,struct,enum,typedef` is much smaller if you do
 not need them. The build summary and `ka stats` separately report files that
 were parsed, skipped, or failed. Before a completed index becomes active, the
 same deep structural and semantic audit exposed by `ka check` is run against it.
+
+After editing a local source tree, use
+`ka build --src /path/to/linux --with-calls --force` to replace its existing
+index. The replacement is fully built and audited before publication.
+
+Schema-6 indexes remain readable for their existing features. Rebuild to obtain
+the individual call sites, document text, and function kernel-doc stored in
+schema 7. New query modes report missing capabilities; opening an index never
+migrates or rewrites it automatically.
 
 ## Naming a target
 

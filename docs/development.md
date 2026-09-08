@@ -47,7 +47,7 @@ src/kernel_atlas/
   commands/            CLI entry point, command handlers, shared CLI services
   parsing/             C parser, MAINTAINERS, syntax, records, recovery, documentation
   indexing/            index builds, Kbuild domains, includes, call identity resolution
-  queries/             target resolution, listings, structures, documentation, links
+  queries/             resolution, structures, call/type relationships, docs
   storage/             configuration, database, source acquisition, identity, locking
   presentation/        listing formats, terminal output, progress, study reports
 docs/                  task-oriented user and developer guides
@@ -76,10 +76,10 @@ Internal modules use short names within their feature package:
 
 | Package | Modules |
 | --- | --- |
-| `parsing/` | `cparse.py`, `maintainers.py`, `models.py`, `syntax.py`, `calls.py`, `recovery.py`, `aggregates.py`, `documentation.py`, `groups.py` |
+| `parsing/` | `cparse.py`, `maintainers.py`, `models.py`, `syntax.py`, `calls.py`, `recovery.py`, `aggregates.py`, `documentation.py`, `contracts.py`, `type_references.py`, `groups.py` |
 | `indexing/` | `indexer.py`, `kbuild.py`, `call_resolution.py` |
-| `queries/` | `query.py`, `models.py`, `paths.py`, `targeting.py`, `structures.py`, `documentation.py`, `relationships.py`, `links.py` |
-| `storage/` | `config.py`, `db.py`, `kernelsrc.py`, `schema.py`, `validation.py`, `integrity.py`, `managed_source.py`, `locks.py` |
+| `queries/` | `query.py`, `models.py`, `paths.py`, `targeting.py`, `structures.py`, `documentation.py`, `text_search.py`, `function_docs.py`, `relationships.py`, `type_relationships.py`, `call_graph.py`, `links.py` |
+| `storage/` | `config.py`, `db.py`, `kernelsrc.py`, `schema.py`, `validation.py`, `integrity.py`, `evidence.py`, `managed_source.py`, `locks.py` |
 | `presentation/` | `render.py`, `terminal.py`, `progress.py`, `build.py`, `structure.py` |
 
 The command package groups orchestration by task:
@@ -158,6 +158,19 @@ and struct-group interpretation have dedicated helpers. Split by responsibility
 when it separates independently understandable behavior, rather than imposing
 a line limit on a cohesive syntax-tree traversal.
 
+Function kernel-doc extraction belongs in `parsing/contracts.py`; explicit
+declaration type references belong in `parsing/type_references.py`. Query their
+stored evidence in the matching `queries/` modules. Keep call traversal bounded
+in `queries/call_graph.py`; it should use indexed evidence without reading or
+modifying current source. `storage/evidence.py` validates the stored evidence
+and its declared capabilities.
+
+Meaningful extension tests include legacy capability absence, invalid stored
+evidence, graph cycles and truncation, ambiguous type visibility, kernel-doc
+attachment, and literal text matching with bounded excerpts. Use synthetic
+source and project-local databases for these cases rather than requiring a
+downloaded kernel.
+
 The documentation is split by reader task: `README.md` introduces the tool,
 `getting-started.md` covers setup, `commands.md` defines behavior, and
 `architecture.md` records evidence and limitations. Update command help and
@@ -174,6 +187,8 @@ This builds a source archive and a wheel from that archive. `MANIFEST.in` keeps
 the guides and complete test fixtures in the source archive. The project
 version is defined once in `src/kernel_atlas/__init__.py`; setuptools reads it
 for package metadata. Runtime dependencies stay separate from the `dev` extra.
+Generated `build/` and `dist/` directories can be removed after packaging and
+verification; they are not persistent verification stores or application data.
 
 `ka`, `kernel-atlas`, and `python -m kernel_atlas` keep the same command syntax
 and behavior. Both installed console scripts now point to
@@ -185,6 +200,11 @@ Python imports must use the feature packages. For example, replace
 `from kernel_atlas import db, query` with `from kernel_atlas.storage import db`
 and `from kernel_atlas.queries import query`; use
 `from kernel_atlas.commands.cli import main` for the CLI entry point.
-The former root module paths have no compatibility shims. This regrouping
-preserves the database schema and index format, so existing indexes remain
-usable without rebuilding.
+The former root module paths have no compatibility shims.
+
+New builds use schema 7. Readers still accept schema 6 without mutation and
+gate new evidence behind explicit metadata capabilities. Keep legacy fixtures
+in compatibility coverage: ordinary queries, declaration relationships, call
+traversal without sites, and existing documentation ranking must remain usable.
+Individual sites, searchable text, and function contracts require an explicit
+rebuild when their evidence is absent.

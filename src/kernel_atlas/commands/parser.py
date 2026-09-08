@@ -114,6 +114,15 @@ def _jobs_int(value: str) -> int:
     return i
 
 
+def _bounded_positive(maximum):
+    def parse(value):
+        result = _positive_int(value)
+        if result > maximum:
+            raise argparse.ArgumentTypeError(f"must be between 1 and {maximum}")
+        return result
+    return parse
+
+
 def _add_output_opts(p, sorts=True, limit_default=0):
     g = p.add_argument_group("output")
     g.add_argument("--format", "-f", default="table",
@@ -264,6 +273,7 @@ def build_parser(support) -> argparse.ArgumentParser:
                     help="maximum ownership matches to show (default: 3)")
     sp.add_argument("--max-candidates", type=_nonneg_int, default=10,
                     help="maximum ambiguous target candidates (default: 10)")
+    sp.add_argument("--detail", action="store_true", help="show documented function parameters, context, and return values")
     sp.set_defaults(func=support.cmd_info)
 
     sp = add("struct", aliases=["structure"],
@@ -277,6 +287,9 @@ def build_parser(support) -> argparse.ArgumentParser:
     sp.add_argument("--max-docs", type=_nonneg_int, default=5,
                     help="maximum related Documentation/ files (0 disables)")
     sp.add_argument("--format", "-f", default="table", choices=("table", "json"))
+    sp.add_argument("--relations", action="store_true", help="show explicit type relationships in declarations")
+    sp.add_argument("--used-by", action="store_true", help="show declarations that refer to this type")
+    sp.add_argument("--max-relations", type=_bounded_positive(1000), default=100)
     sp.set_defaults(func=support.cmd_struct)
 
     sp = add("siblings", aliases=["sib"],
@@ -365,9 +378,12 @@ def build_parser(support) -> argparse.ArgumentParser:
     sp.set_defaults(func=support.cmd_web)
 
     sp = add("docs", help="Documentation/ files related to a target")
-    sp.add_argument("target")
+    sp.add_argument("target", nargs="?", default=".")
+    search = sp.add_mutually_exclusive_group()
+    search.add_argument("--search", type=_nonempty_arg, help="find a literal phrase in indexed documentation and function comments")
+    search.add_argument("--mentions", action="store_true", help="find textual mentions of the target name")
     sp.add_argument("--limit", "-n", type=_nonneg_int, default=30,
-                    help="maximum matching documents (default: 30; 0 = all)")
+                    help="maximum results (default: 30; 0 = all related documents; text modes cap at 5000)")
     sp.add_argument("--under", type=documentation_scope,
                     help="restrict to a Documentation path before ranking, "
                          "e.g. driver-api or Documentation/usb")
@@ -399,6 +415,10 @@ def build_parser(support) -> argparse.ArgumentParser:
         kinds_help="resolved result identities to keep: function,syscall",
     )
     _add_output_opts(sp, limit_default=200)
+    sp.add_argument("--sites", action="store_true", help="include exact source invocation locations")
+    sp.add_argument("--depth", type=_bounded_positive(64), help="explore up to this many resolved call edges")
+    sp.add_argument("--to", type=_nonempty_arg, help="find a shortest resolved source-level chain to this function")
+    sp.add_argument("--max-nodes", type=_bounded_positive(5000), default=200)
     sp.set_defaults(func=support.cmd_calls)
 
     sp = add(

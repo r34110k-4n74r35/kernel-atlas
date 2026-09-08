@@ -4,6 +4,8 @@
 
 - [How subsystems are determined](#how-subsystems-are-determined)
 - [How parsing works, and its limits](#how-parsing-works-and-its-limits)
+- [Index storage and compatibility](#index-storage-and-compatibility)
+- [Relationships and source evidence](#relationships-and-source-evidence)
 
 ## How subsystems are determined
 
@@ -151,3 +153,52 @@ Known limits:
   excluded directories cannot add compilation domains or include paths.
 - A read or parser failure is stored on the affected file and counted in the
   build summary instead of being reported as a successful parse.
+
+## Index storage and compatibility
+
+New schema-7 indexes store individual call sites, searchable document text,
+and function documentation alongside declarations and relationships. Metadata
+records the available evidence capabilities. These records live inside the
+index database, so they remain queryable without the original source tree.
+
+SQLite sorts and temporary tables stay in process memory, preventing spills
+into a system temporary directory. Persistent indexes and publication scratch
+files retain their project-local locations. Large builds may consequently use
+more memory for database work.
+
+Each build parses the selected inputs and computes file inventory,
+`MAINTAINERS` ownership, Kbuild evidence, include relationships, and call
+identities before the full integrity audit and atomic publication. Rebuild
+after editing source to update indexed declarations and relationships.
+
+Schema-6 indexes remain readable without automatic migration. Declaration-based
+type relationships and call traversal can use their existing records. Features
+requiring newly persisted evidence report that it is unavailable and request
+an explicit rebuild.
+
+## Relationships and source evidence
+
+Type relationships come from explicit member and function declarations. The
+query separates embedded/pointer members, parameter and return types, and
+callback types, retaining source locations, conditions, and candidate
+definitions. Direct typedef aliases participate, but alias chains and arbitrary
+macro expansion do not. Even one header candidate is not proof that the header
+is visible in a particular compilation. This is a declaration graph, not field
+access analysis or a model of runtime object flow.
+
+Individual call sites supplement the existing grouped call records with source
+lines, byte positions, and invocation categories. Bounded traversal follows
+resolved callee identities, retains unresolved boundary evidence, detects
+cycles, and reports exhausted budgets. A shortest source-level chain is not a
+runtime trace, and absence from the bounded lower-bound graph cannot prove
+that a runtime path does not exist.
+
+Function contracts retain text from adjacent kernel-doc comments: summary,
+parameter descriptions, notes, context, and returns. Missing comments are not
+filled in, and documented locking or execution-context requirements are not
+verified against implementation behavior. Searchable text includes retained
+Documentation files up to 1 MiB, subject to the input-size limit, and recognized
+function contracts. Larger, binary, unreadable, or unrecognized inputs remain
+outside that search corpus.
+Text matches carry excerpts and source locations; related-guide ranking remains
+a separate mode based on names, paths, and ownership.

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
+READABLE_SCHEMA_VERSIONS = {"6", SCHEMA_VERSION}
 # Direct typedef spellings can belong to any C tagged-type definition.  Enum
 # aliases are retained even though type_members currently models only structs
 # and unions, and structure queries deliberately remain struct/union-scoped.
@@ -190,6 +191,29 @@ CREATE TABLE calls (
     FOREIGN KEY (caller_id) REFERENCES symbols(id),
     FOREIGN KEY (callee_id) REFERENCES symbols(id)
 );
+
+CREATE TABLE call_sites (
+    caller_id INTEGER NOT NULL REFERENCES symbols(id),
+    callee TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('direct','indirect','macro')),
+    line INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL
+);
+
+CREATE TABLE document_text (
+    file_id INTEGER PRIMARY KEY REFERENCES files(id),
+    content TEXT NOT NULL
+);
+
+CREATE TABLE function_docs (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(id),
+    line INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    parameters TEXT NOT NULL,
+    description TEXT NOT NULL,
+    context TEXT NOT NULL,
+    returns TEXT NOT NULL
+);
 """
 
 INDEXES = """
@@ -212,4 +236,6 @@ CREATE INDEX idx_calls_caller   ON calls(caller_id);
 CREATE INDEX idx_calls_callee   ON calls(callee);
 CREATE INDEX idx_calls_target   ON calls(callee_id);
 CREATE INDEX idx_sym_file_name  ON symbols(file_id, name, kind);
+CREATE INDEX idx_call_sites_caller ON call_sites(caller_id, line, byte_offset);
+CREATE INDEX idx_call_sites_callee ON call_sites(callee, caller_id);
 """

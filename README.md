@@ -44,8 +44,10 @@ also needs temporary space for a second index. See the
 
 ```bash
 ka struct usb_device                  # members, types, comments, conditions
+ka struct usb_device --used-by        # declarations that refer to this type
+ka info usb_get_dev --detail          # documented parameters, context, returns
 ka show usb_get_dev                   # source for a function using the structure
-ka calls usb_get_dev                  # resolved callees and uncertain calls
+ka calls usb_get_dev --sites          # invocation locations and resolution evidence
 ka calls usb_get_dev --callers -n 20   # who invokes it?
 ka info drivers/usb                   # ownership composition of the directory
 ka relationships 'USB SUBSYSTEM'      # shared ownership and cross-subsystem calls
@@ -67,13 +69,16 @@ and device drivers, use the [study guide](docs/study-guide.md).
 | Where is a declaration? | `ka find tcp_sendmsg --exact` |
 | What surrounds this code? | `ka siblings kernel/sched` or `ka ls mm` |
 | What does a structure contain? | `ka struct usb_device` |
+| Where is a type used in declarations? | `ka struct usb_device --relations` |
+| What does a function require? | `ka info usb_get_dev --detail` |
 | Who owns this area? | `ka info drivers/usb` |
 | How do subsystems interact? | `ka relationships 'USB SUBSYSTEM'` |
-| Which functions are connected? | `ka calls usb_get_dev` |
+| Which functions are connected? | `ka calls usb_get_dev --depth 3 --sites` |
 | Which guides should I read? | `ka docs usb_device --under driver-api --explain` |
+| Where is this name actually mentioned? | `ka docs usb_device --mentions` |
 | Did a symbol move across releases? | `ka locate tcp_sendmsg` |
 | Which code is in a stack trace? | `ka trace` with a log on stdin |
-| Is the index consistent? | `ka check` |
+| Is the index internally consistent? | `ka check` |
 
 Use `-f json` for structured output. `-K VERSION` or `--db PATH` selects an index
 for a command. The [command reference](docs/commands.md) covers filtering,
@@ -88,9 +93,18 @@ ambiguity, output fields, and examples for every command.
 - `MAINTAINERS` ownership can overlap. Directory reports retain mixed ownership;
   call flows use resolved identities and disjoint primary-owner sets.
 - Documentation suggestions use indexed paths, declaration names, and ownership.
-  `--explain` shows those signals; it does not claim a document mentions a symbol.
-- Indexes are snapshots. Rebuild after editing source. Local/custom source
-  indexes support `path` and `show`; upstream links require matching provenance.
+  `--explain` shows those signals. `--mentions` or `--search 'literal phrase'`
+  instead returns excerpts from indexed documentation and function comments.
+- Type relationships retain candidate definitions and unresolved header
+  visibility. Call paths follow resolved source identities; neither view
+  establishes runtime data flow.
+- Indexes are snapshots; rebuild after editing the source tree. Local/custom
+  source indexes support `path` and `show`; upstream links require matching
+  provenance.
+
+Existing schema-6 indexes remain readable. Rebuild to obtain individual call
+sites, searchable document text, and function documentation.
+Queries report unavailable evidence and never upgrade an index automatically.
 
 See [the indexing model and limitations](docs/architecture.md) for the evidence
 behind these results.

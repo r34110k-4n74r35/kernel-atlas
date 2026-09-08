@@ -10,6 +10,22 @@ import pytest
 from kernel_atlas.storage import db
 
 
+def test_temporary_sqlite_state_stays_in_memory(storage_roots):
+    project, outside = storage_roots
+    path = project / "index.db"
+    for operation in (lambda: db.create(path), lambda: db.connect(path),
+                      lambda: db.connect(path, readonly=False)):
+        conn = operation()
+        try:
+            assert conn.execute("PRAGMA temp_store").fetchone()[0] == 2
+            conn.execute("CREATE TEMP TABLE scratch(value)")
+            conn.execute("INSERT INTO scratch VALUES ('local session')")
+            assert conn.execute("SELECT value FROM scratch").fetchone()[0] == "local session"
+        finally:
+            conn.close()
+    assert list(outside.iterdir()) == []
+
+
 @pytest.mark.parametrize("operation", ["create", "read", "write"])
 def test_database_rejects_external_path_before_creating_files(storage_roots, operation):
     _, outside = storage_roots

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from ..storage import config, db
-from ..queries import query
+from ..queries import query, text_search
 from ..presentation import render
 from ..queries import links
 from ..presentation.terminal import Console
@@ -67,6 +67,8 @@ def cmd_web(args, support):
 
 def cmd_docs(args, support):
     conn, meta = support.open_index(args)
+    if getattr(args, "search", None) is not None or getattr(args, "mentions", False):
+        return _docs_text(conn, meta, args, support)
     resolution = support._resolve_area(conn, args.target, meta)
     target = resolution.target
     matches = query.documentation_matches(
@@ -124,6 +126,70 @@ def cmd_docs(args, support):
         next_command = f"{prefix} show {first}"
     console.commands([next_command])
 
+
+
+def _docs_text(conn, meta, args, support):
+    if args.explain:
+        support._die("--explain describes related-document ranking and cannot be used "
+                     "with --search or --mentions; text results include their evidence")
+    has_documents = meta.get("has_document_text") == "1"
+    has_contracts = meta.get("has_function_docs") == "1"
+    if not has_documents and not has_contracts:
+        support._die("this index has no stored documentation text; rebuild this index "
+                     "with the current ka build command and --force")
+    scope = None
+    if args.mentions:
+        if args.target == ".":
+            support._die("docs --mentions requires a symbol target")
+        resolution = support.resolve_or_die(conn, args.target, meta)
+        target = resolution.target
+        if target.kind != "symbol":
+            support._die("docs --mentions requires a symbol target")
+        phrase = target.name
+    else:
+        phrase = args.search
+        if args.target not in {".", ""}:
+            resolution = support.resolve_or_die(conn, args.target, meta)
+            support._require_unique_symbol_identity(resolution, args.target, conn)
+            if resolution.target.kind not in {"dir", "file"}:
+                support._die("the target of docs --search must be a file or directory scope; "
+                             "use docs SYMBOL --mentions for identifier evidence")
+            scope = resolution.target.path
+    result = text_search.search(
+        conn, phrase, mentions=args.mentions, limit=args.limit,
+        under=args.under, scope=scope, include_documents=has_documents,
+        include_contracts=has_contracts)
+    result["index"] = support.index_version(meta)
+    result["coverage"] = {
+        "documentation_text": has_documents, "function_comments": has_contracts,
+        "document_max_bytes": int(meta.get("document_text_max_bytes", 1048576)),
+        "note": "Search covers stored rst, txt, md, yaml and yml documentation plus "
+                "parsed function kernel-doc comments. Oversized, unreadable or excluded "
+                "documents and comments not captured during parsing are not searched.",
+    }
+    if args.format == "json":
+        sys.stdout.write(render.render_json(result))
+        return
+    console = Console(args.color)
+    console.heading(f"Documentation {result['mode']}: {phrase} [{support._linux(meta)}]")
+    console.blank()
+    if not result["matches"]:
+        console.text("No matching text in the stored documentation.", tone="muted")
+    for match in result["matches"]:
+        location = f"{match['path']}:{match['line']}"
+        anchor = " (comment block)" if match["line_kind"] == "documentation_block" else ""
+        console.heading(f"{location}{anchor}", tone="accent")
+        if match["heading"]:
+            console.field("Heading", match["heading"])
+        console.field("Evidence", match["source_kind"] +
+                      (f" / {match['section']}" if match.get("section") else ""))
+        console.text(match["snippet"])
+        console.blank()
+    if result["truncated"]:
+        console.note(f"Results truncated at {result['limit']} matches; narrow the scope.")
+    console.text(result["note"], tone="muted")
+    console.text(result["coverage"]["note"], tone="muted")
+    console.field("Document limit", f"{result['coverage']['document_max_bytes']:,} bytes")
 
 def cmd_locate(args, support):
     """Resolve a target in every built index to show version movement."""

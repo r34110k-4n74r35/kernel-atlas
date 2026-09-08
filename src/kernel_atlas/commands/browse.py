@@ -7,7 +7,7 @@ import shlex
 import sys
 from dataclasses import replace
 
-from ..queries import query
+from ..queries import function_docs, query
 from ..presentation import render
 from ..queries.models import Entry
 from ..presentation.terminal import Console
@@ -17,6 +17,16 @@ def cmd_info(args, support):
     conn, meta = support.open_index(args)
     res = support.resolve_or_die(conn, args.target, meta)
     t = res.target
+    documentation = None
+    if getattr(args, "detail", False):
+        support._require_unique_symbol_identity(res, args.target, conn)
+        if t.kind != "symbol" or t.symbol_kind not in {"function", "syscall", "prototype"}:
+            support._die("info --detail requires a function, syscall or prototype")
+        if meta.get("has_function_docs") != "1":
+            support._die("this index has no stored function documentation; rebuild this index "
+                         "with the current ka build command and --force")
+        documentation = function_docs.contract(conn, t.id)
+        documentation["path"] = t.path
 
     composition = query.all_subsystems(
         conn, "dir" if t.kind == "dir" else "file",
@@ -148,6 +158,8 @@ def cmd_info(args, support):
                                  for c in res.candidates[:args.max_candidates]],
             "n_other_candidates": len(res.candidates),
         }
+        if documentation is not None:
+            payload["documentation"] = documentation
         sys.stdout.write(render.render_json(payload))
         return
 
@@ -200,6 +212,9 @@ def cmd_info(args, support):
         field("docs", lnks["docs"])
     if lnks.get("ident"):
         field("ident", lnks["ident"])
+
+    if documentation is not None:
+        _render_function_documentation(console, documentation)
 
     if area:
         console.blank()
@@ -278,6 +293,24 @@ def cmd_info(args, support):
         next_lines.append(f"{prefix} web {target_arg}")
     console.commands(next_lines)
 
+
+
+def _render_function_documentation(console, documentation):
+    console.blank()
+    console.heading("Documented function contract", tone="success")
+    if documentation["line"] is not None:
+        console.field("Source comment", f"{documentation['path']}:{documentation['line']}")
+    for name, key in (("Purpose", "summary"), ("Description", "description"),
+                      ("Context / locks", "context"), ("Return", "returns")):
+        value = documentation[key]
+        console.field(name, value or "not documented", tone=None if value else "muted")
+    console.heading("Documented parameters")
+    if documentation["parameters"]:
+        for name, text in documentation["parameters"].items():
+            console.field(name, text or "not documented")
+    else:
+        console.text("not documented", tone="muted")
+    console.text(documentation["note"], tone="muted")
 
 def cmd_siblings(args, support):
     support._validate_listing_output(args)

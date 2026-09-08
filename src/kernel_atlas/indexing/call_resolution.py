@@ -30,7 +30,7 @@ _TABLES = (
     "unit_local_bindings",
     "unit_local_callables",
     "call_contexts",
-    "call_sites",
+    "call_name_sites",
     "effective_file_domains",
     "translation_unit_members",
     "program_header_domains",
@@ -145,18 +145,18 @@ def prepare_evidence(conn: sqlite3.Connection, *, validating: bool = False) -> N
 
         -- Work only on names that actually occur at a call site; joining every
         -- unit to every one of millions of symbols is unnecessary.
-        CREATE TEMP TABLE call_sites AS
+        CREATE TEMP TABLE call_name_sites AS
         SELECT caller.file_id AS caller_file_id, c.callee AS name
         FROM calls c
         JOIN symbols caller ON caller.id=c.caller_id
         WHERE {call_filter}
         GROUP BY caller.file_id, c.callee;
-        CREATE UNIQUE INDEX temp.idx_call_sites_file_name
-          ON call_sites(caller_file_id, name);
+        CREATE UNIQUE INDEX temp.idx_call_name_sites_file_name
+          ON call_name_sites(caller_file_id, name);
 
         CREATE TEMP TABLE call_contexts AS
         SELECT sites.caller_file_id, sites.name, units.unit_id, fd.domain
-        FROM call_sites sites
+        FROM call_name_sites sites
         JOIN translation_unit_members units
           ON units.member_file_id=sites.caller_file_id
         JOIN file_domains fd ON fd.file_id=units.unit_id

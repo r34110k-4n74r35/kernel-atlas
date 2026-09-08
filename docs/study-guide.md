@@ -178,12 +178,23 @@ ka find copy_from_user --exact    # include/linux/uaccess.h, plus tools/ copies
 `open "$(ka web Documentation/mm/index.rst --url docs)"`.
 
 **I want the docs that go with this code.** `ka docs mm`, `ka docs bpf`,
-`ka show Documentation/mm/index.rst`.
+`ka show Documentation/mm/index.rst`. Use `ka docs usb_device --mentions` or
+`ka docs --search 'reference count'` for actual text excerpts instead of
+related-guide ranking.
 
 **I am following data through a subsystem boundary.** Start with
-`ka struct usb_device`, follow referenced `struct ...` types with another
-`ka struct`, then use the listed owner, Documentation files, and source links
-to connect the data representation to its subsystem.
+`ka struct usb_device --relations` to see member references and declarations
+that use the type. `--used-by` focuses on the latter. Follow candidate types
+with another `ka struct`, then use owners and documentation to understand the
+boundary. Header visibility and conditional alternatives remain uncertain;
+declaration references do not prove runtime object flow.
+
+**I am following a function across layers.** Inspect
+`ka info usb_get_dev --detail`, then `ka calls usb_get_dev --depth 3 --sites`.
+The first shows documented requirements; the second gives resolved source
+edges and their invocation lines. For a specific destination, use
+`ka calls usb_get_dev --to get_device`. Review unresolved boundaries and search
+limits before drawing conclusions about a missing chain.
 
 **Open it in an editor.** `vim "$(ka path tcp_sendmsg)"` or
 `code -g "$(ka path tcp_sendmsg --line)"`. `--line` appends `:LINE`.

@@ -67,6 +67,28 @@ def test_lifecycle_index_selection_after_subcommand_is_unrecognized(capsys):
     assert "unrecognized arguments: --db" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("argv", "message"), [
+    (["diff", "schedule", "--from", "before", "--to", "after"], "invalid choice: 'diff'"),
+    (["check", "--source"], "unrecognized arguments: --source"),
+    (["build", "--src", "linux", "--incremental"], "unrecognized arguments: --incremental"),
+])
+def test_removed_snapshot_and_reuse_features_are_rejected(argv, message, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.build_parser().parse_args(argv)
+    assert stopped.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["build", "--src", "linux", "--force"],
+    ["check"],
+    ["show", "schedule", "--bare"],
+    ["remove", "6.12", "--source"],
+])
+def test_existing_build_check_show_and_source_removal_options_remain_valid(argv):
+    assert cli.build_parser().parse_args(argv).command == argv[0]
+
+
 @pytest.mark.parametrize("argv", [
     ["--db", "one.db", "--kernel", "6.12", "stats"],
     ["--db", "one.db", "stats", "--kernel", "6.12"],

@@ -46,6 +46,9 @@ Networking). One call record groups one caller and invocation spelling; only a
 record with a resolved callee identity is a concrete graph edge. Useful as a
 first orientation.
 
+Index metadata includes available evidence capabilities when recorded by the
+builder.
+
 ### `check` / `doctor`
 
 Runs the full row-level audit used before a completed build becomes active. It
@@ -82,6 +85,20 @@ also includes Elixir's *ident* page (every use of that name).
 `source_exists`, and structured unclassified-ownership information.
 `--max-subsystems` and `--max-candidates` trim the two lists that can get
 long.
+
+For one exact function, syscall, or indexed prototype, `--detail` adds its
+adjacent kernel-doc summary, parameter descriptions, notes, execution `Context`,
+and `Return` text, with the comment's source location:
+
+```bash
+ka info usb_get_dev --detail
+ka info drivers/usb/core/usb.c:usb_get_dev --detail -f json
+```
+
+Missing documentation remains missing. These are documented requirements,
+including locking rules when the comment states them; they are not inferred
+or verified guarantees. The comments are persisted, so detailed reports remain
+available after source removal. Older indexes need rebuilding for this evidence.
 
 ### `struct` / `structure`
 
@@ -125,6 +142,30 @@ the source tree is removed; `show` still requires that tree.
 This is a source-structure view, not an ABI layout calculator. It does not claim
 byte offsets, padding, alignment, or `sizeof`; those require a concrete
 configuration, architecture, compiler ABI, and fully expanded macros.
+
+Add `--used-by` for incoming declaration references, or `--relations` for both
+incoming uses and the selected aggregate's outgoing member references:
+
+```bash
+ka struct usb_device --used-by
+ka struct usb_device --relations --max-relations 50 -f json
+```
+
+Evidence distinguishes embedded and pointer members, function parameters and
+returns, and callback parameter/return types. Each row retains its declaration,
+source location, conditions, owner, and candidate type definitions with their
+ownership. Direct typedef aliases participate; typedef chains, macro-generated
+uses, and field accesses do not. A single matching header definition remains a
+candidate because inclusion and configuration visibility are unverified.
+Ambiguous definitions are retained rather than guessed.
+
+`--max-relations` defaults to 100, accepts 1–1000, and caps each direction
+separately. JSON adds `type_relationships` within each definition, with explicit
+direction and truncation fields. Each relation displays at most 100 candidate
+definitions, with the full count and a truncation flag. Ambiguity and incoming
+membership use the full candidate set even when the display is shortened.
+These queries use existing declaration data, including schema-6 indexes;
+incomplete signatures or excluded symbol kinds limit their coverage.
 
 ### `siblings` (`sib`) / `ls`
 
@@ -231,6 +272,9 @@ ka show tcp_sendmsg --bare               # no header, no line numbers
 Whole files larger than 2 MB (generated blobs, huge headers) need
 `--lines N:M` or `$EDITOR "$(ka path …)"`. Binary files are refused.
 
+`show` displays the current source using indexed line ranges. Rebuild after
+editing the source tree to keep those ranges and indexed declarations current.
+
 ### `web`
 
 For an index built from a matching authoritative kernel.org archive, `web`
@@ -291,7 +335,8 @@ unrelated documents match.
 Use `--explain` to print why each document was selected. In JSON, this adds a
 `reasons` array to each result. Without it, the existing JSON fields remain
 unchanged. Explanations describe path, name, ownership, and document-type
-evidence; document bodies are not searched, and relevance is not guaranteed.
+evidence; this related-document mode does not search document bodies, and
+relevance is not guaranteed.
 
 ```bash
 ka docs mm
@@ -301,6 +346,42 @@ ka docs usb_device --under driver-api/usb --explain
 ka docs usb_device --under devicetree/bindings -n 10
 ka docs usb_device --explain -f json
 ```
+
+Use explicit text-search mode when you need actual mentions:
+
+```bash
+ka docs --search 'reference count'
+ka docs drivers/usb --search 'reference count'  # function comments in this subtree
+ka docs usb_device --mentions
+ka docs --search 'usb_device' --under driver-api/usb -f json
+```
+
+`--search TEXT` matches a case-insensitive literal phrase. Its optional target
+must resolve to a file or directory that scopes the search; omit it to search
+the entire stored corpus. `--mentions` requires a symbol target and searches its
+name as a case-sensitive C identifier with token boundaries. It does not match
+that name inside a larger identifier. The two modes are mutually exclusive.
+Neither interprets regex syntax; search text is limited to 1,024 characters.
+
+Results include indexed excerpts and headings where available, distinguishing
+document text from function kernel-doc. Document locations identify the matching
+line; function-comment locations identify the start of the documentation block,
+with the matched section labelled separately. A textual match does not prove
+that it refers to one resolved C identity. `--explain` is intended for the
+related-document ranking mode.
+
+Search operates offline on retained `Documentation/` `.rst`, `.txt`, `.md`,
+`.yaml`, and `.yml` files and parsed function comments. Documentation files over
+1 MiB (or a lower configured input-size limit), binary files, unreadable inputs,
+and comments not recognized as function kernel-doc are not part of this corpus.
+Older indexes without text evidence need rebuilding; queries do not fetch,
+modify, or automatically upgrade them. `--under` limits searches to the chosen
+Documentation path.
+
+The default limit is 30 matching excerpts; text mode caps results at 5,000 even
+with `-n 0`. Excerpts are bounded to about 240 characters. JSON includes the
+matching mode, scopes, evidence coverage, effective limit, and truncation state.
+Narrow the phrase or path when results are truncated.
 
 ### `locate`
 
@@ -377,6 +458,37 @@ ka calls tcp_sendmsg
 ka calls tcp_sendmsg --callers
 # tcp_bpf_sendmsg  (the BPF sockmap hook)
 ```
+
+For exact invocation locations and bounded exploration:
+
+```bash
+ka calls tcp_sendmsg --sites
+ka calls tcp_sendmsg --depth 3 --sites --max-nodes 100
+ka calls tcp_sendmsg --to tcp_sendmsg_locked
+ka calls tcp_sendmsg --callers --depth 2 -f json
+```
+
+`--sites` shows source invocation lines and their direct, indirect, or macro
+classification. It requires individual call-site evidence from a new
+`--with-calls` build. `--depth N` follows up to N resolved edges (1–64), keeping
+cycles and unresolved boundary evidence visible. `--to FUNCTION` finds a
+shortest resolved chain from the selected function within the limits; its
+default search depth is 8, adjustable with `--depth`. It cannot be combined
+with `--callers`. Graph traversal can use existing call-enabled schema-6 indexes
+when `--sites` is omitted.
+
+`--max-nodes` defaults to 200 and accepts 1–5000. Graph exploration also caps
+inspected edge and optional site records at ten times that limit. Standalone
+`--sites` uses the smaller of `--limit` and `--max-nodes`; `-n 0` still respects
+the latter. Graph mode uses `--max-nodes` instead of `--limit`. Truncation
+reasons are reported, including exhausted depth, node, edge, and site budgets.
+Failure to find a chain does not establish that the functions are disconnected.
+
+These options support `table` and `json`; flat-list column, name/linkage/kind
+filters, and alternative sorts are rejected rather than silently changing graph
+meaning. JSON reports nodes, edges, boundary evidence, search limits, and cycle
+and truncation information; path mode additionally reports the selected chain.
+Call-site and graph reports describe source evidence, not an observed execution.
 
 Invocation names are resolved conservatively. A unique callable in the same
 translation unit wins: `same_file` means the definition is in the caller's
