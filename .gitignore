@@ -16,3 +16,5 @@ dist/
 # Kernel sources and built indexes live inside the project (see storage/config.py)
 kernels/
 indexes/
+
+study/
